@@ -24,7 +24,26 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for code changes
+        id: changes
+        run: |
+          CODE_FILES=$(git diff --name-only ${{ github.event.before }} HEAD \
+            | grep -vE '^\.github/|\.md$' || true)
+          if [ -z "$CODE_FILES" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No code changes, skipping release"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Code changes detected:"
+            echo "$CODE_FILES"
+          fi
+
+      - if: steps.changes.outputs.skip == 'false'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           release-type: go
