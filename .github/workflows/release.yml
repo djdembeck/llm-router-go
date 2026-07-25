@@ -94,7 +94,7 @@ jobs:
           head_ref: ${{ steps.tags.outputs.current }}
           max_commits: '100'
           temperature: '0.3'
-          max_tokens: '4096'
+          max_tokens: '12000'
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
