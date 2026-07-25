@@ -306,8 +306,14 @@ func main() {
 
 	if totalWeight > 0 {
 		maxBudget := 0
-		if mb := os.Getenv("MAX_GPU_BUDGET"); mb != "" {
-			fmt.Sscanf(mb, "%d", &maxBudget)
+		mb := os.Getenv("MAX_GPU_BUDGET")
+		if mb != "" {
+			if _, err := fmt.Sscanf(mb, "%d", &maxBudget); err != nil {
+				log.Fatalf("invalid MAX_GPU_BUDGET %q: %v", mb, err)
+			}
+		}
+		if mb == "" {
+			maxBudget = 4 // default per docs
 		}
 		if maxBudget > 0 {
 			gpu = &gpuBudget{max: maxBudget, maxQueue: 4}
@@ -540,9 +546,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		// This will catch MaxBytesError (truncated body) and other read errors
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	r.Body.Close()
@@ -612,7 +620,12 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			gpu.tryAcquire(target.GpuWeight, 0, 0, cancelCh) // fast path, guaranteed
+			if !gpu.tryAcquire(target.GpuWeight, 4, 5*time.Second, cancelCh) {
+				retry := estimateRetryAfter(target.Name)
+				log.Printf("%s %s -> %s (model=%s) 429: GPU budget full (race)", r.Method, r.URL.Path, target.Name, modelName)
+				write429(w, "gpu-budget-full", target.Name, retry)
+				return
+			}
 		}
 		defer gpu.release(target.GpuWeight)
 	}
