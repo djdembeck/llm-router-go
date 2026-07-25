@@ -20,15 +20,15 @@ import (
 // ─── Config ───────────────────────────────────────────────────────────────
 
 type Backend struct {
-	Name                    string `json:"name"`
-	URL                     string `json:"url"`
-	MaxConcurrent          int    `json:"maxConcurrent"`                // 0 = unlimited
-	Tier                   int    `json:"tier"`                        // 0 = king (always admitted), 1 = subject
-	GpuWeight              int    `json:"gpuWeight"`                   // GPU cost when tier-0 active; 0 = no cost
-	BlockOnTier0           int    `json:"blockOnTier0"`                // block when tier0 in-flight >= this; 0 = disabled
-	MaxQueueDepth          int    `json:"maxQueueDepth"`               // queued beyond maxConcurrent before 429 (default 2)
-	MaxConcurrentLargePrefill int    `json:"maxConcurrentLargePrefill"` // max concurrent large prefills; 0 = disabled
-	LargePrefillThresholdTokens int `json:"largePrefillThresholdTokens"` // new-token count to qualify as "large prefill" (default 8192)
+	Name                        string `json:"name"`
+	URL                         string `json:"url"`
+	MaxConcurrent               int    `json:"maxConcurrent"`               // 0 = unlimited
+	Tier                        int    `json:"tier"`                        // 0 = king (always admitted), 1 = subject
+	GpuWeight                   int    `json:"gpuWeight"`                   // GPU cost when tier-0 active; 0 = no cost
+	BlockOnTier0                int    `json:"blockOnTier0"`                // block when tier0 in-flight >= this; 0 = disabled
+	MaxQueueDepth               int    `json:"maxQueueDepth"`               // queued beyond maxConcurrent before 429 (default 2)
+	MaxConcurrentLargePrefill   int    `json:"maxConcurrentLargePrefill"`   // max concurrent large prefills; 0 = disabled
+	LargePrefillThresholdTokens int    `json:"largePrefillThresholdTokens"` // new-token count to qualify as "large prefill" (default 8192)
 }
 
 // ─── Per-backend slot manager ─────────────────────────────────────────────
@@ -206,13 +206,13 @@ func (d *durationTracker) avgSeconds() float64 {
 // ─── Global state ─────────────────────────────────────────────────────────
 
 var (
-	backends     []Backend
-	client       = &http.Client{Timeout: 30 * time.Second}
-	slots        map[string]*slotManager       // per-backend concurrency slots
-	prefillSlots map[string]*slotManager       // per-backend large-prefill slots (released on first response byte)
-	gpu          *gpuBudget
-	queueTimeout = 30 * time.Second
-	durations    map[string]*durationTracker // per backend name
+	backends       []Backend
+	client         = &http.Client{Timeout: 30 * time.Second}
+	slots          map[string]*slotManager // per-backend concurrency slots
+	prefillSlots   map[string]*slotManager // per-backend large-prefill slots (released on first response byte)
+	gpu            *gpuBudget
+	queueTimeout   = 30 * time.Second
+	durations      map[string]*durationTracker // per backend name
 	proxyTransport = &http.Transport{
 		// ResponseHeaderTimeout: max wait for first byte from vLLM after
 		// sending the request. If vLLM hangs after accepting the connection,
@@ -334,17 +334,17 @@ func main() {
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	type stat struct {
-		Name              string  `json:"name"`
-		URL               string  `json:"url"`
-		Tier              int     `json:"tier"`
-		INFlight          int32   `json:"inFlight"`
-		MaxConcurrent     int32   `json:"maxConcurrent"`
-		Waiting           int32   `json:"waiting"`
-		MaxQueueDepth     int32   `json:"maxQueueDepth"`
-		PrefillInFlight   int32   `json:"prefillInFlight"`
-		PrefillWaiting    int32   `json:"prefillWaiting"`
-		PrefillMax        int32   `json:"prefillMax"`
-		AvgDurationS      float64 `json:"avgDurationS"`
+		Name            string  `json:"name"`
+		URL             string  `json:"url"`
+		Tier            int     `json:"tier"`
+		INFlight        int32   `json:"inFlight"`
+		MaxConcurrent   int32   `json:"maxConcurrent"`
+		Waiting         int32   `json:"waiting"`
+		MaxQueueDepth   int32   `json:"maxQueueDepth"`
+		PrefillInFlight int32   `json:"prefillInFlight"`
+		PrefillWaiting  int32   `json:"prefillWaiting"`
+		PrefillMax      int32   `json:"prefillMax"`
+		AvgDurationS    float64 `json:"avgDurationS"`
 	}
 	t0Inflight := tier0Inflight()
 
@@ -710,8 +710,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
-	proxy.FlushInterval = -1                    // flush immediately for SSE streaming
-	proxy.Transport = proxyTransport            // response timeout prevents slot leaks
+	proxy.FlushInterval = -1         // flush immediately for SSE streaming
+	proxy.Transport = proxyTransport // response timeout prevents slot leaks
 	// Wrap ResponseWriter to capture status + detect completion for duration
 	// tracking. Also releases the prefill slot on first response byte.
 	tracker := &respTracker{
@@ -730,9 +730,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 type respTracker struct {
 	http.ResponseWriter
-	status       int
-	wrote        bool
-	onFirstByte  func() // called on first WriteHeader/Write; used to release prefill slot
+	status      int
+	wrote       bool
+	onFirstByte func() // called on first WriteHeader/Write; used to release prefill slot
 }
 
 func (t *respTracker) WriteHeader(code int) {
