@@ -24,7 +24,26 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for code changes
+        id: changes
+        run: |
+          CODE_FILES=$(git diff --name-only ${{ github.event.before }} HEAD \
+            | grep -vE '^\.github/|\.md$' || true)
+          if [ -z "$CODE_FILES" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No code changes, skipping release"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Code changes detected:"
+            echo "$CODE_FILES"
+          fi
+
+      - if: steps.changes.outputs.skip == 'false'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           release-type: go
@@ -43,13 +62,17 @@ jobs:
 
       - name: Resolve tag and previous tag
         id: tags
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            CURRENT_TAG="${{ inputs.tag_name }}"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            CURRENT_TAG="${INPUT_TAG_NAME}"
           else
             CURRENT_TAG="${{ needs.release-please.outputs.tag_name }}"
           fi
-          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${CURRENT_TAG}$" | head -1 || true)
+          # Find the tag immediately before CURRENT_TAG (sorted ascending, take last before it)
+          PREV_TAG=$(git tag --sort=version:refname | grep -B1 -Fx "${CURRENT_TAG}" | grep -v -Fx "${CURRENT_TAG}" | head -1 || true)
           echo "current=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
           echo "prev=${PREV_TAG}" >> "$GITHUB_OUTPUT"
           echo "Current tag: ${CURRENT_TAG}"
