@@ -33,7 +33,7 @@ jobs:
         run: go vet ./...
 
       - name: Mod tidy
-        run: go mod tidy && git diff --exit-code go.mod go.sum
+        run: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
 
   go-build:
     needs: [go-quick]
