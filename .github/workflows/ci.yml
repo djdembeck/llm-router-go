@@ -27,7 +27,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Check formatting
-        run: gofmt -l . | { read f; test -z "$f"; }
+        run: test -z "$(gofmt -l .)"
 
       - name: Vet
         run: go vet ./...
