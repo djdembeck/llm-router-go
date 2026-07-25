@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/djdembeck/llm-router-go/compare/v1.0.0...v1.0.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **ci:** update stale llm-release-action SHA pin ([2ac4cbc](https://github.com/djdembeck/llm-router-go/commit/2ac4cbcc41762097089efa3bdd64256dc45b8809))
+* **ci:** update stale llm-release-action SHA pin ([c0b22dc](https://github.com/djdembeck/llm-router-go/commit/c0b22dcd396552ac1e745a71c108f8462455d3ac))
+
 ## 1.0.0 (2026-07-25)
 
 
