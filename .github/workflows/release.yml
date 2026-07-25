@@ -62,9 +62,12 @@ jobs:
 
       - name: Resolve tag and previous tag
         id: tags
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            CURRENT_TAG="${{ inputs.tag_name }}"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            CURRENT_TAG="${INPUT_TAG_NAME}"
           else
             CURRENT_TAG="${{ needs.release-please.outputs.tag_name }}"
           fi
