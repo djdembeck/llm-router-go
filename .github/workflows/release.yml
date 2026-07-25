@@ -72,7 +72,7 @@ jobs:
             CURRENT_TAG="${{ needs.release-please.outputs.tag_name }}"
           fi
           # Find the tag immediately before CURRENT_TAG (sorted ascending, take last before it)
-          PREV_TAG=$(git tag --sort=version:refname | grep -B1 "^${CURRENT_TAG}$" | grep -v "^${CURRENT_TAG}$" | head -1 || true)
+          PREV_TAG=$(git tag --sort=version:refname | grep -B1 -Fx "${CURRENT_TAG}" | grep -v -Fx "${CURRENT_TAG}" | head -1 || true)
           echo "current=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
           echo "prev=${PREV_TAG}" >> "$GITHUB_OUTPUT"
           echo "Current tag: ${CURRENT_TAG}"
