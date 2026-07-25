@@ -1,3 +1,3 @@
 module github.com/djdembeck/llm-router-go
 
-go 1.22
+go 1.25
