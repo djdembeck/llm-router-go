@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        type: string
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.sha }}
@@ -26,7 +32,7 @@ jobs:
 
   ai-changelog:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    if: ${{ needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -35,20 +41,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Find previous tag
-        id: prev
+      - name: Resolve tag and previous tag
+        id: tags
         run: |
-          CURRENT_TAG="${{ needs.release-please.outputs.tag_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CURRENT_TAG="${{ inputs.tag_name }}"
+          else
+            CURRENT_TAG="${{ needs.release-please.outputs.tag_name }}"
+          fi
           PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${CURRENT_TAG}$" | head -1 || true)
-          echo "tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "current=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "prev=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Current tag: ${CURRENT_TAG}"
           echo "Previous tag: ${PREV_TAG:-<none, first release>}"
 
       - uses: nosovj/llm-release-action@aba906f1ff5d376390d9e751bf407f40971079e0 # v1
         id: llm
         with:
           model: openai/${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
-          current_version: ${{ steps.prev.outputs.tag }}
-          head_ref: ${{ needs.release-please.outputs.tag_name }}
+          current_version: ${{ steps.tags.outputs.prev }}
+          head_ref: ${{ steps.tags.outputs.current }}
           max_commits: '100'
           temperature: '0.3'
           max_tokens: '4096'
@@ -63,7 +75,7 @@ jobs:
             echo "No changelog generated, keeping default release notes"
             exit 0
           fi
-          gh release edit "${{ needs.release-please.outputs.tag_name }}" --notes "$CHANGELOG"
+          gh release edit "${{ steps.tags.outputs.current }}" --notes "$CHANGELOG"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LLM_CHANGLOGS: ${{ steps.llm.outputs.changelogs }}
