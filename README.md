@@ -2,6 +2,17 @@
 
 GPU-aware reverse proxy router for vLLM and SGlang LLM inference backends.
 
+## Security
+
+This proxy has **no built-in authentication or authorization**. It blindly forwards any request it receives to the configured backends.
+
+**Always deploy behind a reverse proxy** (e.g., Caddy, Nginx, Traefik) that handles:
+- Authentication (API keys, tokens, etc.)
+- TLS termination
+- Request validation and rate limiting
+
+Do not expose `llm-router-go` directly to untrusted networks.
+
 ## Quick Start
 
 Build and run via Docker:
