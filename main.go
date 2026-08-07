@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -31,6 +32,19 @@ type Backend struct {
 	LargePrefillThresholdTokens int    `json:"largePrefillThresholdTokens"` // new-token count to qualify as "large prefill" (default 8192)
 }
 
+// ─── Parsed body (single-pass, heavy fields stay raw) ──────────────────────
+
+type rawMessage struct {
+	Content json.RawMessage `json:"content"`
+}
+
+type parsedBody struct {
+	Model    string       `json:"model"`
+	Messages []rawMessage `json:"messages"`
+	Prompt   json.RawMessage `json:"prompt"`
+	Stream   bool         `json:"stream"`
+}
+
 // ─── Per-backend slot manager ─────────────────────────────────────────────
 
 type slotManager struct {
@@ -52,10 +66,10 @@ func newSlot(max, maxQueue int32) *slotManager {
 // acquire returns true if a slot was obtained (immediately or after queued wait).
 // false = queue full or timeout/cancel.
 func (s *slotManager) acquire(grace time.Duration, cancel <-chan struct{}) bool {
-	// Fast path: CAS a free slot.
+	// Fast path: CAS a free slot, but never barge ahead of queued waiters.
 	for {
 		cur := atomic.LoadInt32(&s.inflight)
-		if cur >= s.max {
+		if cur >= s.max || atomic.LoadInt32(&s.waiting) > 0 {
 			break
 		}
 		if atomic.CompareAndSwapInt32(&s.inflight, cur, cur+1) {
@@ -69,6 +83,18 @@ func (s *slotManager) acquire(grace time.Duration, cancel <-chan struct{}) bool 
 		return false // queue full
 	}
 	defer atomic.AddInt32(&s.waiting, -1)
+
+	// A slot may already be free (e.g. a waiter timed out without consuming
+	// its notify). Try once before sleeping.
+	for {
+		cur := atomic.LoadInt32(&s.inflight)
+		if cur >= s.max {
+			break
+		}
+		if atomic.CompareAndSwapInt32(&s.inflight, cur, cur+1) {
+			return true
+		}
+	}
 
 	deadline := time.NewTimer(grace)
 	defer deadline.Stop()
@@ -108,12 +134,11 @@ func (s *slotManager) snapshot() (inflight, max, waiting, maxQueue int32) {
 // ─── GPU budget (weighted semaphore, only active when tier-0 is busy) ──────
 
 type gpuBudget struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	used     int
-	max      int
-	waiting  int
-	maxQueue int
+	mu      sync.Mutex
+	cond    *sync.Cond
+	used    int
+	max     int
+	waiting int
 }
 
 func (g *gpuBudget) tryAcquire(weight, maxQueue int, grace time.Duration, cancel <-chan struct{}) bool {
@@ -129,35 +154,44 @@ func (g *gpuBudget) tryAcquire(weight, maxQueue int, grace time.Duration, cancel
 		return false
 	}
 	g.waiting++
-	// Stay locked for cond.Wait.
+	var expired atomic.Bool
 	done := make(chan struct{})
 	timer := time.NewTimer(grace)
 	go func() {
 		select {
 		case <-timer.C:
+			expired.Store(true)
 			g.mu.Lock()
 			g.cond.Broadcast()
 			g.mu.Unlock()
 		case <-cancel:
+			expired.Store(true)
 			g.mu.Lock()
 			g.cond.Broadcast()
 			g.mu.Unlock()
 		case <-done:
 		}
 	}()
-	g.cond.Wait()
+	acquired := false
+	for {
+		g.cond.Wait()
+		if g.used+weight <= g.max {
+			// Fit wins even at the deadline boundary (same precedence as today).
+			g.used += weight
+			acquired = true
+			break
+		}
+		if expired.Load() {
+			break
+		}
+		// Woken by a partial release or lost the race to another waiter:
+		// keep waiting until the deadline.
+	}
 	close(done)
 	g.waiting--
 	timer.Stop()
-	// After wake: re-check under lock.
-	if g.used+weight <= g.max {
-		g.used += weight
-		g.mu.Unlock()
-		return true
-	}
-	// Still can't fit — timeout or lost race.
 	g.mu.Unlock()
-	return false
+	return acquired
 }
 
 func (g *gpuBudget) release(weight int) {
@@ -206,20 +240,22 @@ func (d *durationTracker) avgSeconds() float64 {
 // ─── Global state ─────────────────────────────────────────────────────────
 
 var (
-	backends       []Backend
-	client         = &http.Client{Timeout: 30 * time.Second}
-	slots          map[string]*slotManager // per-backend concurrency slots
-	prefillSlots   map[string]*slotManager // per-backend large-prefill slots (released on first response byte)
-	gpu            *gpuBudget
-	queueTimeout   = 30 * time.Second
-	durations      map[string]*durationTracker // per backend name
-	proxyTransport = &http.Transport{
-		// ResponseHeaderTimeout: max wait for first byte from vLLM after
-		// sending the request. If vLLM hangs after accepting the connection,
-		// we give up and free the slot instead of holding it forever.
+	backends             []Backend
+	client               = &http.Client{Timeout: 30 * time.Second}
+	slots                map[string]*slotManager // per-backend concurrency slots
+	prefillSlots         map[string]*slotManager // per-backend large-prefill slots (released on first response byte)
+	gpu                  *gpuBudget
+	queueTimeout         = 30 * time.Second
+	maxBodyBytes         int64 = 16 << 20
+	prefillTokensPerSec  int   = 10000
+	durations            map[string]*durationTracker // per backend name
+	proxies              map[string]*httputil.ReverseProxy
+	proxyTransport       = &http.Transport{
 		ResponseHeaderTimeout: 5 * time.Minute,
-		// IdleConnTimeout: close idle backend connections
-		IdleConnTimeout: 60 * time.Second,
+		IdleConnTimeout:       60 * time.Second,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		DisableCompression:    true,
 	}
 )
 
@@ -316,10 +352,35 @@ func main() {
 			maxBudget = 4 // default per docs
 		}
 		if maxBudget > 0 {
-			gpu = &gpuBudget{max: maxBudget, maxQueue: 4}
+			gpu = &gpuBudget{max: maxBudget}
 			gpu.cond = sync.NewCond(&gpu.mu)
 			log.Printf("  GPU budget: max=%d (active only when tier-0 in-flight)", maxBudget)
 		}
+	}
+
+	if mb := os.Getenv("MAX_BODY_BYTES"); mb != "" {
+		if _, err := fmt.Sscanf(mb, "%d", &maxBodyBytes); err != nil || maxBodyBytes <= 0 {
+			log.Fatalf("invalid MAX_BODY_BYTES %q", mb)
+		}
+	}
+
+	if pts := os.Getenv("PREFILL_TOKENS_PER_SEC"); pts != "" {
+		if _, err := fmt.Sscanf(pts, "%d", &prefillTokensPerSec); err != nil || prefillTokensPerSec <= 0 {
+			log.Fatalf("invalid PREFILL_TOKENS_PER_SEC %q", pts)
+		}
+	}
+
+	// Build reverse proxies once at startup.
+	proxies = make(map[string]*httputil.ReverseProxy)
+	for _, b := range backends {
+		u, err := url.Parse(b.URL)
+		if err != nil {
+			log.Fatalf("invalid backend URL for %q: %v", b.Name, err)
+		}
+		p := httputil.NewSingleHostReverseProxy(u)
+		p.FlushInterval = -1 // flush immediately for SSE streaming
+		p.Transport = proxyTransport
+		proxies[b.Name] = p
 	}
 
 	mux := http.NewServeMux()
@@ -456,68 +517,52 @@ func write429(w http.ResponseWriter, reason, backend string, retryAfter int) {
 		reason, backend, retryAfter)
 }
 
-// estimateNewTokens estimates the number of NEW tokens being prefilled in this request.
-// In a multi-turn conversation, only the last message is new input; prior messages
-// are cached from previous turns (radix/prefix cache). For the first request of a
-// session (≤2 messages: system + user), ALL content is new prefill.
-// Also handles the completions API `prompt` field.
-// Rough estimate: ~4 bytes per token (conservative for Qwen tokenizer).
-func estimateNewTokens(body []byte) int {
-	if len(body) == 0 {
-		return 0
-	}
-
-	// Try chat completions format first.
-	var chat struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content any    `json:"content"`
-		} `json:"messages"`
-	}
-	if json.Unmarshal(body, &chat) == nil && len(chat.Messages) > 0 {
-		charCount := 0
-		if len(chat.Messages) <= 2 {
-			// First request of session — all content is new prefill.
-			for _, m := range chat.Messages {
-				charCount += contentLen(m.Content)
+// estimateNewTokens estimates NEW prefill tokens from the parsed body.
+// Multi-turn (>2 messages): only the last message is new input; prior context
+// is assumed cached (radix/prefix cache). ≤2 messages: all content is new.
+// Completions API: the prompt field. ~4 bytes per token (conservative for Qwen).
+func estimateNewTokens(b *parsedBody) int {
+	if len(b.Messages) > 0 {
+		chars := 0
+		if len(b.Messages) <= 2 {
+			for _, m := range b.Messages {
+				chars += rawContentLen(m.Content)
 			}
 		} else {
-			// Continuation — only last message is new input.
-			charCount = contentLen(chat.Messages[len(chat.Messages)-1].Content)
+			chars = rawContentLen(b.Messages[len(b.Messages)-1].Content)
 		}
-		return charCount / 4
+		return chars / 4
 	}
-
-	// Try completions API format.
-	var completion struct {
-		Prompt any `json:"prompt"`
-	}
-	if json.Unmarshal(body, &completion) == nil {
-		return contentLen(completion.Prompt) / 4
-	}
-
-	return 0
+	return rawContentLen(b.Prompt) / 4
 }
 
-// contentLen extracts character count from a message content field.
-// Content can be a string, or an array of content parts (each with "text" field).
-func contentLen(content any) int {
-	switch v := content.(type) {
-	case string:
-		return len(v)
-	case []any:
+// rawContentLen measures character content from raw JSON without decoding it.
+// String: bytes minus the two quotes (escape sequences keep encoded length —
+// slight overestimate, which errs toward throttling, the safe direction).
+// Array: sum of each part's "text" field. Anything else: 0.
+func rawContentLen(raw json.RawMessage) int {
+	if len(raw) < 2 {
+		return 0
+	}
+	if raw[0] == '"' {
+		return len(raw) - 2
+	}
+	if raw[0] == '[' {
+		var parts []struct {
+			Text json.RawMessage `json:"text"`
+		}
+		if json.Unmarshal(raw, &parts) != nil {
+			return 0
+		}
 		total := 0
-		for _, part := range v {
-			if m, ok := part.(map[string]any); ok {
-				if t, ok := m["text"].(string); ok {
-					total += len(t)
-				}
+		for _, p := range parts {
+			if len(p.Text) >= 2 {
+				total += len(p.Text) - 2
 			}
 		}
 		return total
-	default:
-		return 0
 	}
+	return 0
 }
 
 // estimateRetryAfter returns a rough seconds estimate of when a slot frees.
@@ -546,29 +591,34 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		// This will catch MaxBytesError (truncated body) and other read errors
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			w.Header().Set("X-Router-Reason", "body-too-large")
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
 		return
 	}
 	r.Body.Close()
 
 	// Resolve backend from model name.
 	target := backends[0]
-	modelName := ""
+	var parsed parsedBody
 	if len(body) > 0 {
-		var partial struct {
-			Model string `json:"model"`
-		}
-		if json.Unmarshal(body, &partial) == nil && partial.Model != "" {
-			modelName = partial.Model
-			for _, b := range backends {
-				if b.Name == modelName {
-					target = b
-					break
-				}
+		// Error tolerated: zero value keeps modelName "" and routes to backends[0],
+		// identical to today's behavior on unmarshal failure.
+		json.Unmarshal(body, &parsed)
+	}
+	modelName := parsed.Model
+	if modelName != "" {
+		for _, b := range backends {
+			if b.Name == modelName {
+				target = b
+				break
 			}
 		}
 	}
@@ -656,9 +706,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// ── Step 3.5: Large prefill throttle ─────────────────────────────────
 	// Limits how many concurrent large prefills a backend processes. A large
 	// prefill is one whose estimated NEW tokens (last message only, not cached
-	// context) exceed the backend's threshold. The slot is held during prefill
-	// only — released when the first response byte arrives (decode begins).
-	// Small requests skip this entirely. Soft-queued up to maxQueue, then 429.
+	// context) exceed the backend's threshold. The slot is released on the
+	// first response byte for streaming requests, or after the estimated
+	// prefill duration (newTokens / PREFILL_TOKENS_PER_SEC) for non-streaming
+	// requests. Small requests skip this entirely. Soft-queued up to maxQueue,
+	// then 429.
 	prefillSem := prefillSlots[target.Name]
 	prefillRelease := func() {} // no-op by default
 	if prefillSem != nil {
@@ -666,7 +718,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		if threshold == 0 {
 			threshold = 8192
 		}
-		newTokens := estimateNewTokens(body)
+		newTokens := estimateNewTokens(&parsed)
 		if newTokens >= threshold {
 			pin, pmaxC, pwaiting, _ := prefillSem.snapshot()
 			if pin >= pmaxC {
@@ -686,12 +738,16 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				write429(w, stage, target.Name, retry)
 				return
 			}
-			prefillReleased := false
-			prefillRelease = func() {
-				if !prefillReleased {
-					prefillReleased = true
-					prefillSem.release()
-				}
+			var prefillOnce sync.Once
+			prefillRelease = func() { prefillOnce.Do(prefillSem.release) }
+			if !parsed.Stream {
+				// Non-streaming: response headers arrive only after full
+				// generation, so first-byte release would hold the slot through
+				// all of decode. Bound the hold to the estimated prefill duration;
+				// whichever fires first (timer or first byte) wins via the Once.
+				hold := time.Duration(float64(newTokens) / float64(prefillTokensPerSec) * float64(time.Second))
+				timer := time.AfterFunc(hold, prefillRelease)
+				defer timer.Stop()
 			}
 		}
 	}
@@ -715,16 +771,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s -> %s (model=%s)", r.Method, r.URL.Path, target.Name, modelName)
 	}
 
-	backendURL, err := url.Parse(target.URL)
-	if err != nil {
-		http.Error(w, "invalid backend URL", http.StatusInternalServerError)
-		return
-	}
-
 	start := time.Now()
-	proxy := httputil.NewSingleHostReverseProxy(backendURL)
-	proxy.FlushInterval = -1         // flush immediately for SSE streaming
-	proxy.Transport = proxyTransport // response timeout prevents slot leaks
+	proxy := proxies[target.Name]
 	// Wrap ResponseWriter to capture status + detect completion for duration
 	// tracking. Also releases the prefill slot on first response byte.
 	tracker := &respTracker{
