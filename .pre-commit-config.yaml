@@ -4,7 +4,7 @@ repos:
     hooks:
       - id: go-fmt
         name: Go fmt
-        entry: test -z "$(gofmt -l .)"
+        entry: bash -c 'test -z "$(gofmt -l .)"'
         language: system
         types: [go]
         pass_filenames: false
@@ -18,7 +18,7 @@ repos:
 
       - id: go-mod-tidy
         name: Go mod tidy
-        entry: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
+        entry: bash -c 'go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)'
         language: system
         types: [go]
         pass_filenames: false
