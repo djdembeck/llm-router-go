@@ -5,9 +5,7 @@
   "commitMessagePrefix": "ci",
   "labels": ["dependencies", "ci", "renovate"],
   "packageRules": [
-    {
-      "groupName": "GitHub Actions",
-      "matchManagers": ["github-actions"]
-    }
+    { groupName: "github-actions", matchManagers: ["github-actions"] },
+    { groupName: "dockerfile", matchManagers: ["dockerfile"] },
   ]
 }
