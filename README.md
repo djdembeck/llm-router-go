@@ -2,88 +2,238 @@
 
 GPU-aware reverse proxy router for vLLM and SGlang LLM inference backends.
 
+llm-router-go sits in front of one or more OpenAI-compatible inference servers and routes requests using GPU utilization, concurrency, queue depth, and latency signals. It is a single Go binary with no external dependencies.
+
+Use it when several inference backends share GPU hardware and naive load balancing either wastes capacity or lets a large prefill starve smaller requests. Tiered admission, weighted GPU budgets, bounded per-backend queues, and prefill limits keep primary instances responsive while secondary capacity is used deliberately.
+
+## Table of Contents
+
+- [Security](#security)
+- [Background](#background)
+- [Install/Running](#installrunning)
+  - [Docker image](#docker-image)
+  - [Binary install](#binary-install)
+- [Usage](#usage)
+  - [Day-1 quickstart](#day-1-quickstart)
+  - [Use an environment file](#use-an-environment-file)
+- [Configuration](#configuration)
+  - [Backends](#backends)
+  - [Scalar environment variables](#scalar-environment-variables)
+- [API](#api)
+  - [`/health`](#health)
+  - [`/stats`](#stats)
+  - [`/v1/models`](#v1models)
+  - [Proxied requests](#proxied-requests)
+- [Architecture](#architecture)
+  - [Tier system](#tier-system)
+  - [GPU budget and slot managers](#gpu-budget-and-slot-managers)
+  - [Prefill protection and load balancing](#prefill-protection-and-load-balancing)
+- [Building](#building)
+  - [Build the binary](#build-the-binary)
+  - [Build the Docker image](#build-the-docker-image)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Security
 
-This proxy has **no built-in authentication or authorization**. It blindly forwards any request it receives to the configured backends.
+> [!WARNING]
+> This proxy has **no built-in authentication or authorization**. It blindly forwards any request it receives to the configured backends.
+>
+> **Always deploy behind a reverse proxy** (for example, Caddy, Nginx, or Traefik) that handles:
+>
+> - Authentication (API keys, tokens, and similar credentials)
+> - TLS termination
+> - Request validation and rate limiting
+>
+> Do not expose `llm-router-go` directly to untrusted networks.
 
-**Always deploy behind a reverse proxy** (e.g., Caddy, Nginx, Traefik) that handles:
-- Authentication (API keys, tokens, etc.)
-- TLS termination
-- Request validation and rate limiting
+## Background
 
-Do not expose `llm-router-go` directly to untrusted networks.
+When multiple inference backends share GPU resources, request count alone is a poor scheduling signal. A single massive prompt prefill can occupy a GPU and starve smaller requests. Tier 0 (King) backends therefore take priority; Tier 1 (Subject) backends use only the remaining configured GPU budget while a King is active.
 
-## Quick Start
+The router's scheduling controls are deliberately narrow:
 
-Build and run via Docker:
+- **GPU-weighted admission:** `gpuWeight` models the share of a shared GPU consumed by a backend instead of treating every request as equal.
+- **Bounded queues:** each backend has its own concurrency limit and queue. Saturated queues return `429 Too Many Requests` with `Retry-After`.
+- **Large-prefill limits:** request bodies are inspected to estimate new prefill tokens and cap concurrent large prefills per backend.
+- **EWMA durations:** exponentially weighted moving averages guide load balancing without sending a herd of requests to the same backend.
+- **Unified model catalog:** `/v1/models` aggregates model metadata from all configured backends.
+
+## Install/Running
+
+Docker is the fastest path to a running router. The container listens on port `80`.
+
+### Docker image
+
+Pull the pre-built image from GHCR and provide the required `BACKENDS` JSON array:
 
 ```bash
-docker build -t llm-router-go .
-docker run -d -p 80:80 \
+docker run -d --name llm-router-go -p 80:80 \
   -e BACKENDS='[{"name":"primary","url":"http://vllm-1:8000","maxConcurrent":4,"tier":0}]' \
-  llm-router-go
+  ghcr.io/djdembeck/llm-router-go
 ```
+
+The backend URL must be reachable from the container. Adjust the published host port when port `80` is already in use.
+
+### Binary install
+
+Install the Go command from the module, then provide the same environment variables when you run it:
+
+```bash
+go install github.com/djdembeck/llm-router-go@latest
+```
+
+The resulting `llm-router-go` binary is placed in the Go binary directory (`$GOBIN`, or `$GOPATH/bin` when `GOBIN` is unset).
+
+## Usage
+
+### Day-1 quickstart
+
+Start the pre-built container with one vLLM backend:
+
+```bash
+docker run -d --name llm-router-go -p 80:80 \
+  -e BACKENDS='[{"name":"primary","url":"http://vllm-1:8000","maxConcurrent":4,"tier":0}]' \
+  ghcr.io/djdembeck/llm-router-go
+```
+
+Check queue, concurrency, latency, and GPU-budget state:
+
+```bash
+curl http://127.0.0.1:80/stats
+```
+
+Send OpenAI-compatible API requests to the router's port. The router selects a backend for paths other than its management endpoints and forwards the request.
+
+### Use an environment file
+
+`.env.example` documents every supported environment variable. Copy it, set the backend URL, and source it before starting the binary:
+
+```bash
+cp .env.example .env
+# Edit .env and set BACKENDS for the inference servers reachable by this process.
+set -a
+. ./.env
+set +a
+llm-router-go
+```
+
+The `.env.example` file contains a minimal backend entry and the default scalar settings. For multiple backends or tiered scheduling, use the full schema below.
 
 ## Configuration
 
-The router is configured entirely via environment variables.
+The router is configured entirely through environment variables. `BACKENDS` is required; the scalar variables have the defaults shown here.
 
-### Environment Variables
+### Backends
+
+`BACKENDS` is a JSON array. Each object describes one inference backend. This example includes every supported field:
+
+```bash
+BACKENDS='[
+  {
+    "name": "primary",
+    "url": "http://vllm-1:8000",
+    "maxConcurrent": 4,
+    "tier": 0,
+    "gpuWeight": 1,
+    "blockOnTier0": 0,
+    "maxQueueDepth": 2,
+    "maxConcurrentLargePrefill": 1,
+    "largePrefillThresholdTokens": 8192
+  }
+]'
+```
+
+| Field | Description |
+| :--- | :--- |
+| `name` | Required unique backend identifier. |
+| `url` | Required backend endpoint URL. |
+| `maxConcurrent` | Maximum concurrent requests. `0` means unlimited. |
+| `tier` | Routing priority: `0` is a King and `1` is a Subject. Tier 0 backends take precedence. |
+| `gpuWeight` | GPU cost attributed to this backend while Tier 0 is active. `0` has no GPU-budget cost. |
+| `blockOnTier0` | For a secondary backend, block requests when the number of in-flight Tier 0 requests reaches this threshold. `0` disables the check. |
+| `maxQueueDepth` | Maximum pending requests beyond `maxConcurrent`; defaults to `2`. |
+| `maxConcurrentLargePrefill` | Maximum concurrent large-prefill requests. `0` disables large-prefill limiting. |
+| `largePrefillThresholdTokens` | Estimated new-token count that triggers large-prefill logic; defaults to `8192`. |
+
+### Scalar environment variables
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `BACKENDS` | Required | JSON array of backend server configurations. |
-| `MAX_QUEUE_TIMEOUT` | `30s` | Maximum time a request waits in queue before returning `429 Too Many Requests`. |
-| `MAX_GPU_BUDGET` | `4` | Max weighted GPU usage when any Tier 0 (King) backend is active. |
-| `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Requests exceeding this size receive HTTP `413` with header `X-Router-Reason: body-too-large`. |
-| `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput bounding how long a non-streaming request holds a large-prefill slot, released after the estimated prefill duration (or the first response byte, whichever comes first) rather than held through full generation. Bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
+| `MAX_QUEUE_TIMEOUT` | `30s` | Maximum time a request waits in a queue before returning `429 Too Many Requests`. |
+| `MAX_GPU_BUDGET` | `4` | Maximum weighted GPU usage while any Tier 0 (King) backend is active. |
+| `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Larger requests receive HTTP `413` with `X-Router-Reason: body-too-large`. |
+| `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput used to bound how long a non-streaming request holds a large-prefill slot. The slot is released after the estimated prefill duration or the first response byte, whichever comes first. This bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
 
-### Backends JSON Schema
+## API
 
-Each object in the `BACKENDS` array supports:
+The router listens on `:80` by default.
 
-- `name` (string, required): Unique identifier for the backend.
-- `url` (string, required): Backend endpoint URL.
-- `maxConcurrent` (int): Max concurrent requests. `0` for unlimited.
-- `tier` (int): Routing priority. `0` for King, `1` for Subject.
-- `gpuWeight` (int): GPU cost attributed to this backend when Tier 0 is active.
-- `blockOnTier0` (int): Request block threshold when King backends are saturated. `0` to disable.
-- `maxQueueDepth` (int): Max pending requests. Defaults to `2`.
-- `maxConcurrentLargePrefill` (int): Max concurrent large prefill requests. `0` to disable.
-- `largePrefillThresholdTokens` (int): Token count to trigger large prefill logic. Defaults to `8192`.
+### `/health`
 
-## Endpoints
+`GET /health` returns the plain-text health response `vLLM router OK`.
 
-The router listens on port `:80`.
+### `/stats`
 
-- `/stats`: Returns JSON status of all backends, including queue depths, EWMA durations, and active concurrency.
-- `/v1/models`: Aggregates model information from all configured backends.
-- `/*`: All other paths are proxied to the selected backend based on load balancing logic.
+`GET /stats` returns JSON status for every backend, including in-flight requests, queue depth, prefill queue state, and EWMA duration. The top-level response also reports `gpuUsed`, `gpuBudget`, `gpuWaiting`, and `tier0Inflight`.
+
+### `/v1/models`
+
+`GET /v1/models` queries all configured backends and returns one aggregated model catalog. If a backend cannot provide model metadata, the router returns a fallback entry named for that backend.
+
+### Proxied requests
+
+All other paths are proxied to a selected backend. OpenAI-compatible inference paths, including chat and completion requests, are forwarded after the router applies tier, GPU, concurrency, queue, and large-prefill limits.
+
+Requests rejected because a queue, GPU budget, or prefill limit is full receive `429` with `Retry-After`, `X-Router-Reason`, and `X-Router-Backend` headers. Requests exceeding `MAX_BODY_BYTES` receive `413` with `X-Router-Reason: body-too-large`.
 
 ## Architecture
 
-`llm-router-go` implements a specialized scheduling layer to optimize GPU utilization across multiple inference servers.
+The application is a single-file Go binary (`main.go`) using only the standard library. It builds without external runtime dependencies.
 
-### Tier System
-Backends are assigned as either **King (Tier 0)** or **Subject (Tier 1)**. Tier 0 backends take precedence; Tier 1 backends are utilized based on available `MAX_GPU_BUDGET` to prevent resource starvation of primary instances.
+### Tier system
 
-### GPU Budget & Slot Manager
-The router tracks weighted GPU usage. When a Tier 0 backend is active, the router enforces a global GPU budget, limiting the concurrency of Tier 1 backends based on their `gpuWeight`.
+Backends are assigned as **King (Tier 0)** or **Subject (Tier 1)**. Tier 0 backends are always admitted with priority. When a Tier 0 request is in flight, Tier 1 admission consumes the remaining `MAX_GPU_BUDGET` according to each backend's `gpuWeight`. When no King is active, the GPU-budget check is not applied.
 
-### Queue & Load Balancing
-Each backend maintains its own request queue. Requests are routed using an Exponentially Weighted Moving Average (EWMA) of request durations to minimize latency and avoid "herd" behavior.
+### GPU budget and slot managers
 
-### Large Prefill Detection
-To prevent "head-of-line" blocking caused by massive prompt prefills, the router tracks prefill sizes and limits the number of concurrent large prefill operations per backend.
+A weighted GPU semaphore models shared GPU capacity. Each backend also has a slot manager with an optional concurrency limit and bounded queue. This keeps one saturated backend from consuming all request capacity and gives callers a bounded wait followed by a useful `429` response.
 
-## Building from Source
+### Prefill protection and load balancing
 
-The project is written in Go and uses only the standard library.
+The router estimates new prefill tokens from request bodies. Backends can cap concurrent large prefills to prevent a massive prompt from blocking smaller requests. Large-prefill slots are bounded using `PREFILL_TOKENS_PER_SEC` for non-streaming requests and release on the first response byte for streaming requests.
+
+Per-backend request durations are tracked with an exponentially weighted moving average (EWMA). Routing uses these durations with current load to reduce latency and avoid herd behavior.
+
+## Building
+
+### Build the binary
+
+The project requires Go 1.25 or newer and uses only the standard library:
 
 ```bash
 go build -o llm-router-go .
 ```
 
+Run the resulting binary with `BACKENDS` and any optional environment variables from [Configuration](#configuration).
+
+### Build the Docker image
+
+The repository includes a multi-stage Alpine Dockerfile. Build the image locally with:
+
+```bash
+docker build -t llm-router-go .
+```
+
+Run the local image by replacing `ghcr.io/djdembeck/llm-router-go` in the quickstart command with `llm-router-go`.
+
+## Contributing
+
+Use the repository's Gitflow model: `develop` is the integration branch and `main` is the production branch. Use Conventional Commits for pull requests.
+
+Keep the single-file, standard-library architecture intact unless the change requires otherwise. Before opening a pull request, run the repository's formatting, vetting, and test checks (`gofmt`, `go vet`, and `go test`).
+
 ## License
 
-MIT SPDX-License-Identifier: MIT
+This project is licensed under the [MIT License](LICENSE) (SPDX: `MIT`).
