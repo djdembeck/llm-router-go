@@ -35,6 +35,8 @@ The router is configured entirely via environment variables.
 | `BACKENDS` | Required | JSON array of backend server configurations. |
 | `MAX_QUEUE_TIMEOUT` | `30s` | Maximum time a request waits in queue before returning `429 Too Many Requests`. |
 | `MAX_GPU_BUDGET` | `4` | Max weighted GPU usage when any Tier 0 (King) backend is active. |
+| `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Requests exceeding this size receive HTTP `413` with header `X-Router-Reason: body-too-large`. |
+| `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput bounding how long a non-streaming request holds a large-prefill slot, released after the estimated prefill duration (or the first response byte, whichever comes first) rather than held through full generation. Bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
 
 ### Backends JSON Schema
 
