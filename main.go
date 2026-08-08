@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,10 +40,10 @@ type rawMessage struct {
 }
 
 type parsedBody struct {
-	Model    string       `json:"model"`
-	Messages []rawMessage `json:"messages"`
+	Model    string          `json:"model"`
+	Messages []rawMessage    `json:"messages"`
 	Prompt   json.RawMessage `json:"prompt"`
-	Stream   bool         `json:"stream"`
+	Stream   bool            `json:"stream"`
 }
 
 // ─── Per-backend slot manager ─────────────────────────────────────────────
@@ -86,6 +87,11 @@ func (s *slotManager) acquire(grace time.Duration, cancel <-chan struct{}) bool 
 
 	// A slot may already be free (e.g. a waiter timed out without consuming
 	// its notify). Try once before sleeping.
+	select {
+	case <-cancel:
+		return false
+	default:
+	}
 	for {
 		cur := atomic.LoadInt32(&s.inflight)
 		if cur >= s.max {
@@ -240,17 +246,17 @@ func (d *durationTracker) avgSeconds() float64 {
 // ─── Global state ─────────────────────────────────────────────────────────
 
 var (
-	backends             []Backend
-	client               = &http.Client{Timeout: 30 * time.Second}
-	slots                map[string]*slotManager // per-backend concurrency slots
-	prefillSlots         map[string]*slotManager // per-backend large-prefill slots (released on first response byte)
-	gpu                  *gpuBudget
-	queueTimeout         = 30 * time.Second
-	maxBodyBytes         int64 = 16 << 20
-	prefillTokensPerSec  int   = 10000
-	durations            map[string]*durationTracker // per backend name
-	proxies              map[string]*httputil.ReverseProxy
-	proxyTransport       = &http.Transport{
+	backends            []Backend
+	client              = &http.Client{Timeout: 30 * time.Second}
+	slots               map[string]*slotManager // per-backend concurrency slots
+	prefillSlots        map[string]*slotManager // per-backend large-prefill slots (released on first response byte)
+	gpu                 *gpuBudget
+	queueTimeout                                    = 30 * time.Second
+	maxBodyBytes        int64                       = 16 << 20
+	prefillTokensPerSec int                         = 10000
+	durations           map[string]*durationTracker // per backend name
+	proxies             map[string]*httputil.ReverseProxy
+	proxyTransport      = &http.Transport{
 		ResponseHeaderTimeout: 5 * time.Minute,
 		IdleConnTimeout:       60 * time.Second,
 		MaxIdleConns:          256,
@@ -344,9 +350,11 @@ func main() {
 		maxBudget := 0
 		mb := os.Getenv("MAX_GPU_BUDGET")
 		if mb != "" {
-			if _, err := fmt.Sscanf(mb, "%d", &maxBudget); err != nil {
+			v, err := strconv.Atoi(mb)
+			if err != nil {
 				log.Fatalf("invalid MAX_GPU_BUDGET %q: %v", mb, err)
 			}
+			maxBudget = v
 		}
 		if mb == "" {
 			maxBudget = 4 // default per docs
@@ -359,15 +367,19 @@ func main() {
 	}
 
 	if mb := os.Getenv("MAX_BODY_BYTES"); mb != "" {
-		if _, err := fmt.Sscanf(mb, "%d", &maxBodyBytes); err != nil || maxBodyBytes <= 0 {
+		v, err := strconv.ParseInt(mb, 10, 64)
+		if err != nil || v <= 0 {
 			log.Fatalf("invalid MAX_BODY_BYTES %q", mb)
 		}
+		maxBodyBytes = v
 	}
 
 	if pts := os.Getenv("PREFILL_TOKENS_PER_SEC"); pts != "" {
-		if _, err := fmt.Sscanf(pts, "%d", &prefillTokensPerSec); err != nil || prefillTokensPerSec <= 0 {
+		v, err := strconv.Atoi(pts)
+		if err != nil || v <= 0 {
 			log.Fatalf("invalid PREFILL_TOKENS_PER_SEC %q", pts)
 		}
+		prefillTokensPerSec = v
 	}
 
 	// Build reverse proxies once at startup.
