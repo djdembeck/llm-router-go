@@ -312,9 +312,9 @@ func TestEstimateNewTokens_MultiTurnCaching(t *testing.T) {
 
 	body := &parsedBody{
 		Messages: []rawMessage{
-			{Content: json.RawMessage(`"` + bigContent + `"`)},    // 25000 tokens if counted
-			{Content: json.RawMessage(`"` + bigContent + `"`)},    // 25000 tokens if counted
-			{Content: json.RawMessage(`"` + smallContent + `"`)},  // only this one counted
+			{Content: json.RawMessage(`"` + bigContent + `"`)},   // 25000 tokens if counted
+			{Content: json.RawMessage(`"` + bigContent + `"`)},   // 25000 tokens if counted
+			{Content: json.RawMessage(`"` + smallContent + `"`)}, // only this one counted
 		},
 	}
 
