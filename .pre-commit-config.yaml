@@ -4,35 +4,35 @@ repos:
     hooks:
       - id: go-fmt
         name: Go fmt
-        entry: bash -c 'test -z "$(gofmt -l .)"'
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
+        entry: test -z "$(gofmt -l .)"
 
       - id: go-vet
         name: Go vet
-        entry: go vet ./...
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
+        entry: go vet ./...
 
       - id: go-mod-tidy
         name: Go mod tidy
-        entry: bash -c 'go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)'
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
+        entry: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
 
       - id: go-build
         name: Go build
-        entry: go build ./...
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
+        entry: go build ./...
 
       - id: go-test
         name: Go test
-        entry: go test ./...
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
+        entry: go test ./...

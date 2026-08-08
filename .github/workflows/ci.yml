@@ -13,7 +13,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
-permissions: read-all
+permissions:
+  contents: read
 
 env:
   PR_IS_SAME_REPO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
@@ -137,29 +138,20 @@ jobs:
         with:
           issue-number: ${{ github.event.pull_request.number }}
           comment-author: 'github-actions[bot]'
-          body-includes: 'Docker Image Ready'
+          body-includes: 'Docker image ready'
 
       - name: Comment PR with image tags
-        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true'
+        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true' && steps.find-comment.outputs.comment-id == ''
         uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
         with:
-          comment-id: ${{ steps.find-comment.outputs.comment-id }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            ## Docker Image Ready
+            ## 🐳 Docker image ready
 
-            The following image tag is available for testing this PR:
+            A test image for this PR is available:
 
-            | Tag | Image |
-            |-----|-------|
-            | `pr-${{ github.event.pull_request.number }}` | `ghcr.io/djdembeck/llm-router-go:pr-${{ github.event.pull_request.number }}` |
-
-            **Note:** This tag is stable for this PR. Each new commit will overwrite this tag with the latest build.
-
-            **To test:**
             ```bash
             docker pull ghcr.io/djdembeck/llm-router-go:pr-${{ github.event.pull_request.number }}
             ```
 
-            Images will be automatically deleted when this PR is merged or closed.
-          edit-mode: replace
+            The `pr-${{ github.event.pull_request.number }}` tag is stable — new commits on this PR overwrite it with the latest build. The image is deleted automatically when the PR closes.
