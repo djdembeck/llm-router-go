@@ -9,7 +9,7 @@ FROM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aab
 WORKDIR /src
 COPY go.mod go.sum* ./
 COPY main.go main_test.go ./
-COPY web/embed.go web/embed_stub.go ./
+COPY web/embed.go web/embed_stub.go web/
 COPY --from=web /web/build ./web/build
 RUN CGO_ENABLED=0 go build -tags webui -o /router main.go
 
