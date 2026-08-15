@@ -188,6 +188,44 @@ All other paths are proxied to a selected backend. OpenAI-compatible inference p
 
 Requests rejected because a queue, GPU budget, or prefill limit is full receive `429` with `Retry-After`, `X-Router-Reason`, and `X-Router-Backend` headers. Requests exceeding `MAX_BODY_BYTES` receive `413` with `X-Router-Reason: body-too-large`.
 
+
+## Dashboard
+
+The router embeds a live operations dashboard (SvelteKit, served at `/` by the
+same binary). One tessellated "fold sheet" shows every backend as a live
+cell: current in-flight vs its limit, queue depth, large-prefill state, EWMA
+duration, streaming time-to-first-byte (TTFT), request/byte rates, and the GPU
+budget gauge while a King is active. A fleet strip shows aggregate
+requests/sec, TTFT, and estimated token rate; a live request tape streams the
+most recent requests including router rejections (429/413).
+
+The dashboard is served by the same listener as the management endpoints (so
+it inherits the same deployment boundary: put it behind your TLS/auth reverse
+proxy). It reads two streaming endpoints:
+
+| Endpoint | Description |
+| :--- | :--- |
+| `GET /metrics/stream` | SSE feed of full live snapshots every `?interval=` (default `500ms`, clamped `200ms`–`10s`). One JSON frame per `data:` line: per-backend slots, EWMA duration, streaming TTFT EWMA + sample count, request/byte/est-token rates (per-interval deltas), cumulative counters, GPU budget state, tier-0 in-flight, and fleet totals. |
+| `GET /metrics/burst` | The most recent completed requests (bounded ring, default capacity `500`, `?limit=` up to `1000`), newest last, including router-originated rejections. |
+
+The frontend connects to `/metrics/stream` via `EventSource` and falls back to
+polling `/stats` if the stream is unavailable. Rebuilt on every code change
+with `cd web && bun run build` and embedded with the `webui` build tag (the
+Docker image does this automatically; the plain `go build` ships a 404 stub
+for the dashboard until `web/build` exists).
+
+### Measurement boundary
+
+Token figures are **estimates, not measured decode throughput**. The router
+measures requests, bytes, queue/concurrency/GPU state, total-duration EWMA,
+and streaming first-byte TTFT directly. It does **not** count output tokens:
+it streams response bytes through without parsing upstream usage (vLLM/SGLang
+expose per-request token usage inconsistently). `tokEst*` figures are the
+router's existing estimate of **new prefill tokens** from the request body
+(~4 bytes/token, last-message-only for multi-turn). The dashboard labels
+these `est`; requests/sec and bytes/sec are measured.
+
+
 ## Architecture
 
 The application is a single-file Go binary (`main.go`) using only the standard library. It builds without external runtime dependencies.
@@ -210,13 +248,16 @@ Per-backend request durations are tracked with an exponentially weighted moving 
 
 ### Build the binary
 
-The project requires Go 1.25 or newer and uses only the standard library:
+The project requires Go 1.25 or newer and uses only the standard library for
+the router itself:
 
 ```bash
-go build -o llm-router-go .
+go build -o llm-router-go .          # dashboard is a 404 stub
+cd web && bun install && bun run build
+go build -tags webui -o llm-router-go .   # embedded dashboard
 ```
 
-Run the resulting binary with `BACKENDS` and any optional environment variables from [Configuration](#configuration).
+Run the resulting binary with `BACKENDS` and any optional environment variables from [Configuration](#configuration). Without `-tags webui` the dashboard path returns 404 (`web/build` is absent); the Docker image and release builds always embed it.
 
 ### Build the Docker image
 

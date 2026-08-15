@@ -1,0 +1,364 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-15T08:58:11Z",
+  "title": "Design System: llm-router-go — Fleet Sheet",
+  "extensions": {
+    "colorMeta": {
+      "ink-ground": {
+        "role": "neutral",
+        "displayName": "Ink Ground",
+        "canonical": "#0a0a0b",
+        "tonalRamp": [
+          "oklch(0.18 0.001 286)",
+          "oklch(0.29 0.001 286)",
+          "oklch(0.39 0.001 286)",
+          "oklch(0.50 0.002 286)",
+          "oklch(0.60 0.002 286)",
+          "oklch(0.71 0.002 286)",
+          "oklch(0.81 0.002 286)",
+          "oklch(0.92 0.002 286)"
+        ]
+      },
+      "recess": {
+        "role": "neutral",
+        "displayName": "Recess Seam",
+        "canonical": "#161513",
+        "tonalRamp": [
+          "oklch(0.18 0.002 85)",
+          "oklch(0.29 0.003 85)",
+          "oklch(0.39 0.003 85)",
+          "oklch(0.50 0.003 85)",
+          "oklch(0.60 0.004 85)",
+          "oklch(0.71 0.004 85)",
+          "oklch(0.81 0.004 85)",
+          "oklch(0.92 0.004 85)"
+        ]
+      },
+      "cell-face": {
+        "role": "neutral",
+        "displayName": "Cell Face",
+        "canonical": "#0e0e10",
+        "tonalRamp": [
+          "oklch(0.18 0.002 286)",
+          "oklch(0.29 0.003 286)",
+          "oklch(0.39 0.003 286)",
+          "oklch(0.50 0.003 286)",
+          "oklch(0.60 0.004 286)",
+          "oklch(0.71 0.004 286)",
+          "oklch(0.81 0.004 286)",
+          "oklch(0.92 0.004 286)"
+        ]
+      },
+      "cell-face-hi": {
+        "role": "neutral",
+        "displayName": "Cell Face (raised)",
+        "canonical": "#141416",
+        "tonalRamp": [
+          "oklch(0.18 0.002 286)",
+          "oklch(0.29 0.002 286)",
+          "oklch(0.39 0.003 286)",
+          "oklch(0.50 0.003 286)",
+          "oklch(0.60 0.004 286)",
+          "oklch(0.71 0.004 286)",
+          "oklch(0.81 0.004 286)",
+          "oklch(0.92 0.004 286)"
+        ]
+      },
+      "mountain-dim": {
+        "role": "tertiary",
+        "displayName": "Mountain Crease (dim)",
+        "canonical": "#a6a6a0",
+        "tonalRamp": [
+          "oklch(0.18 0.005 107)",
+          "oklch(0.29 0.005 107)",
+          "oklch(0.39 0.006 107)",
+          "oklch(0.50 0.006 107)",
+          "oklch(0.60 0.009 107)",
+          "oklch(0.71 0.009 107)",
+          "oklch(0.81 0.009 107)",
+          "oklch(0.92 0.009 107)"
+        ]
+      },
+      "mountain-lit": {
+        "role": "tertiary",
+        "displayName": "Mountain Crease (lit)",
+        "canonical": "#e8e6e0",
+        "tonalRamp": [
+          "oklch(0.18 0.005 91)",
+          "oklch(0.29 0.005 91)",
+          "oklch(0.39 0.006 91)",
+          "oklch(0.50 0.006 91)",
+          "oklch(0.60 0.008 91)",
+          "oklch(0.71 0.008 91)",
+          "oklch(0.81 0.008 91)",
+          "oklch(0.92 0.008 91)"
+        ]
+      },
+      "valley-dim": {
+        "role": "secondary",
+        "displayName": "Valley Crease (dim)",
+        "canonical": "#8fa9c0",
+        "tonalRamp": [
+          "oklch(0.18 0.024 245)",
+          "oklch(0.29 0.027 245)",
+          "oklch(0.39 0.030 245)",
+          "oklch(0.50 0.033 245)",
+          "oklch(0.60 0.044 245)",
+          "oklch(0.71 0.044 245)",
+          "oklch(0.81 0.044 245)",
+          "oklch(0.92 0.044 245)"
+        ]
+      },
+      "valley-lit": {
+        "role": "secondary",
+        "displayName": "Valley Crease (lit)",
+        "canonical": "#cfe0ef",
+        "tonalRamp": [
+          "oklch(0.18 0.015 245)",
+          "oklch(0.29 0.017 245)",
+          "oklch(0.39 0.019 245)",
+          "oklch(0.50 0.020 245)",
+          "oklch(0.60 0.028 245)",
+          "oklch(0.71 0.028 245)",
+          "oklch(0.81 0.028 245)",
+          "oklch(0.92 0.028 245)"
+        ]
+      },
+      "gold": {
+        "role": "primary",
+        "displayName": "Gold Foil",
+        "canonical": "#c9a24b",
+        "tonalRamp": [
+          "oklch(0.18 0.063 85)",
+          "oklch(0.29 0.070 85)",
+          "oklch(0.39 0.078 85)",
+          "oklch(0.50 0.085 85)",
+          "oklch(0.60 0.115 85)",
+          "oklch(0.71 0.115 85)",
+          "oklch(0.81 0.115 85)",
+          "oklch(0.92 0.115 85)"
+        ]
+      },
+      "gold-lit": {
+        "role": "primary",
+        "displayName": "Gold Foil (lit)",
+        "canonical": "#e4c264",
+        "tonalRamp": [
+          "oklch(0.18 0.066 90)",
+          "oklch(0.29 0.074 90)",
+          "oklch(0.39 0.081 90)",
+          "oklch(0.50 0.089 90)",
+          "oklch(0.60 0.120 90)",
+          "oklch(0.71 0.120 90)",
+          "oklch(0.81 0.120 90)",
+          "oklch(0.92 0.120 90)"
+        ]
+      },
+      "text-primary": {
+        "role": "neutral",
+        "displayName": "Text Primary",
+        "canonical": "#edebe4",
+        "tonalRamp": [
+          "oklch(0.18 0.005 94)",
+          "oklch(0.29 0.006 94)",
+          "oklch(0.39 0.007 94)",
+          "oklch(0.50 0.007 94)",
+          "oklch(0.60 0.010 94)",
+          "oklch(0.71 0.010 94)",
+          "oklch(0.81 0.010 94)",
+          "oklch(0.92 0.010 94)"
+        ]
+      },
+      "text-secondary": {
+        "role": "neutral",
+        "displayName": "Text Secondary",
+        "canonical": "#a6a29a",
+        "tonalRamp": [
+          "oklch(0.18 0.007 85)",
+          "oklch(0.29 0.008 85)",
+          "oklch(0.39 0.008 85)",
+          "oklch(0.50 0.009 85)",
+          "oklch(0.60 0.012 85)",
+          "oklch(0.71 0.012 85)",
+          "oklch(0.81 0.012 85)",
+          "oklch(0.92 0.012 85)"
+        ]
+      },
+      "text-muted": {
+        "role": "neutral",
+        "displayName": "Text Muted",
+        "canonical": "#6e6a62",
+        "tonalRamp": [
+          "oklch(0.18 0.007 85)",
+          "oklch(0.29 0.008 85)",
+          "oklch(0.39 0.009 85)",
+          "oklch(0.50 0.010 85)",
+          "oklch(0.60 0.013 85)",
+          "oklch(0.71 0.013 85)",
+          "oklch(0.81 0.013 85)",
+          "oklch(0.92 0.013 85)"
+        ]
+      },
+      "signal-red": {
+        "role": "signal",
+        "displayName": "Signal Red",
+        "canonical": "#c0564b",
+        "tonalRamp": [
+          "oklch(0.18 0.076 28)",
+          "oklch(0.29 0.085 28)",
+          "oklch(0.39 0.094 28)",
+          "oklch(0.50 0.103 28)",
+          "oklch(0.60 0.139 28)",
+          "oklch(0.71 0.139 28)",
+          "oklch(0.81 0.139 28)",
+          "oklch(0.92 0.139 28)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Masthead wordmark only (Archivo 700 italic, 30px, -0.015em; 24px under 720px). The -go suffix is gold."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Readout rows, fleet foot, feed notes — JetBrains Mono 400 at 13px/1.45."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Panel/fleet-cell/tape-head labels: 10px, 0.14em, uppercase, muted."
+      },
+      "data-value": {
+        "displayName": "Data Value",
+        "purpose": "The fold-cell's current in-flight count: 30px 500 tabular, lit warm gray; 26px in the fleet strip."
+      }
+    },
+    "shadows": [
+      { "name": "cell-rest", "value": "0 1px 0 rgba(232,230,224,0.05)", "purpose": "The crease score under each cell's 1px lit top border — the only shadow at rest, a 1px score, not a blur." },
+      { "name": "hover-lift", "value": "0 10px 26px rgba(0,0,0,0.55), inset 0 1px 0 rgba(228,194,100,0.55)", "purpose": "Hover: the crease rises (translateY(-3px)) with a deep drop and a gold lit top edge." },
+      { "name": "opened-fold", "value": "0 0 0 1px rgba(228,194,100,0.4), 0 0 48px rgba(201,162,75,0.16), 0 14px 44px rgba(0,0,0,0.55)", "purpose": "Opened fold: 1px gold ring + 48px warm gold halo + drop — the selection glow." },
+      { "name": "saturated", "value": "inset 0 1px 0 rgba(192,86,75,0.5), 0 0 22px rgba(192,86,75,0.1)", "purpose": "Saturated/429: the cell inverts to red-on-ground with a faint red halo." },
+      { "name": "packet-btn-hover", "value": "0 0 18px rgba(201,162,75,0.28), inset 0 1px 0 rgba(228,194,100,0.4)", "purpose": "The gold-foil deploy control's hover glow." },
+      { "name": "health-live", "value": "0 0 8px rgba(228,194,100,0.8)", "purpose": "The live feed dot in the masthead (8px, live gold only; paused has none, offline is red at 0.7)." }
+    ],
+    "motion": [
+      { "name": "ease-fold", "value": "cubic-bezier(0.2, 0.8, 0.25, 1)", "purpose": "The fold easing for every cell transition (--ease-fold): fast start, long settling tail." },
+      { "name": "fold-cascade-step", "value": "55ms", "purpose": "Per-cell delay in the diagonal deploy cascade (--fold-step); each cell's --fold-delay is order*55ms, so the unfold travels along the tessellation diagonal." },
+      { "name": "fold-in", "value": "0.6s", "purpose": "One cell's unfold: scaleY(0.14) skewY(2deg) opacity 0 → none, over 0.6s with ease-fold, animation-fill backwards." },
+      { "name": "undulate", "value": "6.5s ease-in-out infinite", "purpose": "The deployed sheet breathes: cell faces translate up 2px on a 6.5s loop, offset per-cell by calc(var(--fold-delay) * -16) so the wave rides the diagonal. Only under prefers-reduced-motion: no-preference." },
+      { "name": "hover-sweep", "value": "0.8s", "purpose": "The 2px gold lit-edge sweep across the fold on hover: background-position -60% → 160% over 0.8s (opacity 0.3s)." },
+      { "name": "cell-lift", "value": "0.3s", "purpose": "Hover lift (transform/box-shadow) and background change timing." },
+      { "name": "detail-fade", "value": "0.25s", "purpose": "The hover detail readout row fades in with a 2px rise." },
+      { "name": "packet-btn", "value": "0.25s", "purpose": "The deploy control's color/box-shadow/background transitions." },
+      { "name": "trace-scroll", "value": "requestAnimationFrame", "purpose": "Not CSS: the scope's window scrolls at frame rate on a virtual clock anchored to server sample timestamps (data arrives on 500ms ticks); the y-scale eases at 0.15 lerp/frame. Under prefers-reduced-motion: reduce the rAF loop is off and the trace redraws on data ticks only." }
+    ],
+    "breakpoints": [
+      { "name": "compact", "value": "720px", "purpose": "The single responsive breakpoint: masthead stacks, fleet strip goes single-column, the opened fold's readout drops under the trace, and (in JS) the sheet auto-folds to the packet row." }
+    ]
+  },
+  "components": [
+    {
+      "name": "Packet Control (deploy/fold)",
+      "kind": "button",
+      "refersTo": "packet-btn",
+      "description": "The signature interaction: one gold-foil button that folds or deploys the entire tessellation in a stepped diagonal cascade; aria-pressed reflects state.",
+      "html": "<button class=\"ds-packet-btn\" aria-pressed=\"true\">[FOLD]</button>",
+      "css": ".ds-packet-btn { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase; color: #c9a24b; background: linear-gradient(180deg, rgba(201,162,75,0.16), rgba(201,162,75,0.04)); border: 1px solid rgba(201,162,75,0.55); border-top-color: rgba(228,194,100,0.9); padding: 8px 14px; border-radius: 0; cursor: pointer; transition: color 0.25s, box-shadow 0.25s, background 0.25s; } .ds-packet-btn:hover { color: #e4c264; box-shadow: 0 0 18px rgba(201,162,75,0.28), inset 0 1px 0 rgba(228,194,100,0.4); } .ds-packet-btn:focus-visible { outline: 1px solid #e4c264; outline-offset: 2px; }"
+    },
+    {
+      "name": "Fold Cell (deployed)",
+      "kind": "card",
+      "refersTo": "fold-cell",
+      "description": "One backend, one fold: crease ID + tier chip, big tabular value, a live gold trace on the crease grid, and a hover-only detail row. Hover lifts the crease and sweeps a gold lit-edge.",
+      "html": "<div class=\"ds-fold-cell\" role=\"button\" tabindex=\"0\" aria-expanded=\"false\"><div class=\"ds-cell-face\"><div class=\"ds-cell-top\"><span class=\"ds-crease-id\"><span class=\"ds-name\">vllm-king-0</span><span class=\"ds-tier ds-tier-king\">T0·KING</span></span><span class=\"ds-cell-val\">7<span class=\"ds-max\">/16</span></span></div><div class=\"ds-cell-trace\"><svg class=\"ds-line\" viewBox=\"0 0 220 64\" preserveAspectRatio=\"none\" aria-hidden=\"true\"><polyline points=\"0,46 28,43 56,48 84,38 112,41 140,32\" fill=\"none\" stroke=\"#8a6f35\" stroke-width=\"1\" opacity=\"0.4\"/><polyline points=\"140,32 168,28 196,21 220,15\" fill=\"none\" stroke=\"#e4c264\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><circle cx=\"220\" cy=\"15\" r=\"2.5\" fill=\"#e4c264\" opacity=\"0.9\"/></svg></div><div class=\"ds-cell-detail\"><span>inf <b>7/16</b></span><span>wait <b>0</b></span><span>prefill <b>2/4</b></span><span>ewma <b>1.4s</b></span><span>ttft <b>212ms</b></span></div></div></div>",
+      "css": ".ds-fold-cell { position: relative; display: flex; flex-direction: column; background: #0e0e10; min-height: 168px; border: 0; border-top: 1px solid rgba(232,230,224,0.1); box-shadow: 0 1px 0 rgba(232,230,224,0.05); border-radius: 0; cursor: pointer; font-family: 'JetBrains Mono', ui-monospace, monospace; transition: transform 0.3s cubic-bezier(0.2,0.8,0.25,1), box-shadow 0.3s cubic-bezier(0.2,0.8,0.25,1), background 0.3s; } .ds-fold-cell::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, #e4c264, transparent); background-size: 50% 100%; background-repeat: no-repeat; background-position: -60% 0; opacity: 0; transition: opacity 0.3s, background-position 0.8s cubic-bezier(0.2,0.8,0.25,1); pointer-events: none; } .ds-fold-cell:hover { transform: translateY(-3px); background: #141416; box-shadow: 0 10px 26px rgba(0,0,0,0.55), inset 0 1px 0 rgba(228,194,100,0.55); } .ds-fold-cell:hover::before { opacity: 1; background-position: 160% 0; } .ds-fold-cell:focus-visible { outline: 1px solid #e4c264; outline-offset: 2px; } .ds-fold-cell.is-saturated { border-top-color: rgba(192,86,75,0.85); box-shadow: inset 0 1px 0 rgba(192,86,75,0.5), 0 0 22px rgba(192,86,75,0.1); } .ds-cell-face { display: flex; flex-direction: column; flex: 1; padding: 10px 14px 8px; gap: 6px; } .ds-cell-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; } .ds-crease-id { font-size: 11px; font-weight: 500; letter-spacing: 0.08em; color: #e8e6e0; display: inline-flex; align-items: center; gap: 7px; } .ds-name { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .ds-tier { font-size: 9px; letter-spacing: 0.12em; color: #8fa9c0; border: 1px solid rgba(143,169,192,0.4); padding: 1px 4px; } .ds-tier-king { color: #e4c264; border-color: rgba(201,162,75,0.55); } .ds-cell-val { font-size: 30px; font-weight: 500; line-height: 1; color: #e8e6e0; font-variant-numeric: tabular-nums; } .ds-cell-val.saturated { color: #c0564b; } .ds-max { font-size: 13px; color: #6e6a62; } .ds-cell-trace { flex: 1; min-height: 0; position: relative; background: linear-gradient(115deg, transparent 30%, rgba(143,169,192,0.09) 30.25%, transparent 30.5%), repeating-linear-gradient(90deg, transparent 0 43px, rgba(166,166,160,0.12) 43px 44px); } .ds-line { position: absolute; inset: 0; width: 100%; height: 100%; display: block; } .ds-cell-detail { display: flex; gap: 14px; font-size: 10px; color: #a6a29a; letter-spacing: 0.04em; opacity: 0; transform: translateY(2px); transition: opacity 0.25s, transform 0.25s; white-space: nowrap; overflow: hidden; } .ds-fold-cell:hover .ds-cell-detail, .ds-fold-cell:focus-visible .ds-cell-detail { opacity: 1; transform: none; } .ds-cell-detail b { color: #edebe4; font-weight: 500; }"
+    },
+    {
+      "name": "Opened Fold (expanded cell)",
+      "kind": "card",
+      "refersTo": "fold-cell-open",
+      "description": "A clicked fold opens in place: spans the row (308px), gold ring + halo, full-height trace with signal switcher and ttft overlay, and a 272px readout column.",
+      "html": "<div class=\"ds-opened-fold\"><div class=\"ds-open-trace-wrap\"><div class=\"ds-switcher\"><button class=\"on\">in-flight</button><button>req/s</button><button>ttft</button><button>tok-est est</button><button>bytes/s</button><button>fold ✕</button></div><div class=\"ds-open-trace\"><svg class=\"ds-line\" viewBox=\"0 0 420 180\" preserveAspectRatio=\"none\" aria-hidden=\"true\"><line x1=\"0\" y1=\"62\" x2=\"420\" y2=\"62\" stroke=\"rgba(143,169,192,0.45)\" stroke-dasharray=\"4 4\"/><text x=\"416\" y=\"58\" fill=\"rgba(143,169,192,0.6)\" font-size=\"9\" text-anchor=\"end\" font-family=\"'JetBrains Mono', monospace\">16</text><polyline points=\"0,130 40,124 80,134 120,112 160,118 200,96 240,104 280,84 320,92 360,70 390,60 418,48\" fill=\"none\" stroke=\"#8a6f35\" stroke-width=\"1\" opacity=\"0.35\"/><polyline points=\"320,92 360,70 390,60 418,48\" fill=\"none\" stroke=\"#e4c264\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><polyline points=\"0,150 60,146 120,152 180,140 240,144 300,132 360,136 418,124\" fill=\"none\" stroke=\"#8fa9c0\" stroke-width=\"1\" opacity=\"0.55\"/><circle cx=\"418\" cy=\"48\" r=\"3\" fill=\"#e4c264\"/></svg></div><div class=\"ds-open-legend\"><span><i class=\"ds-swatch ds-swatch-gold\"></i>in-flight</span><span><i class=\"ds-swatch ds-swatch-valley\"></i>ttft overlay</span><span>7 in-flight · 0 waiting</span></div></div><div class=\"ds-readout\"><div class=\"ds-row\"><span class=\"ds-k\">in-flight</span><span class=\"ds-v\">7 / 16</span></div><div class=\"ds-row\"><span class=\"ds-k\">queue</span><span class=\"ds-v\">0 / 2 waiting</span></div><div class=\"ds-row\"><span class=\"ds-k\">ewma dur</span><span class=\"ds-v\">1.4s</span></div><div class=\"ds-row\"><span class=\"ds-k\">ttft</span><span class=\"ds-v\">212ms · 48 samples</span></div><div class=\"ds-row\"><span class=\"ds-k\">req rate</span><span class=\"ds-v\">3.2 /s (measured)</span></div><div class=\"ds-row\"><span class=\"ds-k\">tok rate</span><span class=\"ds-v\">142 <span class=\"ds-est\">est</span></span></div></div></div>",
+      "css": ".ds-opened-fold { display: grid; grid-template-columns: minmax(0,1fr) 272px; gap: 18px; background: #141416; min-height: 308px; box-shadow: 0 0 0 1px rgba(228,194,100,0.4), 0 0 48px rgba(201,162,75,0.16), 0 14px 44px rgba(0,0,0,0.55); border-radius: 0; padding: 10px 14px 8px; font-family: 'JetBrains Mono', ui-monospace, monospace; } .ds-open-trace-wrap { position: relative; display: flex; flex-direction: column; min-height: 0; } .ds-switcher { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; } .ds-switcher button { font-family: inherit; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #6e6a62; background: transparent; border: 1px solid rgba(166,166,160,0.25); border-radius: 0; padding: 4px 9px; cursor: pointer; transition: color 0.2s, border-color 0.2s, box-shadow 0.2s; } .ds-switcher button:hover { color: #edebe4; border-color: rgba(232,230,224,0.5); } .ds-switcher button.on { color: #e4c264; border-color: rgba(201,162,75,0.7); box-shadow: inset 0 1px 0 rgba(228,194,100,0.35); } .ds-open-trace { flex: 1; min-height: 0; position: relative; border: 1px solid rgba(166,166,160,0.18); background: linear-gradient(115deg, transparent 30%, rgba(143,169,192,0.09) 30.25%, transparent 30.5%), repeating-linear-gradient(90deg, transparent 0 43px, rgba(166,166,160,0.12) 43px 44px); } .ds-open-trace .ds-line { position: absolute; inset: 0; width: 100%; height: 100%; display: block; } .ds-open-legend { display: flex; gap: 16px; font-size: 10px; letter-spacing: 0.08em; color: #a6a29a; margin-top: 4px; } .ds-swatch { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; } .ds-swatch-gold { background: #e4c264; } .ds-swatch-valley { background: #8fa9c0; } .ds-readout { display: flex; flex-direction: column; min-width: 0; } .ds-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid rgba(166,166,160,0.12); font-size: 11px; } .ds-row:last-child { border-bottom: none; } .ds-k { color: #6e6a62; letter-spacing: 0.08em; text-transform: uppercase; font-size: 10px; } .ds-v { color: #edebe4; font-variant-numeric: tabular-nums; } .ds-est { color: #c9a24b; font-size: 9px; letter-spacing: 0.1em; }"
+    },
+    {
+      "name": "Fleet Strip Cell",
+      "kind": "card",
+      "refersTo": "fleet-cell",
+      "description": "One of three wide aggregate cells (req/s, ttft, tok-est/s) on the same skewed grid: uppercase label, 26px tabular value, live trace below; token cells carry the gold est.",
+      "html": "<div class=\"ds-fleet-cell\"><span class=\"ds-fleet-label\">tok/s · new-prefill <span class=\"ds-est\">est</span></span><span class=\"ds-fleet-value\">142</span><div class=\"ds-fleet-trace\"><svg class=\"ds-line\" viewBox=\"0 0 220 48\" preserveAspectRatio=\"none\" aria-hidden=\"true\"><polyline points=\"0,34 28,30 56,36 84,24 112,28 140,18 168,22 196,12 220,9\" fill=\"none\" stroke=\"#8a6f35\" stroke-width=\"1\" opacity=\"0.4\"/><polyline points=\"140,18 168,22 196,12 220,9\" fill=\"none\" stroke=\"#e4c264\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><circle cx=\"220\" cy=\"9\" r=\"2.5\" fill=\"#e4c264\"/></svg></div></div>",
+      "css": ".ds-fleet-cell { background: #0e0e10; min-height: 118px; padding: 10px 16px 8px; display: flex; flex-direction: column; gap: 4px; border-radius: 0; font-family: 'JetBrains Mono', ui-monospace, monospace; } .ds-fleet-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #6e6a62; } .ds-est { color: #c9a24b; font-size: 9px; letter-spacing: 0.1em; } .ds-fleet-value { font-size: 26px; line-height: 1; color: #e8e6e0; font-variant-numeric: tabular-nums; } .ds-fleet-trace { flex: 1; min-height: 0; position: relative; background: linear-gradient(115deg, transparent 30%, rgba(143,169,192,0.09) 30.25%, transparent 30.5%), repeating-linear-gradient(90deg, transparent 0 43px, rgba(166,166,160,0.12) 43px 44px); } .ds-fleet-trace .ds-line { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }"
+    },
+    {
+      "name": "Request Tape Entry",
+      "kind": "custom",
+      "refersTo": "tape-entry",
+      "description": "One line of the continuously scrolling request transcript: t · backend · path · status · ttft · dur · ~tok(est) / — gold 200, steel-blue throttled, red errors.",
+      "html": "<span class=\"ds-tape-entry\"><span class=\"ds-t\">14:02:11</span><span class=\"ds-be\">vllm-king-0</span><span class=\"ds-pa\">/v1/chat/completions</span><span class=\"ds-st ds-st-ok\">200</span><span class=\"ds-num\">212ms</span><span class=\"ds-num\">1.9s</span><span class=\"ds-num\">~142</span><span class=\"ds-sep\">/</span></span>",
+      "css": ".ds-tape-entry { display: inline-flex; gap: 8px; padding: 0 18px; font-size: 11px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; align-items: baseline; white-space: nowrap; } .ds-tape-entry .ds-t { color: #6e6a62; } .ds-tape-entry .ds-be { color: #edebe4; } .ds-tape-entry .ds-pa { color: #a6a29a; } .ds-tape-entry .ds-st { font-weight: 500; } .ds-st-ok { color: #c9a24b; } .ds-st-throttle { color: #8fa9c0; } .ds-st-err { color: #c0564b; } .ds-tape-entry .ds-num { color: #a6a29a; } .ds-tape-entry .ds-sep { color: #6e6a62; opacity: 0.5; }"
+    },
+    {
+      "name": "GPU Crease Gauge",
+      "kind": "custom",
+      "refersTo": "gpu-seg",
+      "description": "One skewed parallelogram segment per GPU budget slot: empty = steel-blue 10%, used = gold with lit border and glow, the next pending slot flashes a red top border when the queue is waiting.",
+      "html": "<span class=\"ds-gpu-gauge\" aria-label=\"gpu budget 3 of 5 used\"><i class=\"ds-gpu-seg ds-on\"></i><i class=\"ds-gpu-seg ds-on\"></i><i class=\"ds-gpu-seg ds-on\"></i><i class=\"ds-gpu-seg ds-wait\"></i><i class=\"ds-gpu-seg\"></i><span class=\"ds-gpu-num\">3/5 gpu</span><span class=\"ds-gpu-wait\">+1 waiting</span></span>",
+      "css": ".ds-gpu-gauge { display: inline-flex; align-items: center; gap: 3px; font-family: 'JetBrains Mono', ui-monospace, monospace; } .ds-gpu-seg { width: 12px; height: 9px; transform: skewX(-18deg); border: 1px solid rgba(143,169,192,0.35); background: rgba(143,169,192,0.1); border-radius: 0; display: inline-block; } .ds-gpu-seg.ds-on { background: #c9a24b; border-color: #e4c264; box-shadow: 0 0 7px rgba(201,162,75,0.55); } .ds-gpu-seg.ds-wait { border-top: 1px solid #c0564b; } .ds-gpu-num { font-size: 10px; color: #a6a29a; margin-left: 5px; font-variant-numeric: tabular-nums; } .ds-gpu-wait { font-size: 10px; color: #c0564b; margin-left: 5px; }"
+    },
+    {
+      "name": "Hollow Packet (empty state)",
+      "kind": "custom",
+      "refersTo": "hollow",
+      "description": "The empty state is an unfolded tessellation — the skewed ground plane with faint diagonal seam lines and no cells, not an empty-state card.",
+      "html": "<div class=\"ds-hollow\" role=\"status\"><span>no backends configured — set BACKENDS in the router</span></div>",
+      "css": ".ds-hollow { min-height: 240px; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(166,166,160,0.22); border-radius: 0; background: repeating-linear-gradient(115deg, transparent 0 38px, rgba(166,166,160,0.05) 38px 39px), repeating-linear-gradient(65deg, transparent 0 38px, rgba(143,169,192,0.045) 38px 39px), #0a0a0b; } .ds-hollow span { color: #6e6a62; font-size: 12px; letter-spacing: 0.12em; font-family: 'JetBrains Mono', ui-monospace, monospace; }"
+    },
+    {
+      "name": "Masthead Title",
+      "kind": "custom",
+      "refersTo": "mast-title",
+      "description": "The sheet's wordmark: Archivo 700 italic 30px in lit warm gray with a gold -go foil stamp, above a 10px uppercase muted subtitle.",
+      "html": "<div><h1 class=\"ds-mast-title\">llm-router<em>-go</em></h1><div class=\"ds-mast-sub\">fleet sheet · gpu-aware inference routing</div></div>",
+      "css": ".ds-mast-title { font-family: 'Archivo', 'JetBrains Mono', sans-serif; font-style: italic; font-weight: 700; letter-spacing: -0.015em; font-size: 30px; line-height: 1; margin: 0; color: #e8e6e0; } .ds-mast-title em { color: #c9a24b; font-style: inherit; } .ds-mast-sub { margin-top: 6px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #6e6a62; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Miura Fleet Sheet",
+    "overview": "The fleet is a sheet. Every backend is a fold-cell in one tessellated Miura grid, and the grid undulates with live load — what an operator sees at a glance is a single continuous surface, the whole fleet's requests, latency, and GPU pressure as one field of linked creases, not a scatter of unrelated cards. The world is dark-ink: a matte near-black sheet (#0a0a0b) scored with warm-gray mountain creases and steel-blue valley creases, carrying a single gold-foil live signal. The first thing the eye lands on is a live gold line moving on the sheet.\n\nThis is an operate-in-situ surface: an ML-infrastructure operator checks it while traffic is live, at arm's length, in a dark room. Density is high but disciplined — the data is the decoration. Every number is the router's actual in-flight state (never a stale or derived approximation), and the honesty boundary is visual: token figures are estimated prefill and always wear a gold est label; measured figures say so. The committed refusals, carried from the world contract: a row of equal dashboard cards, and the dark \"near-black + one neon accent + glowing edges\" ops board — here gold is a signal line, not a glow, and the sheet is one field, not a card grid.",
+    "keyCharacteristics": [
+      "One tessellated field of sharp-cornered parallelogram fold-cells under a shared isometric skew (-6deg)",
+      "Gold-foil (#c9a24b) as the only hot color: the live trace, the active state, nothing decorative",
+      "Depth by fold geometry, not shadows: recessed 1px seams, 1px crease-scored lit edges, a ~3% diagonal sheen",
+      "Archivo 700 italic for the masthead; JetBrains Mono for every number, ID, label, and line of the tape",
+      "One pull deploys the whole field: the [DEPLOY]/[FOLD] packet control cascades every cell in a stepped diagonal (55ms per cell)",
+      "The same sheet folds to a thin packet row — the mobile/compact mode is the fold, not a separate layout"
+    ],
+    "rules": [
+      { "name": "The One Hot Color Rule", "body": "Gold is the live signal and nothing else. Its rarity — thin lines, small lit edges, one button — is the point. A screen with a gold surface, a gold block, or gold used for emphasis of a non-signal value has left the world.", "section": "colors" },
+      { "name": "The Red Reservation Rule", "body": "Red appears only on 429/5xx/saturated/offline state. If a red pixel isn't a failure condition, delete it.", "section": "colors" },
+      { "name": "The Est Label Rule", "body": "Token figures are estimated new-prefill tokens, never measured decode throughput. Anywhere a token number appears, a gold est (9px, 0.1em) sits beside it: the fleet strip label, the readout rows, the tape's ~n column. A token figure without est is a lie about the data.", "section": "typography" },
+      { "name": "The Tabular Rule", "body": "Every live number uses tabular numerals. A ticking value that shifts horizontal weight has broken the sheet's calm.", "section": "typography" },
+      { "name": "The Fold-Is-Depth Rule", "body": "If a surface isn't reacting to hover, selection, or failure, it carries no shadow and no glow. Ambient depth is geometry — seams, crease scores, the sheen — not blur. Glassmorphism, heavy drop shadows, and decorative glows are outside this world.", "section": "elevation" },
+      { "name": "The Value-Wins Rule", "body": "A fold effect that makes a value hard to read loses to the value. The skew must never put a number behind another number; the cascade must not delay reading a value; text inside the skew is always counter-skewed.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do use gold (#c9a24b / #e4c264) only for live signals and active states: the trace line and its lit head, hover/selection edges, the packet control, focus outlines, and the est label.",
+      "Do counter-skew (.unskew) every text element inside a skewed container, so numbers stay horizontal, crisp, and selectable.",
+      "Do keep a gold est label on every token figure (fleet strip, readout, tape column) — token numbers are estimated prefill, not decode.",
+      "Do use tabular numerals on every value that ticks.",
+      "Do keep the sr-only flat table next to the tessellation; the sheet must always have its non-skewed accessible twin.",
+      "Do draw traces as a scrolling scope (server timestamps, eased y-scale, lit newest 30%, afterglow fade) on 500ms data ticks.",
+      "Do honor prefers-reduced-motion: reduce by disabling the deploy cascade, the undulation, the hover sweep, and the rAF scroll — the trace then redraws on ticks only."
+    ],
+    "donts": [
+      "Don't use gold for decoration, emphasis, or any surface — one hot color, live signal only.",
+      "Don't use red (#c0564b) for anything except 429/5xx/saturated/offline state.",
+      "Don't round a corner. Zero radius is the fold; the parallelogram comes from skew, not border-radius.",
+      "Don't let the skew obscure a value — no number behind another number; if a fold effect delays reading a value, the value wins.",
+      "Don't add ambient shadows, glassmorphism, or glows at rest; shadow/glow is a state response (hover lift, opened-fold ring, saturated inversion) in the exact documented values.",
+      "Don't present token throughput as measured; measured figures are req/s, bytes/s, durations.",
+      "Don't run a per-cell 60fps loop — one rAF-driven scope per trace instance, redrawn on data ticks otherwise.",
+      "Don't build the compact/mobile view as a separate layout — it is the folded sheet (packet row), driven by the same deploy state."
+    ]
+  }
+}

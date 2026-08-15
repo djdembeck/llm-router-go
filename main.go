@@ -19,6 +19,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/djdembeck/llm-router-go/web"
 )
 
 // ─── Config ───────────────────────────────────────────────────────────────
@@ -245,6 +247,166 @@ func (d *durationTracker) avgSeconds() float64 {
 	return d.ewma
 }
 
+// ─── Metrics registry (live observability) ────────────────────────────────
+
+// requestSample is one completed (or rejected) request, kept in the burst
+// ring and folded into per-backend counters.
+type requestSample struct {
+	T            time.Time
+	Backend      string
+	Path         string
+	Status       int
+	Stream       bool
+	DurMs        float64
+	TTFTMs       float64
+	NewTokensEst int
+	BytesIn      int64
+	BytesOut     int64
+}
+
+// backendMetrics holds per-backend counters, the streaming TTFT EWMA (ms),
+// and precomputed rates (refreshed by computeRates on the 500ms tick).
+type backendMetrics struct {
+	reqTotal      int64
+	bytesInTotal  int64
+	bytesOutTotal int64
+	tokEstTotal   int64
+	ttftEwma      float64 // ms
+	ttftSamples   int
+	reqRate       float64
+	bytesRate     float64
+	tokEstRate    float64
+	lastT         time.Time
+	lastReq       int64
+	lastBytesIn   int64
+	lastBytesOut  int64
+	lastTokEst    int64
+}
+
+// backendMetricSnapshot is the lock-free view of backendMetrics used by the
+// frame builder.
+type backendMetricSnapshot struct {
+	TTFTMs          float64
+	TTFTSampleCount int
+	ReqRate         float64
+	BytesRate       float64
+	TokEstRate      float64
+	ReqTotal        int64
+	BytesInTotal    int64
+	BytesOutTotal   int64
+	TokEstTotal     int64
+}
+
+// metricsRegistry is the mutex-guarded home for request counters, the TTFT
+// EWMA, and the bounded burst ring (newest appended, oldest evicted).
+type metricsRegistry struct {
+	mu         sync.Mutex
+	backends   map[string]*backendMetrics
+	ring       []requestSample
+	ringCap    int
+	rateBaseln time.Time // last tick at which per-backend baselines were taken
+}
+
+func newMetricsRegistry() *metricsRegistry {
+	return &metricsRegistry{backends: map[string]*backendMetrics{}, ringCap: 500}
+}
+
+var metrics = newMetricsRegistry()
+
+// recordRequest folds one sample into per-backend counters and the ring.
+// The TTFT EWMA updates only for streaming samples with TTFTMs > 0.
+func (m *metricsRegistry) recordRequest(backend string, s requestSample) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bm, ok := m.backends[backend]
+	if !ok {
+		bm = &backendMetrics{}
+		m.backends[backend] = bm
+	}
+	bm.reqTotal++
+	bm.bytesInTotal += s.BytesIn
+	bm.bytesOutTotal += s.BytesOut
+	bm.tokEstTotal += int64(s.NewTokensEst)
+	if s.Stream && s.TTFTMs > 0 {
+		if bm.ttftSamples == 0 {
+			bm.ttftEwma = s.TTFTMs
+		} else {
+			alpha := 0.3
+			bm.ttftEwma = alpha*s.TTFTMs + (1-alpha)*bm.ttftEwma
+		}
+		bm.ttftSamples++
+	}
+	m.ring = append(m.ring, s)
+	if len(m.ring) > m.ringCap {
+		m.ring = m.ring[len(m.ring)-m.ringCap:]
+	}
+}
+
+// burst returns up to limit ring samples, oldest first (newest last), capped
+// at the ring length.
+func (m *metricsRegistry) burst(limit int) []requestSample {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := len(m.ring)
+	if limit > n {
+		limit = n
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	out := make([]requestSample, limit)
+	copy(out, m.ring[n-limit:])
+	return out
+}
+
+// computeRates refreshes per-backend req/bytes/tok-est rates from counter
+// deltas over the interval since the last call. The first call only takes a
+// registry-level baseline (rates start on the following tick), so a backend
+// first seen between ticks measures over the full interval.
+func (m *metricsRegistry) computeRates(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.rateBaseln.IsZero() {
+		m.rateBaseln = now
+		return
+	}
+	dt := now.Sub(m.rateBaseln).Seconds()
+	m.rateBaseln = now
+	if dt <= 0 {
+		return
+	}
+	for _, bm := range m.backends {
+		bm.reqRate = float64(bm.reqTotal-bm.lastReq) / dt
+		bm.bytesRate = float64(bm.bytesInTotal+bm.bytesOutTotal-bm.lastBytesIn-bm.lastBytesOut) / dt
+		bm.tokEstRate = float64(bm.tokEstTotal-bm.lastTokEst) / dt
+		bm.lastReq = bm.reqTotal
+		bm.lastBytesIn = bm.bytesInTotal
+		bm.lastBytesOut = bm.bytesOutTotal
+		bm.lastTokEst = bm.tokEstTotal
+	}
+}
+
+func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var zero backendMetricSnapshot
+	bm, ok := m.backends[backend]
+	if !ok {
+		return zero
+	}
+	return backendMetricSnapshot{
+		TTFTMs:          bm.ttftEwma,
+		TTFTSampleCount: bm.ttftSamples,
+		ReqRate:         bm.reqRate,
+		BytesRate:       bm.bytesRate,
+		TokEstRate:      bm.tokEstRate,
+		ReqTotal:        bm.reqTotal,
+		BytesInTotal:    bm.bytesInTotal,
+		BytesOutTotal:   bm.bytesOutTotal,
+		TokEstTotal:     bm.tokEstTotal,
+	}
+}
+
 // ─── Global state ─────────────────────────────────────────────────────────
 
 var (
@@ -279,6 +441,22 @@ func tier0Inflight() int32 {
 		}
 	}
 	return total
+}
+
+// buildMux assembles the router's route table. /v1/ is the proxy prefix;
+// management routes are registered before it. A future web.Handler() would
+// be mounted at "/" by the caller, after this mux is built.
+func buildMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "vLLM router OK")
+	})
+	mux.HandleFunc("/stats", handleStats)
+	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/metrics/stream", handleMetricsStream)
+	mux.HandleFunc("/metrics/burst", handleBurst)
+	mux.HandleFunc("/v1/", handleProxy)
+	return mux
 }
 
 func main() {
@@ -401,13 +579,22 @@ func main() {
 		proxies[b.Name] = p
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "vLLM router OK")
-	})
-	mux.HandleFunc("/stats", handleStats)
-	mux.HandleFunc("/v1/models", handleModels)
-	mux.HandleFunc("/", handleProxy)
+	mux := buildMux()
+
+	// Mount the embedded SPA dashboard as the lowest-priority catch-all.
+	// buildMux() already registered the more specific management and proxy
+	// routes (/health, /stats, /v1/models, /metrics/*, /v1/); web.Handler()
+	// 404s any of those that reach it, so nothing is shadowed. Without the
+	// webui build tag web.Handler() is a 404 stub, so this is a no-op there.
+	mux.Handle("/", web.Handler())
+
+	// Refresh per-backend + fleet rates for the live metrics feed.
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		for range ticker.C {
+			metrics.computeRates(time.Now())
+		}
+	}()
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("vLLM router listening on %s with %d backends (queueTimeout=%s, gpuBudget=%v)",
@@ -601,6 +788,204 @@ func estimateRetryAfter(name string) int {
 	return estimate
 }
 
+// ─── /metrics/stream (SSE) + /metrics/burst ───────────────────────────────
+
+type backendFrame struct {
+	Name            string  `json:"name"`
+	URL             string  `json:"url"`
+	Tier            int     `json:"tier"`
+	InFlight        int32   `json:"inFlight"`
+	MaxConcurrent   int32   `json:"maxConcurrent"`
+	Waiting         int32   `json:"waiting"`
+	MaxQueueDepth   int32   `json:"maxQueueDepth"`
+	PrefillInFlight int32   `json:"prefillInFlight"`
+	PrefillWaiting  int32   `json:"prefillWaiting"`
+	PrefillMax      int32   `json:"prefillMax"`
+	AvgDurationS    float64 `json:"avgDurationS"`
+	EWMAms          float64 `json:"ewmaMs"`
+	TTFTms          float64 `json:"ttftMs"`
+	TTFTSampleCount int     `json:"ttftSampleCount"`
+	ReqRate         float64 `json:"reqRate"`
+	BytesRate       float64 `json:"bytesRate"`
+	TokEstRate      float64 `json:"tokEstRate"`
+	ReqTotal        int64   `json:"reqTotal"`
+	BytesInTotal    int64   `json:"bytesInTotal"`
+	BytesOutTotal   int64   `json:"bytesOutTotal"`
+	TokEstTotal     int64   `json:"tokEstTotal"`
+}
+
+type gpuFrame struct {
+	Used    int  `json:"used"`
+	Budget  int  `json:"budget"`
+	Waiting int  `json:"waiting"`
+	Active  bool `json:"active"`
+}
+
+type totalsFrame struct {
+	InFlight      int32   `json:"inFlight"`
+	Waiting       int32   `json:"waiting"`
+	ReqRate       float64 `json:"reqRate"`
+	BytesRate     float64 `json:"bytesRate"`
+	TokEstRate    float64 `json:"tokEstRate"`
+	ReqTotal      int64   `json:"reqTotal"`
+	BytesInTotal  int64   `json:"bytesInTotal"`
+	BytesOutTotal int64   `json:"bytesOutTotal"`
+	TokEstTotal   int64   `json:"tokEstTotal"`
+}
+
+type metricsFrame struct {
+	T             int64          `json:"t"`
+	Backends      []backendFrame `json:"backends"`
+	GPU           gpuFrame       `json:"gpu"`
+	Tier0Inflight int32          `json:"tier0Inflight"`
+	Totals        totalsFrame    `json:"totals"`
+}
+
+// buildMetricsFrame assembles one full live snapshot per the live metrics
+// contract.
+func buildMetricsFrame() metricsFrame {
+	f := metricsFrame{T: time.Now().UnixMilli(), Backends: make([]backendFrame, 0, len(backends))}
+	f.Tier0Inflight = tier0Inflight()
+
+	for _, b := range backends {
+		bf := backendFrame{
+			Name:         b.Name,
+			URL:          b.URL,
+			Tier:         b.Tier,
+			AvgDurationS: durations[b.Name].avgSeconds(),
+		}
+		if s, ok := slots[b.Name]; ok {
+			bf.InFlight, bf.MaxConcurrent, bf.Waiting, bf.MaxQueueDepth = s.snapshot()
+		}
+		if s, ok := prefillSlots[b.Name]; ok {
+			bf.PrefillInFlight, bf.PrefillMax, bf.PrefillWaiting, _ = s.snapshot()
+		}
+		ms := metrics.snapshot(b.Name)
+		bf.EWMAms = bf.AvgDurationS * 1000
+		bf.TTFTms = ms.TTFTMs
+		bf.TTFTSampleCount = ms.TTFTSampleCount
+		bf.ReqRate = ms.ReqRate
+		bf.BytesRate = ms.BytesRate
+		bf.TokEstRate = ms.TokEstRate
+		bf.ReqTotal = ms.ReqTotal
+		bf.BytesInTotal = ms.BytesInTotal
+		bf.BytesOutTotal = ms.BytesOutTotal
+		bf.TokEstTotal = ms.TokEstTotal
+		f.Backends = append(f.Backends, bf)
+
+		f.Totals.InFlight += bf.InFlight
+		f.Totals.Waiting += bf.Waiting
+		f.Totals.ReqRate += ms.ReqRate
+		f.Totals.BytesRate += ms.BytesRate
+		f.Totals.TokEstRate += ms.TokEstRate
+		f.Totals.ReqTotal += ms.ReqTotal
+		f.Totals.BytesInTotal += ms.BytesInTotal
+		f.Totals.BytesOutTotal += ms.BytesOutTotal
+		f.Totals.TokEstTotal += ms.TokEstTotal
+	}
+
+	// Active means the GPU budget mechanism is engaged: a budget exists AND
+	// tier-0 has in-flight requests. No budget configured → active false.
+	f.GPU.Active = gpu != nil && f.Tier0Inflight > 0
+	if gpu != nil {
+		f.GPU.Used, f.GPU.Budget, f.GPU.Waiting = gpu.snapshot()
+	}
+
+	return f
+}
+
+// handleMetricsStream pushes one JSON snapshot per SSE data frame every
+// interval (default 500ms, clamped 200ms..10s) until the client disconnects.
+func handleMetricsStream(w http.ResponseWriter, r *http.Request) {
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	interval := 500 * time.Millisecond
+	if v := r.URL.Query().Get("interval"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			interval = d
+		}
+	}
+	if interval < 200*time.Millisecond {
+		interval = 200 * time.Millisecond
+	}
+	if interval > 10*time.Second {
+		interval = 10 * time.Second
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		frame := buildMetricsFrame()
+		buf, err := json.Marshal(frame)
+		if err != nil {
+			return
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", buf); err != nil {
+			return
+		}
+		fl.Flush()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+type burstRequestFrame struct {
+	T            int64   `json:"t"`
+	Backend      string  `json:"backend"`
+	Path         string  `json:"path"`
+	Status       int     `json:"status"`
+	Stream       bool    `json:"stream"`
+	DurMs        float64 `json:"durMs"`
+	TTFTms       float64 `json:"ttftMs"`
+	NewTokensEst int     `json:"newTokensEst"`
+	BytesIn      int64   `json:"bytesIn"`
+	BytesOut     int64   `json:"bytesOut"`
+}
+
+// handleBurst serves the recent-request ring as {"requests":[...]} (newest
+// last), ?limit default 500, max 1000.
+func handleBurst(w http.ResponseWriter, r *http.Request) {
+	limit := 500
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	samples := metrics.burst(limit)
+	out := make([]burstRequestFrame, 0, len(samples))
+	for _, s := range samples {
+		out = append(out, burstRequestFrame{
+			T:            s.T.UnixMilli(),
+			Backend:      s.Backend,
+			Path:         s.Path,
+			Status:       s.Status,
+			Stream:       s.Stream,
+			DurMs:        s.DurMs,
+			TTFTms:       s.TTFTMs,
+			NewTokensEst: s.NewTokensEst,
+			BytesIn:      s.BytesIn,
+			BytesOut:     s.BytesOut,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"requests": out})
+}
+
 // ─── Proxy ────────────────────────────────────────────────────────────────
 
 // handleProxyError converts upstream transport failures into clean,
@@ -631,6 +1016,13 @@ func handleProxyError(w http.ResponseWriter, r *http.Request, err error, backend
 		code = "backend_unavailable"
 	}
 	log.Printf("%s %s -> %s %d %s: %v", r.Method, r.URL.Path, backend, status, code, err)
+	// The request never produced an upstream response byte, so the sample
+	// carries TTFT 0 and BytesOut 0. Record now (before the error body is
+	// written through the tracker) so the error body doesn't pollute bytesOut.
+	if t, ok := w.(*respTracker); ok {
+		t.status = status
+		t.finish(backend, r.URL.Path, status, 0, 0)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Retry-After", "5")
 	w.Header().Set("X-Router-Reason", code)
@@ -645,8 +1037,16 @@ func handleProxyError(w http.ResponseWriter, r *http.Request, err error, backend
 }
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
+	reqStart := time.Now()
 	if !strings.HasPrefix(r.URL.Path, "/v1/") {
 		http.NotFound(w, r)
+		return
+	}
+	// Production: unreachable (main fatals on an empty BACKENDS); tests swap
+	// the global backends slice, so a request racing teardown gets a clean
+	// 503 instead of an index panic.
+	if len(backends) == 0 {
+		http.Error(w, "no backends configured", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -657,6 +1057,15 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &maxErr) {
 			w.Header().Set("X-Router-Reason", "body-too-large")
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			// Model is unknown at this point; attribute to the default backend.
+			metrics.recordRequest(backends[0].Name, requestSample{
+				T:       time.Now(),
+				Backend: backends[0].Name,
+				Path:    r.URL.Path,
+				Status:  http.StatusRequestEntityTooLarge,
+				DurMs:   float64(time.Since(reqStart) / time.Millisecond),
+				BytesIn: int64(len(body)),
+			})
 			return
 		}
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
@@ -690,6 +1099,22 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Estimated NEW prefill tokens (request-body based, ~4 bytes/token).
+	// Computed once, before any admission decision: the large-prefill
+	// throttle and metrics both use this value.
+	newTokens := estimateNewTokens(&parsed)
+	reqContext := requestSample{
+		T:            time.Now(),
+		Backend:      target.Name,
+		Path:         r.URL.Path,
+		NewTokensEst: newTokens,
+	}
+	recordRejection := func(status int) {
+		reqContext.Status = status
+		reqContext.DurMs = float64(time.Since(reqStart) / time.Millisecond)
+		metrics.recordRequest(reqContext.Backend, reqContext)
+	}
+
 	cancelCh := r.Context().Done()
 	t0Inflight := tier0Inflight()
 
@@ -709,6 +1134,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s -> %s (model=%s) REJECTED: blocked by tier-0 (tier0Inflight=%d >= threshold %d)",
 			r.Method, r.URL.Path, target.Name, modelName, t0Inflight, target.BlockOnTier0)
 		write429(w, "blocked-by-tier0", target.Name, retry)
+		recordRejection(http.StatusTooManyRequests)
 		return
 	}
 
@@ -726,6 +1152,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				retry := estimateRetryAfter(target.Name)
 				log.Printf("%s %s -> %s (model=%s) 429: GPU budget full", r.Method, r.URL.Path, target.Name, modelName)
 				write429(w, "gpu-budget-full", target.Name, retry)
+				recordRejection(http.StatusTooManyRequests)
 				return
 			}
 		} else {
@@ -733,6 +1160,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				retry := estimateRetryAfter(target.Name)
 				log.Printf("%s %s -> %s (model=%s) 429: GPU budget full (race)", r.Method, r.URL.Path, target.Name, modelName)
 				write429(w, "gpu-budget-full", target.Name, retry)
+				recordRejection(http.StatusTooManyRequests)
 				return
 			}
 		}
@@ -757,6 +1185,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("%s %s -> %s (model=%s) 429: backend at capacity", r.Method, r.URL.Path, target.Name, modelName)
 			write429(w, stage, target.Name, retry)
+			recordRejection(http.StatusTooManyRequests)
 			return
 		}
 		defer sem.release()
@@ -777,7 +1206,6 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		if threshold == 0 {
 			threshold = 8192
 		}
-		newTokens := estimateNewTokens(&parsed)
 		if newTokens >= threshold {
 			pin, pmaxC, pwaiting, _ := prefillSem.snapshot()
 			if pin >= pmaxC {
@@ -795,6 +1223,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (newTokens=%d)",
 					r.Method, r.URL.Path, target.Name, modelName, newTokens)
 				write429(w, stage, target.Name, retry)
+				recordRejection(http.StatusTooManyRequests)
 				return
 			}
 			var prefillOnce sync.Once
@@ -830,6 +1259,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s -> %s (model=%s)", r.Method, r.URL.Path, target.Name, modelName)
 	}
 
+	// Duration + TTFT are measured from here (after admission/queue wait),
+	// matching the existing per-backend EWMA semantics. Rejections record
+	// queue-wait time from reqStart instead.
 	start := time.Now()
 	proxy := proxies[target.Name]
 	// Wrap ResponseWriter to capture status + detect completion for duration
@@ -838,6 +1270,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		ResponseWriter: w,
 		status:         200,
 		onFirstByte:    prefillRelease,
+		reqStart:       start,
+		stream:         parsed.Stream,
+		newTokensEst:   newTokens,
+		bytesIn:        int64(len(body)),
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
@@ -846,6 +1282,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	prefillRelease() // fallback: release if no response was ever written
 	durations[target.Name].record(time.Since(start))
+
+	// TTFT is only meaningful for streaming requests (time to first byte).
+	var ttftMs float64
+	if parsed.Stream && !tracker.firstByteAt.IsZero() {
+		ttftMs = float64(tracker.firstByteAt.Sub(start) / time.Millisecond)
+	}
+	tracker.finish(target.Name, r.URL.Path, tracker.status, ttftMs, tracker.bytesOut)
 }
 
 type respTracker struct {
@@ -853,12 +1296,27 @@ type respTracker struct {
 	status      int
 	wrote       bool
 	onFirstByte func() // called on first WriteHeader/Write; used to release prefill slot
+	// firstByteAt: time of the first response byte; if only WriteHeader
+	// ever happens (no body byte), the WriteHeader time is the fallback.
+	firstByteAt time.Time
+	bodyByte    bool // a Write with n>0 has happened
+	bytesOut    int64
+
+	// Request context for metrics recording (set at construction).
+	reqStart     time.Time
+	stream       bool
+	newTokensEst int
+	bytesIn      int64
+	recorded     bool // finish guard: exactly one sample per request
 }
 
 func (t *respTracker) WriteHeader(code int) {
 	if !t.wrote {
 		t.status = code
 		t.wrote = true
+		if !t.bodyByte {
+			t.firstByteAt = time.Now() // fallback; first body byte overrides
+		}
 		if t.onFirstByte != nil {
 			t.onFirstByte()
 		}
@@ -873,7 +1331,37 @@ func (t *respTracker) Write(b []byte) (int, error) {
 			t.onFirstByte()
 		}
 	}
-	return t.ResponseWriter.Write(b)
+	n, err := t.ResponseWriter.Write(b)
+	if n > 0 {
+		if !t.bodyByte {
+			t.firstByteAt = time.Now()
+			t.bodyByte = true
+		}
+		t.bytesOut += int64(n)
+	}
+	return n, err
+}
+
+// finish records the metrics sample for this request exactly once. Called
+// from the normal completion path (real status, TTFT, bytesOut) and from
+// handleProxyError when it itself wrote a 502/503 (TTFTMs 0, BytesOut 0).
+func (t *respTracker) finish(backend, path string, status int, ttftMs float64, bytesOut int64) {
+	if t.recorded {
+		return
+	}
+	t.recorded = true
+	metrics.recordRequest(backend, requestSample{
+		T:            time.Now(),
+		Backend:      backend,
+		Path:         path,
+		Status:       status,
+		Stream:       t.stream,
+		DurMs:        float64(time.Since(t.reqStart) / time.Millisecond),
+		TTFTMs:       ttftMs,
+		NewTokensEst: t.newTokensEst,
+		BytesIn:      t.bytesIn,
+		BytesOut:     bytesOut,
+	})
 }
 
 func (t *respTracker) Flush() {

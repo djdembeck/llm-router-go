@@ -1,0 +1,903 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Vast Miura-Fold Sheet — dark mode
+   The fleet is a sheet: one tessellated Miura grid of live fold-cells.
+   Dark-ink ground, warm-gray mountain creases, steel-blue valley creases,
+   gold-foil live signal. Sharp fold corners, 1px crease scores with lit
+   edges, a ~3% diagonal sheen, an isometric skew on the grid container
+   (text is counter-skewed so it stays crisp and selectable). The deploy
+   cascade runs along the diagonal and is disabled under
+   prefers-reduced-motion. Token rates are ESTIMATED new-prefill tokens and
+   always carry an "est" label.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ground */
+  --ground: #0a0a0b;
+  --recess: #161513;
+  --face: #0e0e10;
+  --face-hi: #141416;
+
+  /* mountain crease (warm gray) */
+  --mt-dim: #a6a6a0;
+  --mt-lit: #e8e6e0;
+  /* valley crease (steel blue) */
+  --vl-dim: #8fa9c0;
+  --vl-lit: #cfe0ef;
+  /* gold-foil accent */
+  --gold: #c9a24b;
+  --gold-lit: #e4c264;
+
+  /* text */
+  --tx-1: #edebe4;
+  --tx-2: #a6a29a;
+  --tx-3: #6e6a62;
+
+  /* signal red — reserved for 429 / 5xx / saturated */
+  --red: #c0564b;
+
+  /* geometry */
+  --skew: -6deg;
+  --fold-step: 55ms;
+  --cell-h: 168px;
+  --cell-h-open: 308px;
+  --cell-h-pkt: 46px;
+  --ease-fold: cubic-bezier(0.2, 0.8, 0.25, 1);
+}
+
+html {
+  background: var(--ground);
+}
+
+body {
+  margin: 0;
+  background:
+    linear-gradient(
+      115deg,
+      transparent 30%,
+      rgba(232, 230, 224, 0.025) 46%,
+      transparent 62%
+    ),
+    var(--ground);
+  color: var(--tx-1);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
+}
+
+::selection {
+  background: rgba(201, 162, 75, 0.35);
+}
+
+/* Archivo — the display face (700 italic, tight) */
+.display {
+  font-family: "Archivo", "JetBrains Mono", sans-serif;
+  font-style: italic;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+
+/* counter-skew: keeps text crisp + horizontal inside the skewed sheet */
+.unskew {
+  transform: skewX(calc(-1 * var(--skew)));
+}
+
+button {
+  font-family: inherit;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* A <table> treats width as a minimum and sizes to its content (large
+   tables blow past 1px and extend the document scroll region even though
+   paint is clipped). Collapse the layout box so it can never produce
+   horizontal overflow, while keeping the element a real table for AT. */
+.sr-only:is(table) {
+  display: block;
+  width: 1px;
+}
+
+:focus-visible {
+  outline: 1px solid var(--gold-lit);
+  outline-offset: 2px;
+}
+
+/* ── crease line: 1px scored fold with a lit edge ─────────────────────── */
+.crease {
+  position: relative;
+  height: 1px;
+  background: rgba(166, 166, 160, 0.28);
+}
+.crease::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: rgba(232, 230, 224, 0.1);
+}
+
+/* ── page frame ───────────────────────────────────────────────────────── */
+.page {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 18px 28px 48px;
+}
+
+/* ── masthead ─────────────────────────────────────────────────────────── */
+.masthead {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding-bottom: 12px;
+}
+.mast-title {
+  font-size: 30px;
+  line-height: 1;
+  margin: 0;
+  color: var(--mt-lit);
+}
+.mast-title em {
+  color: var(--gold);
+  font-style: inherit;
+}
+.mast-sub {
+  margin-top: 6px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+}
+.mast-mid {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.mast-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.clock {
+  font-size: 21px;
+  color: var(--tx-1);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--tx-2);
+  letter-spacing: 0.05em;
+  flex-wrap: wrap;
+}
+.status-line b {
+  color: var(--mt-lit);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.stat-dot {
+  color: var(--tx-3);
+}
+
+.health {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--gold-lit);
+}
+.health i {
+  width: 7px;
+  height: 7px;
+  background: var(--gold-lit);
+  box-shadow: 0 0 8px rgba(228, 194, 100, 0.8);
+  display: inline-block;
+}
+.health[data-h="paused"] {
+  color: var(--tx-2);
+}
+.health[data-h="paused"] i {
+  background: var(--tx-3);
+  box-shadow: none;
+}
+.health[data-h="offline"] {
+  color: var(--red);
+}
+.health[data-h="offline"] i {
+  background: var(--red);
+  box-shadow: 0 0 8px rgba(192, 86, 75, 0.7);
+}
+
+/* gold-foil packet control — the signature interaction */
+.packet-btn {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--gold);
+  background: linear-gradient(
+    180deg,
+    rgba(201, 162, 75, 0.16),
+    rgba(201, 162, 75, 0.04)
+  );
+  border: 1px solid rgba(201, 162, 75, 0.55);
+  border-top-color: rgba(228, 194, 100, 0.9);
+  padding: 8px 14px;
+  cursor: pointer;
+  transition:
+    color 0.25s,
+    box-shadow 0.25s,
+    background 0.25s;
+}
+.packet-btn:hover {
+  color: var(--gold-lit);
+  box-shadow:
+    0 0 18px rgba(201, 162, 75, 0.28),
+    inset 0 1px 0 rgba(228, 194, 100, 0.4);
+}
+
+/* ── gpu crease-gauge ─────────────────────────────────────────────────── */
+.gpu-gauge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.gpu-seg {
+  width: 12px;
+  height: 9px;
+  transform: skewX(-18deg);
+  border: 1px solid rgba(143, 169, 192, 0.35);
+  background: rgba(143, 169, 192, 0.1);
+}
+.gpu-seg.on {
+  background: var(--gold);
+  border-color: var(--gold-lit);
+  box-shadow: 0 0 7px rgba(201, 162, 75, 0.55);
+}
+.gpu-seg.wait {
+  border-top: 1px solid var(--red);
+}
+.gpu-num {
+  font-size: 10px;
+  color: var(--tx-2);
+  margin-left: 5px;
+  font-variant-numeric: tabular-nums;
+}
+.gpu-wait {
+  font-size: 10px;
+  color: var(--red);
+  margin-left: 5px;
+}
+.gpu-none {
+  font-size: 10px;
+  color: var(--tx-3);
+  letter-spacing: 0.12em;
+}
+
+/* ── the sheet: tessellated parallelogram grid under isometric skew ──── */
+.sheet-viewport {
+  overflow: visible;
+  margin-top: 18px;
+}
+.sheet {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(252px, 1fr));
+  gap: 1px;
+  background: var(--recess);
+  border: 1px solid rgba(166, 166, 160, 0.3);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 224, 0.07);
+  transform: skewX(var(--skew));
+  transform-origin: 50% 0;
+}
+/* the diagonal sheen — ~3% light shift along the tessellation diagonal */
+.sheet::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    115deg,
+    transparent 34%,
+    rgba(232, 230, 224, 0.03) 48%,
+    transparent 62%
+  );
+  pointer-events: none;
+}
+
+/* ── fold-cell ────────────────────────────────────────────────────────── */
+.fold-cell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--face);
+  min-height: var(--cell-h);
+  border-top: 1px solid rgba(232, 230, 224, 0.1);
+  box-shadow: 0 1px 0 rgba(232, 230, 224, 0.05);
+  cursor: pointer;
+  transition:
+    transform 0.3s var(--ease-fold),
+    box-shadow 0.3s var(--ease-fold),
+    min-height 0.5s var(--ease-fold) var(--fold-delay, 0ms),
+    opacity 0.4s var(--ease-fold) var(--fold-delay, 0ms),
+    background 0.3s;
+}
+.fold-cell:hover {
+  transform: translateY(-3px);
+  z-index: 3;
+  background: var(--face-hi);
+  box-shadow:
+    0 10px 26px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(228, 194, 100, 0.55);
+}
+/* gold lit-edge sweep across the fold on hover */
+.fold-cell::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--gold-lit), transparent);
+  background-size: 50% 100%;
+  background-repeat: no-repeat;
+  background-position: -60% 0;
+  opacity: 0;
+  transition:
+    opacity 0.3s,
+    background-position 0.8s var(--ease-fold);
+  z-index: 4;
+}
+.fold-cell:hover::before {
+  opacity: 1;
+  background-position: 160% 0;
+}
+/* saturated / 429: the cell inverts to red-on-ground */
+.fold-cell.is-saturated {
+  border-top-color: rgba(192, 86, 75, 0.85);
+  box-shadow:
+    inset 0 1px 0 rgba(192, 86, 75, 0.5),
+    0 0 22px rgba(192, 86, 75, 0.1);
+}
+/* opened fold: spans the row, full-height trace, warm gold selection glow */
+.fold-cell.is-open {
+  grid-column: 1 / -1;
+  min-height: var(--cell-h-open);
+  cursor: default;
+  background: var(--face-hi);
+  box-shadow:
+    0 0 0 1px rgba(228, 194, 100, 0.4),
+    0 0 48px rgba(201, 162, 75, 0.16),
+    0 14px 44px rgba(0, 0, 0, 0.55);
+}
+
+/* undulation — the deployed sheet breathes along the diagonal */
+@keyframes undulate {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .sheet.is-deployed:not(.is-folded) .cell-face {
+    animation: undulate 6.5s ease-in-out infinite;
+    animation-delay: calc(var(--fold-delay, 0ms) * -16);
+  }
+}
+
+/* the deploy cascade: cells unfold along the diagonal, stepped */
+@keyframes fold-in {
+  0% {
+    transform: scaleY(0.14) skewY(2deg);
+    opacity: 0;
+  }
+  60% {
+    opacity: 1;
+  }
+  100% {
+    transform: none;
+    opacity: 1;
+  }
+}
+.sheet.cascade .fold-cell {
+  animation: fold-in 0.6s var(--ease-fold) backwards;
+  animation-delay: var(--fold-delay, 0ms);
+}
+
+/* ── cell interiors ───────────────────────────────────────────────────── */
+.cell-face {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  padding: 10px 14px 8px;
+  gap: 6px;
+}
+
+.cell-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.crease-id {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--mt-lit);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.crease-id .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tier {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--vl-dim);
+  border: 1px solid rgba(143, 169, 192, 0.4);
+  padding: 1px 4px;
+  flex: none;
+}
+.tier.king {
+  color: var(--gold-lit);
+  border-color: rgba(201, 162, 75, 0.55);
+}
+.cell-val {
+  font-size: 30px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--mt-lit);
+  font-variant-numeric: tabular-nums;
+}
+.cell-val .max {
+  font-size: 13px;
+  color: var(--tx-3);
+}
+.cell-val.saturated {
+  color: var(--red);
+}
+.cell-trace {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+.cell-detail {
+  display: flex;
+  gap: 14px;
+  font-size: 10px;
+  color: var(--tx-2);
+  letter-spacing: 0.04em;
+  opacity: 0;
+  transform: translateY(2px);
+  transition:
+    opacity 0.25s,
+    transform 0.25s;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.fold-cell:hover .cell-detail,
+.fold-cell:focus-visible .cell-detail {
+  opacity: 1;
+  transform: none;
+}
+.cell-detail b {
+  color: var(--tx-1);
+  font-weight: 500;
+}
+.cell-detail .red {
+  color: var(--red);
+}
+
+/* ── packet row (folded / compact / mobile mode) ──────────────────────── */
+.cell-pkt {
+  display: none;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  padding: 0 4px;
+}
+.sheet.is-folded {
+  grid-template-columns: 1fr;
+}
+.sheet.is-folded .fold-cell {
+  min-height: var(--cell-h-pkt);
+  cursor: default;
+}
+.sheet.is-folded .cell-face,
+.sheet.is-folded .cell-open {
+  display: none;
+}
+.sheet.is-folded .cell-pkt {
+  display: flex;
+}
+.pkt-id {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--tx-2);
+  width: 86px;
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pkt-trace {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+}
+.pkt-val {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--mt-lit);
+  font-variant-numeric: tabular-nums;
+  width: 26px;
+  text-align: right;
+}
+
+/* ── opened fold: full-height trace + readout column + switcher ───────── */
+.cell-open {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr) 272px;
+  gap: 18px;
+}
+.fold-cell.is-open .cell-open {
+  display: grid;
+}
+.fold-cell.is-open .cell-face {
+  display: none;
+}
+.open-trace-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.open-trace {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  border: 1px solid rgba(166, 166, 160, 0.18);
+}
+.open-legend {
+  display: flex;
+  gap: 16px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--tx-2);
+  margin-top: 4px;
+}
+.open-legend .swatch {
+  display: inline-block;
+  width: 14px;
+  height: 2px;
+  vertical-align: middle;
+  margin-right: 5px;
+}
+.swatch.gold {
+  background: var(--gold-lit);
+}
+.swatch.valley {
+  background: var(--vl-dim);
+}
+.switcher {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.switcher button {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+  background: transparent;
+  border: 1px solid rgba(166, 166, 160, 0.25);
+  padding: 4px 9px;
+  cursor: pointer;
+  transition:
+    color 0.2s,
+    border-color 0.2s,
+    box-shadow 0.2s;
+}
+.switcher button:hover {
+  color: var(--tx-1);
+  border-color: rgba(232, 230, 224, 0.5);
+}
+.switcher button.on {
+  color: var(--gold-lit);
+  border-color: rgba(201, 162, 75, 0.7);
+  box-shadow: inset 0 1px 0 rgba(228, 194, 100, 0.35);
+}
+.readout {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+.readout .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(166, 166, 160, 0.12);
+  font-size: 11px;
+}
+.readout .row:last-child {
+  border-bottom: none;
+}
+.readout .k {
+  color: var(--tx-3);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+.readout .v {
+  color: var(--tx-1);
+  font-variant-numeric: tabular-nums;
+}
+.readout .v .est {
+  color: var(--gold);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+}
+.readout .v.red {
+  color: var(--red);
+}
+.open-url {
+  font-size: 10px;
+  color: var(--tx-3);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── fleet strip ──────────────────────────────────────────────────────── */
+.fleet-strip {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--recess);
+  border: 1px solid rgba(166, 166, 160, 0.3);
+  transform: skewX(var(--skew));
+  transform-origin: 50% 0;
+}
+.fleet-cell {
+  background: var(--face);
+  min-height: 118px;
+  padding: 10px 16px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+}
+.fleet-cell .label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+}
+.fleet-cell .label .est {
+  color: var(--gold);
+}
+.fleet-cell .value {
+  font-size: 26px;
+  line-height: 1;
+  color: var(--mt-lit);
+  font-variant-numeric: tabular-nums;
+}
+.fleet-cell .unit {
+  font-size: 11px;
+  color: var(--tx-3);
+  font-style: normal;
+}
+.fleet-cell .trace-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+.fleet-foot {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--tx-3);
+  letter-spacing: 0.03em;
+  transform: skewX(var(--skew));
+  transform-origin: 50% 0;
+  padding: 0 8px;
+}
+
+/* ── request tape: the continuous transcript ──────────────────────────── */
+.tape-wrap {
+  margin-top: 16px;
+  transform: skewX(var(--skew));
+  transform-origin: 50% 0;
+  border-top: 1px solid rgba(166, 166, 160, 0.3);
+  border-bottom: 1px solid rgba(166, 166, 160, 0.3);
+  background: linear-gradient(180deg, rgba(22, 21, 19, 0.65), rgba(22, 21, 19, 0.2));
+}
+.tape-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 14px 0;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+}
+.tape-head .spikes {
+  color: var(--tx-2);
+}
+.tape-head .spikes.hot {
+  color: var(--red);
+}
+.tape-vp {
+  overflow: hidden;
+  padding: 4px 0 7px;
+  /* fade the edges of the window */
+  -webkit-mask-image: linear-gradient(
+    90deg,
+    transparent 0,
+    #000 3%,
+    #000 97%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(90deg, transparent 0, #000 3%, #000 97%, transparent 100%);
+}
+.tape-track {
+  display: inline-flex;
+  white-space: nowrap;
+  will-change: transform;
+}
+.tape-half {
+  display: inline-flex;
+  white-space: nowrap;
+}
+.tape-entry {
+  display: inline-flex;
+  gap: 8px;
+  padding: 0 18px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  align-items: baseline;
+}
+.tape-entry .sep {
+  color: var(--tx-3);
+  opacity: 0.5;
+}
+.tape-entry .t {
+  color: var(--tx-3);
+}
+.tape-entry .be {
+  color: var(--tx-1);
+}
+.tape-entry .pa {
+  color: var(--tx-2);
+}
+.tape-entry .st {
+  font-weight: 500;
+}
+.st-ok {
+  color: var(--gold);
+}
+.st-throttle {
+  color: var(--vl-dim);
+}
+.st-err {
+  color: var(--red);
+}
+.tape-entry .num {
+  color: var(--tx-2);
+}
+.tape-idle {
+  padding: 4px 14px 7px;
+  font-size: 11px;
+  color: var(--tx-3);
+}
+
+/* ── hollow packet: empty state is an unfolded tessellation ───────────── */
+.hollow {
+  margin-top: 18px;
+  min-height: 240px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(166, 166, 160, 0.22);
+  transform: skewX(var(--skew));
+  transform-origin: 50% 0;
+  background:
+    repeating-linear-gradient(
+      115deg,
+      transparent 0 38px,
+      rgba(166, 166, 160, 0.05) 38px 39px
+    ),
+    repeating-linear-gradient(
+      65deg,
+      transparent 0 38px,
+      rgba(143, 169, 192, 0.045) 38px 39px
+    ),
+    var(--ground);
+}
+.hollow span {
+  transform: skewX(calc(-1 * var(--skew)));
+  color: var(--tx-3);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+}
+
+/* ── reduced motion: no cascade, no undulation, no sweep ──────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .sheet.cascade .fold-cell {
+    animation: none;
+  }
+  .fold-cell,
+  .fold-cell::before,
+  .cell-detail {
+    transition: none;
+  }
+  .tape-track {
+    transform: none !important;
+  }
+}
+
+/* ── compact ──────────────────────────────────────────────────────────── */
+@media (max-width: 720px) {
+  .page {
+    padding: 14px 14px 36px;
+  }
+  .masthead {
+    align-items: flex-start;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .mast-right {
+    justify-content: space-between;
+  }
+  .mast-title {
+    font-size: 24px;
+  }
+  .fleet-strip {
+    grid-template-columns: 1fr;
+  }
+  .fold-cell.is-open {
+    grid-template-columns: 1fr;
+  }
+  .cell-open {
+    grid-template-columns: 1fr !important;
+  }
+}
