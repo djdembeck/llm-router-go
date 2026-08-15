@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -392,6 +394,10 @@ func main() {
 		p := httputil.NewSingleHostReverseProxy(u)
 		p.FlushInterval = -1 // flush immediately for SSE streaming
 		p.Transport = proxyTransport
+		name := b.Name
+		p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			handleProxyError(w, r, err, name)
+		}
 		proxies[b.Name] = p
 	}
 
@@ -596,6 +602,47 @@ func estimateRetryAfter(name string) int {
 }
 
 // ─── Proxy ────────────────────────────────────────────────────────────────
+
+// handleProxyError converts upstream transport failures into clean,
+// OpenAI-style JSON errors instead of Go's bare "http: proxy error" 502.
+//
+// Classification:
+//   - client canceled: log quietly; nothing can be written
+//   - response already started (engine died mid-stream): the status line is
+//     fixed; log and end the stream
+//   - transport failure (dial refused/reset, EOF, timeout): 503
+//     backend_unavailable + Retry-After — the engine is down or restarting;
+//     the request never reached it, so retrying is safe
+//   - anything else (e.g. malformed upstream response): 502 bad_gateway
+func handleProxyError(w http.ResponseWriter, r *http.Request, err error, backend string) {
+	if errors.Is(err, context.Canceled) {
+		log.Printf("%s %s -> %s client canceled during upstream roundtrip", r.Method, r.URL.Path, backend)
+		return
+	}
+	if t, ok := w.(*respTracker); ok && t.wrote {
+		log.Printf("%s %s -> %s upstream failed mid-response: %v", r.Method, r.URL.Path, backend, err)
+		return
+	}
+	status := http.StatusBadGateway
+	code := "bad_gateway"
+	var opErr *net.OpError
+	if errors.As(err, &opErr) || errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded) {
+		status = http.StatusServiceUnavailable
+		code = "backend_unavailable"
+	}
+	log.Printf("%s %s -> %s %d %s: %v", r.Method, r.URL.Path, backend, status, code, err)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", "5")
+	w.Header().Set("X-Router-Reason", code)
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("backend %q unavailable (engine down or restarting): %v", backend, err),
+			"type":    "server_error",
+			"code":    code,
+		},
+	})
+}
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(r.URL.Path, "/v1/") {

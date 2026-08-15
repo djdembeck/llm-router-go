@@ -1,7 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -338,5 +345,91 @@ func TestEstimateNewTokens_MultiTurnCaching(t *testing.T) {
 
 	if got2 != want2 {
 		t.Errorf("two-message case: got %d tokens, want %d (all messages should count)", got2, want2)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// handleProxyError
+// ---------------------------------------------------------------------------
+
+func TestHandleProxyError_Classification(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantErr  string // error.code in JSON body + X-Router-Reason
+	}{
+		{"connection refused", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}, http.StatusServiceUnavailable, "backend_unavailable"},
+		{"eof before response", io.EOF, http.StatusServiceUnavailable, "backend_unavailable"},
+		{"i/o deadline", os.ErrDeadlineExceeded, http.StatusServiceUnavailable, "backend_unavailable"},
+		{"malformed upstream response", errors.New("malformed HTTP response"), http.StatusBadGateway, "bad_gateway"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+
+			handleProxyError(rec, req, tt.err, "qwen3.6-27b")
+
+			if rec.Code != tt.wantCode {
+				t.Errorf("status: got %d, want %d", rec.Code, tt.wantCode)
+			}
+			if got := rec.Header().Get("X-Router-Reason"); got != tt.wantErr {
+				t.Errorf("X-Router-Reason: got %q, want %q", got, tt.wantErr)
+			}
+			if got := rec.Header().Get("Retry-After"); got == "" {
+				t.Error("Retry-After header missing")
+			}
+			var body struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Code    string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("response is not valid JSON: %v (body %q)", err, rec.Body.String())
+			}
+			if body.Error.Code != tt.wantErr {
+				t.Errorf("error.code: got %q, want %q", body.Error.Code, tt.wantErr)
+			}
+			if body.Error.Type != "server_error" {
+				t.Errorf("error.type: got %q, want %q", body.Error.Type, "server_error")
+			}
+			if !strings.Contains(body.Error.Message, "qwen3.6-27b") {
+				t.Errorf("error.message should name the backend, got %q", body.Error.Message)
+			}
+		})
+	}
+}
+
+func TestHandleProxyError_ClientCanceled(t *testing.T) {
+	// Client went away mid-roundtrip: nothing can be written.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+
+	handleProxyError(rec, req, context.Canceled, "qwen3.6-27b")
+
+	if rec.Body.Len() != 0 {
+		t.Errorf("expected no body on client cancel, got %q", rec.Body.String())
+	}
+}
+
+func TestHandleProxyError_MidStream(t *testing.T) {
+	// Engine died after the response started: the status line is already
+	// committed, so the handler must leave the partial response untouched.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	tracker := &respTracker{ResponseWriter: rec}
+	tracker.WriteHeader(http.StatusOK)
+	tracker.Write([]byte("data: partial\n\n"))
+
+	before := rec.Body.String()
+	resetErr := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("read: connection reset by peer")}
+	handleProxyError(tracker, req, resetErr, "qwen3.6-27b")
+
+	if rec.Body.String() != before {
+		t.Errorf("mid-stream failure must not append an error body, got %q", rec.Body.String())
 	}
 }
