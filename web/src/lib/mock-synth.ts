@@ -1,17 +1,15 @@
-// DEV-ONLY mock metrics feed. Synthesizes the EXACT contract frame shape
+// DEV-ONLY mock metrics synthesizer. Shared by the dev-only
+// +server.ts routes (stream + burst); no imports, so nothing leaks
+// into client bundles. adapter-static prunes it from the production
+// build because only those dev-only routes import it.
+//
+// Synthesizes the EXACT contract frame shape
 // (.impeccable/metrics-contract.md) with plausible random-walk traffic:
 // two backends — one tier-0 "king" and one tier-1 "subject" — with an
 // occasional saturation spike on the subject that produces 429s,
 // streaming TTFTs, and burst spikes.
 //
-// This is a SvelteKit +server.ts route: adapter-static prunes server-only
-// code from the production build, so it can never ship. The production
-// store only ever hits /metrics/stream and /stats.
-
-import { json } from "@sveltejs/kit";
-import type { RequestHandler } from "./$types";
-
-// ── shared synthesizer state (module-level; one process per dev server) ─
+// State lives at module scope: one process per dev server.
 
 interface MockBackend {
   name: string;
@@ -92,7 +90,7 @@ const walk = (v: number, step: number, lo: number, hi: number) =>
   clamp(v + (Math.random() * 2 - 1) * step, lo, hi);
 
 // request ring, newest last — mirrors the server's bounded burst ring
-interface BurstReq {
+export interface BurstReq {
   t: number;
   backend: string;
   path: string;
@@ -150,7 +148,7 @@ function spawnRequest(t: number): void {
 // pre-seed a little history so the tape is not empty on first paint
 for (let i = 60; i > 0; i--) spawnRequest(T0 - i * 1900);
 
-interface Frame {
+export interface Frame {
   t: number;
   backends: Array<Record<string, unknown>>;
   gpu: { used: number; budget: number; waiting: number; active: boolean };
@@ -242,62 +240,13 @@ function tick(): Frame {
   };
 }
 
-// ── routes ───────────────────────────────────────────────────────────────
+/** Advance the simulation one frame and return it. */
+export function mockTick(): Frame {
+  return tick();
+}
 
-/** GET /dev-metrics/burst — the bounded request ring. */
-export const GET: RequestHandler = async ({ url, request }) => {
-  if (url.pathname === "/dev-metrics/burst") {
-    const limit = Math.min(
-      1000,
-      Math.max(10, Number(url.searchParams.get("limit")) || 500),
-    );
-    return json({ requests: ring.slice(-limit) });
-  }
-  const raw = Number(url.searchParams.get("interval")?.replace("ms", ""));
-  const interval = clamp(
-    Number.isFinite(raw) && raw > 0 ? raw : 500,
-    200,
-    10000,
-  );
-
-  return new Response(
-    new ReadableStream({
-      start(controller) {
-        let open = true;
-        const send = () => {
-          if (!open) return;
-          try {
-            controller.enqueue(
-              new TextEncoder().encode(`data: ${JSON.stringify(tick())}\n\n`),
-            );
-          } catch {
-            open = false;
-          }
-        };
-        send();
-        const iv = setInterval(send, interval);
-        const stop = () => {
-          if (!open) return;
-          open = false;
-          clearInterval(iv);
-          try {
-            controller.close();
-          } catch {
-            /* already closed */
-          }
-        };
-        request.signal.addEventListener("abort", stop);
-        // let the dev server process exit without waiting on idle streams
-        (iv as unknown as { unref?: () => void }).unref?.();
-      },
-    }),
-    {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-      },
-    },
-  );
-};
+/** The bounded request ring, newest last. */
+export function mockBurst(limit: number): BurstReq[] {
+  const n = Math.min(1000, Math.max(10, Number(limit) || 500));
+  return ring.slice(-n);
+}

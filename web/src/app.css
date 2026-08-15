@@ -32,10 +32,11 @@
   /* text */
   --tx-1: #edebe4;
   --tx-2: #a6a29a;
-  --tx-3: #6e6a62;
+  /* muted labels: ≥4.5:1 on every dark surface (ground/recess/face/face-hi) */
+  --tx-3: #8c867c;
 
-  /* signal red — reserved for 429 / 5xx / saturated */
-  --red: #c0564b;
+  /* signal red — reserved for 5xx / saturated / offline (see red rule) */
+  --red: #d46a5e;
 
   /* geometry */
   --skew: -6deg;
@@ -66,10 +67,6 @@ body {
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   overflow-x: clip;
-}
-
-::selection {
-  background: rgba(201, 162, 75, 0.35);
 }
 
 /* Archivo — the display face (700 italic, tight) */
@@ -216,10 +213,10 @@ button {
   box-shadow: 0 0 8px rgba(228, 194, 100, 0.8);
   display: inline-block;
 }
-.health[data-h="paused"] {
+.health[data-h="degraded"] {
   color: var(--tx-2);
 }
-.health[data-h="paused"] i {
+.health[data-h="degraded"] i {
   background: var(--tx-3);
   box-shadow: none;
 }
@@ -228,7 +225,160 @@ button {
 }
 .health[data-h="offline"] i {
   background: var(--red);
-  box-shadow: 0 0 8px rgba(192, 86, 75, 0.7);
+  box-shadow: 0 0 8px rgba(212, 106, 94, 0.7);
+}
+
+/* ── stale banner: the last truth, flagged as old ─────────────────────── */
+/* Shown when the feed drops: the sheet keeps its last numbers but the
+   whole page carries a red time anchor so "the data stopped" is the
+   loudest thing on screen. Red is the offline reservation, legitimately. */
+.stale-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 7px 12px;
+  border: 1px solid rgba(212, 106, 94, 0.55);
+  border-top-color: rgba(212, 106, 94, 0.9);
+  background: rgba(212, 106, 94, 0.07);
+  color: var(--red);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.stale-banner .stale-clock {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  font-weight: 500;
+}
+.stale-banner .stale-why {
+  color: var(--tx-2);
+  text-transform: none;
+  letter-spacing: 0.03em;
+}
+.stale-banner .stale-why b {
+  color: var(--tx-1);
+  font-weight: 500;
+}
+
+/* ── packet row: inline readout (mobile/folded) ───────────────────────── */
+.pkt-detail {
+  display: none;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--tx-2);
+  gap: 12px;
+}
+.pkt-detail b {
+  color: var(--tx-1);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.pkt-detail .red {
+  color: var(--red);
+}
+/* a folded sheet never shows the opened-fold layout — the packet row is
+   the open state on mobile; the .is-open min-height would otherwise win
+   and leave a 308px empty box */
+.sheet.is-folded .fold-cell.is-open .cell-open {
+  display: none;
+}
+.fold-cell.is-open .cell-pkt .pkt-detail {
+  display: flex;
+}
+/* when a packet row is open it expands a touch so the detail has room */
+.sheet.is-folded .fold-cell.is-open {
+  min-height: 72px;
+}
+
+/* ── readout grouping: live state leads, totals demote ────────────────── */
+.readout .group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0 4px;
+  margin-top: 4px;
+  border-top: 1px solid rgba(166, 166, 160, 0.28);
+}
+.readout .group-head:first-child {
+  margin-top: 0;
+  border-top: none;
+  padding-top: 0;
+}
+.readout .group-head .gk {
+  color: var(--tx-3);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-size: 9px;
+}
+.readout .group-head .gt {
+  color: var(--tx-2);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+}
+.readout .totals-toggle {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+  background: transparent;
+  border: none;
+  border-top: 1px solid rgba(166, 166, 160, 0.28);
+  padding: 6px 0 4px;
+  margin-top: 4px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.readout .totals-toggle:hover {
+  color: var(--tx-1);
+}
+.readout .totals-toggle .est-hint {
+  color: var(--gold);
+}
+.readout .totals-rows {
+  overflow: hidden;
+}
+.readout .totals-rows.collapsed {
+  display: none;
+}
+
+/* ── browser surfaces: theming the parts we did not draw ──────────────── */
+/* The sheet is dense tabular data — the caret, selection and scrollbars
+   belong to the world, not to the browser default. */
+::selection {
+  background: rgba(201, 162, 75, 0.32);
+  color: var(--tx-1);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(166, 166, 160, 0.35) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--ground);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(166, 166, 160, 0.3);
+  border: 2px solid var(--ground);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(166, 166, 160, 0.5);
+}
+::placeholder {
+  color: var(--tx-3);
+  opacity: 1;
+}
+input,
+select,
+textarea {
+  caret-color: var(--gold-lit);
 }
 
 /* gold-foil packet control — the signature interaction */
@@ -376,10 +526,10 @@ button {
 }
 /* saturated / 429: the cell inverts to red-on-ground */
 .fold-cell.is-saturated {
-  border-top-color: rgba(192, 86, 75, 0.85);
+  border-top-color: rgba(212, 106, 94, 0.85);
   box-shadow:
-    inset 0 1px 0 rgba(192, 86, 75, 0.5),
-    0 0 22px rgba(192, 86, 75, 0.1);
+    inset 0 1px 0 rgba(212, 106, 94, 0.5),
+    0 0 22px rgba(212, 106, 94, 0.1);
 }
 /* opened fold: spans the row, full-height trace, warm gold selection glow */
 .fold-cell.is-open {
@@ -613,10 +763,17 @@ button {
 .swatch.valley {
   background: var(--vl-dim);
 }
+.switcher-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
 .switcher {
   display: flex;
   gap: 6px;
-  margin-bottom: 6px;
+  min-width: 0;
   flex-wrap: wrap;
 }
 .switcher button {
@@ -641,6 +798,25 @@ button {
   color: var(--gold-lit);
   border-color: rgba(201, 162, 75, 0.7);
   box-shadow: inset 0 1px 0 rgba(228, 194, 100, 0.35);
+}
+/* the fold control is distinct from a signal option — it is the exit */
+.switcher-row .esc {
+  margin-left: auto;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--tx-2);
+  background: transparent;
+  border: 1px solid rgba(166, 166, 160, 0.18);
+  padding: 4px 9px;
+  cursor: pointer;
+  transition:
+    color 0.2s,
+    border-color 0.2s;
+}
+.switcher-row .esc:hover {
+  color: var(--tx-1);
+  border-color: rgba(232, 230, 224, 0.5);
 }
 .readout {
   display: flex;
@@ -762,9 +938,36 @@ button {
 }
 .tape-head .spikes {
   color: var(--tx-2);
+  margin-left: 14px;
 }
 .tape-head .spikes.hot {
   color: var(--red);
+}
+.tape-head .head-right {
+  display: inline-flex;
+  align-items: center;
+}
+.tape-head .f429 {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+  background: transparent;
+  border: 1px solid rgba(166, 166, 160, 0.25);
+  padding: 2px 8px;
+  cursor: pointer;
+  transition:
+    color 0.2s,
+    border-color 0.2s;
+}
+.tape-head .f429:hover {
+  color: var(--tx-1);
+  border-color: rgba(232, 230, 224, 0.5);
+}
+.tape-head .f429[aria-pressed="true"] {
+  color: var(--vl-lit);
+  border-color: rgba(143, 169, 192, 0.6);
+  box-shadow: inset 0 1px 0 rgba(207, 224, 239, 0.3);
 }
 .tape-vp {
   overflow: hidden;

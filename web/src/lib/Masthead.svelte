@@ -12,12 +12,24 @@
     totalWaiting: number;
     gpu: GpuMetrics | null;
     tier0Inflight: number;
+    /** sum of the King backends' concurrency caps, null when uncapped. */
+    tier0Limit: number | null;
     deployed: boolean;
+    /** false in narrow mode (the sheet is force-folded; the button is hidden). */
+    showPacketControl: boolean;
     onToggle: () => void;
   }
 
-  let { totalInFlight, totalWaiting, gpu, tier0Inflight, deployed, onToggle }:
-    Props = $props();
+  let {
+    totalInFlight,
+    totalWaiting,
+    gpu,
+    tier0Inflight,
+    tier0Limit,
+    deployed,
+    showPacketControl,
+    onToggle,
+  }: Props = $props();
 
   let now = $state(Date.now());
 
@@ -51,7 +63,7 @@
       <span class="stat-dot">·</span>
       <span>waiting <b>{totalWaiting}</b></span>
       <span class="stat-dot">·</span>
-      <span>tier0 <b>{tier0Inflight}</b></span>
+      <span>tier0 <b>{tier0Inflight}{tier0Limit ? ` / ${tier0Limit}` : ''}</b></span>
       <span class="stat-dot">·</span>
       {#if gpu && gpu.budget > 0}
         <span class="gpu-gauge" aria-label="gpu budget {gpu.used} of {gpu.budget} used">
@@ -69,12 +81,14 @@
 
   <div class="mast-right unskew">
     <time class="clock">{clock(now)}</time>
-    <button
-      class="packet-btn"
-      onclick={onToggle}
-      aria-pressed={deployed}
-      aria-label="{deployed ? 'fold the sheet to packet mode' : 'deploy the sheet'}">
-      [{deployed ? 'FOLD' : 'DEPLOY'}]
-    </button>
+    {#if showPacketControl}
+      <button
+        class="packet-btn"
+        onclick={onToggle}
+        aria-pressed={deployed}
+        aria-label="{deployed ? 'fold the sheet to packet mode' : 'deploy the sheet'}">
+        [{deployed ? 'FOLD' : 'DEPLOY'}]
+      </button>
+    {/if}
   </div>
 </header>

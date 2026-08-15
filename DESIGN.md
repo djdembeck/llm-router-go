@@ -14,8 +14,8 @@ colors:
   gold-lit: "#e4c264"
   text-primary: "#edebe4"
   text-secondary: "#a6a29a"
-  text-muted: "#6e6a62"
-  signal-red: "#c0564b"
+  text-muted: "#8c867c"
+  signal-red: "#d46a5e"
 typography:
   display:
     fontFamily: "Archivo, 'JetBrains Mono', sans-serif"
@@ -122,9 +122,14 @@ observed dim/lit pairs, one gold-foil signal color, and a single reserved signal
   switcher `.on`, focus outline, selection background) are gold. The gold-foil packet
   control carries it. Gold never decorates — if a gold pixel isn't a signal or an active
   state, it doesn't belong.
-- **Signal Red** (#c0564b): reserved for 429 / 5xx / saturated / offline. A saturated
-  fold-cell inverts to red-on-ground (red top crease + red inset + faint red halo);
-  `st-err` on the tape, the waiting GPU segment's red top border, `health[data-h="offline"]`.
+- **Signal Red** (#d46a5e): reserved for 5xx / saturated / offline — the
+  failure conditions. A saturated fold-cell inverts to red-on-ground (red top
+  crease + red inset + faint red halo); `st-err` on the tape, the waiting GPU
+  segment's red top border, `health[data-h="offline"]`, and the STALE feed-loss
+  banner. A 429 on the tape is NOT red — it is valley blue (`st-throttle`): a
+  capacity rejection with `Retry-After` is the policy working as designed, not
+  a failure. The contrast floor is 4.5:1 on every dark surface (verified
+  against #0a0a0b, #161513, #0e0e10, #141416).
 
 ### Secondary
 - **Valley Crease — Steel Blue** (#8fa9c0 dim, #cfe0ef lit): the secondary signal and
@@ -144,7 +149,7 @@ observed dim/lit pairs, one gold-foil signal color, and a single reserved signal
 - **Cell Face Hi** (#141416): the raised face — hover and opened folds.
 - **Text Primary** (#edebe4): primary text, readout values, tape backend names.
 - **Text Secondary** (#a6a29a): status lines, paths, secondary numerals.
-- **Text Muted** (#6e6a62): labels, axis-adjacent text, idle states, `.k` keys.
+- **Text Muted** (#8c867c): labels, axis-adjacent text, idle states, `.k` keys.
 
 ### Named Rules
 
@@ -152,8 +157,10 @@ observed dim/lit pairs, one gold-foil signal color, and a single reserved signal
 lines, small lit edges, one button — is the point. A screen with a gold surface, a gold
 block, or gold used for emphasis of a non-signal value has left the world.
 
-**The Red Reservation Rule.** Red appears only on 429/5xx/saturated/offline state. If a
-red pixel isn't a failure condition, delete it.
+**The Red Reservation Rule.** Red appears only on 5xx / saturated / offline —
+the failure conditions, plus the STALE feed-loss banner. A 429 on the tape is
+valley blue, not red: it is a capacity rejection, the bounded-failure policy
+working as designed. If a red pixel isn't a failure condition, delete it.
 
 ## Typography
 
@@ -294,7 +301,8 @@ place.
 - **Rest:** face #0e0e10, 168px min-height, 1px lit top crease, `10px 14px 8px` padding.
   Top row: crease-ID (11px 500, 0.08em, lit mountain, with tier chip — 9px, steel-blue
   border; King chips are gold-bordered) and the value (30px 500 tabular, lit mountain,
-  `n/max` with the max at 13px muted). Below: the trace canvas. Bottom: a hidden 10px
+  `n/max` with the max at 13px muted). Below: the trace canvas (30s window — the
+  operator's glance unit; the opened fold keeps the full 60s). Bottom: a hidden 10px
   detail row (inf/wait/prefill/ewma/ttft) that fades in on hover and `:focus-visible`.
 - **Hover:** translateY(-3px), face-hi background, deep shadow + gold inset top, and the
   2px gold lit-edge sweep across the fold (0.3s opacity, 0.8s travel).
@@ -302,13 +310,20 @@ place.
   halo, value in red. State inverts, it doesn't just tint.
 - **Opened:** spans the row, 308px, face-hi, gold ring + 48px halo. The face is replaced
   by a full-height trace (1px `rgba(166,166,160,0.18)` border) with a signal switcher
-  above, a legend below (gold swatch for the primary signal, steel-blue for the ttft
-  overlay), and a 272px readout column: 11px rows, 10px uppercase muted keys, tabular
-  values, hairline `rgba(166,166,160,0.12)` row borders, `est` in gold on token rows,
-  red on saturated values. `role="button"`, `tabindex=0`, Enter/Space toggle, Esc refolds.
+  above (the `fold ✕` control sits at the row's right end, visually distinct from a
+  signal option — it is the exit), a legend below (gold swatch for the primary signal,
+  steel-blue for the ttft overlay), and a 272px readout column that leads with a
+  **live-state block** (in-flight / queue / prefill / ewma / ttft), then a **rates**
+  group, then a **lifetime totals** group collapsed behind a `＋` toggle — progressive
+  disclosure, so a 15-second glance sees state first. The `fold ✕` button is at the
+  switcher row's right end, visually distinct from a signal option. `role="button"`,
+  `tabindex=0`, Enter/Space toggle, Esc refolds and returns focus to the cell (a
+  keyboard user is never stranded at `<body>`).
 - **Packet:** when the sheet is folded (or the viewport is narrow), the face is replaced
-  by a 46px single column: 86px name, a 26px bare trace (no crease grid), value 15px
-  right. The sheet becomes `grid-template-columns: 1fr` — one thin live line per backend.
+  by a 46px single column: 86px name, a 26px bare trace (30s window, no crease grid),
+  value 15px right. Tapping a packet row expands it to 72px with an inline readout
+  (inf / wait / prefill) — on mobile the packet row is data, not a dead tap. The sheet
+  becomes `grid-template-columns: 1fr` — one thin live line per backend.
 
 ### Trace Scope
 **Character:** a scrolling oscilloscope, not a stepped chart — the gold line glides
@@ -336,12 +351,29 @@ measured.
 ### Request Tape Entry
 **Character:** the continuous transcript — the last requests as one horizontally scrolling
 mono line, edge-masked (`transparent → black at 3%/97%`), duplicated half for a seamless
-loop, paused on hover. One entry: `t backend path status ttft dur ~tokens /` at 11px
+loop, paused on hover **and on touch** (touch-down pauses, touch-up gives a 1.5s grace
+before resuming — there is no hover on a phone). One entry: `t backend path status ttft dur ~tokens /` at 11px
 tabular, 8px gaps, 18px entry padding. Colors by field: time muted, backend text-primary,
-path text-secondary, status 500-weight and semantic — gold for 200 (`st-ok`), steel-blue
-for throttled (`st-throttle`), red for errors (`st-err`) — numerals secondary, separator
-muted at 0.5. A header row (10px uppercase muted) carries the field legend and a `spikes
-n/5s` counter that goes red when nonzero. Idle state: one muted line — "the sheet is quiet."
+path text-secondary, status 500-weight and semantic — gold for 200 (`st-ok`), valley blue
+for 429 (`st-throttle`, a capacity rejection — not red), red for 5xx/4xx errors (`st-err`)
+— numerals secondary, separator muted at 0.5. The header row (10px uppercase muted)
+carries the field legend **above the tape** (`t · backend · path · status · ttft · dur · tok(est)`),
+a `429s+ only` toggle that filters the transcript to rejections, and a `spikes n/5s`
+counter that goes red when nonzero and carries a 60s `peak` so the evidence does not
+decay away before it is read. When the feed drops, the tape freezes in place (the
+transcript is still the last truth). Idle state: one muted line — "the sheet is quiet."
+
+### Stale Banner (feed loss)
+**Character:** the moment the truth stops arriving is the moment the page must be
+loudest. When no frame has arrived in >6s, the sheet keeps its last numbers (a frozen
+truth is more honest than an empty frame) and a red banner takes the place between the
+feed row and the sheet: `stale — last data HH:MM:SS · Ns ago` on the left, the failing
+endpoint on the right (`re-arming /metrics/stream`). The banner is the only red that is
+not a per-backend failure — it is the offline reservation applied to the feed itself.
+The feed row also carries a persistent `last data HH:MM:SS` anchor so the age of the
+numbers is always readable, and the flat table's caption notes the data is stale. The
+health chip states are `live` (gold), `degraded` (on a fallback feed — not "paused",
+which reads like a user-controlled state), and `offline` (red).
 
 ### Hollow Packet
 **Character:** the empty state is an *unfolded tessellation*, not an empty-state card. A
@@ -371,10 +403,10 @@ honest-data boundary and ships with the sheet.
 
 ### Don't:
 - **Don't** use gold for decoration, emphasis, or any surface — one hot color, live signal only.
-- **Don't** use red (#c0564b) for anything except 429/5xx/saturated/offline state.
+- **Don't** use red (#d46a5e) for anything except 5xx / saturated / offline state and the STALE feed-loss banner; a 429 stays valley blue on the tape.
 - **Don't** round a corner. Zero radius is the fold; the parallelogram comes from skew, not border-radius.
 - **Don't** let the skew obscure a value — no number behind another number; if a fold effect delays reading a value, the value wins.
 - **Don't** add ambient shadows, glassmorphism, or glows at rest; shadow/glow is a state response (hover lift, opened-fold ring, saturated inversion) in the exact documented values.
-- **Don't** present token throughput as measured; measured figures are req/s, bytes/s, durations.
+- **Don't** present token throughput as measured; measured figures are req/s, bytes/s, durations. A 429 is a rejection, not an error — it stays blue.
 - **Don't** run a per-cell 60fps loop — one rAF-driven scope per trace instance, redrawn on data ticks otherwise.
 - **Don't** build the compact/mobile view as a separate layout — it is the folded sheet (packet row), driven by the same deploy state.

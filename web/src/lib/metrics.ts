@@ -151,6 +151,9 @@ export function emptySample(t: number): Sample {
 
 export type FeedKind = "none" | "sse" | "sse-mock" | "stats";
 
+/** A periodic timer handle: number in the browser, Timeout object in Node. */
+type StoreTimer = ReturnType<typeof setInterval>;
+
 export interface Feed {
   name: string;
   url: string;
@@ -162,8 +165,8 @@ export interface Feed {
 export interface StoreState {
   /** true once a frame has ever arrived. */
   live: boolean;
-  /** live: streaming, paused: degraded to a fallback feed, offline: no feed. */
-  health: "live" | "paused" | "offline";
+  /** live: streaming, degraded: on a fallback feed, offline: no feed. */
+  health: "live" | "degraded" | "offline";
   feed: Feed | null;
   frame: Frame | null;
   /** per-backend history, newest last, ≤ HISTORY_LEN samples. */
@@ -173,6 +176,12 @@ export interface StoreState {
   requests: BurstRequest[];
   /** requests that completed in the last 5s. */
   spikeCount: number;
+  /** wall time (ms) of the last frame received, null before the first. */
+  lastFrameAt: number | null;
+  /** true when the last frame is >6s old — the sheet shows STALE data. */
+  stale: boolean;
+  /** max of spikeCount over the last 60s (evidence does not decay away). */
+  spikePeak: number;
 }
 
 export function createMetricsStore(on: (s: StoreState) => void) {
@@ -185,11 +194,17 @@ export function createMetricsStore(on: (s: StoreState) => void) {
   let requests: BurstRequest[] = [];
   let spikeCount = 0;
   let lastFrameMs = 0;
+  let lastFrameAt: number | null = null;
+  let stale = false;
+  let spikePeak = 0;
+  /** one spikeCount sample per second, ≤ 60 (a minute of evidence). */
+  const spikeSamples: number[] = [];
 
   // feed control
   let es: EventSource | null = null;
-  let burstTimer: ReturnType<typeof setInterval> | null = null;
-  let statTimer: ReturnType<typeof setInterval> | null = null;
+  let burstTimer: StoreTimer | null = null;
+  let statTimer: StoreTimer | null = null;
+  let staleTimer: StoreTimer | null = null;
   let stop = false;
   let tickN = 0;
   let sseGen = 0;
@@ -204,6 +219,9 @@ export function createMetricsStore(on: (s: StoreState) => void) {
       fleetHist: fleetHist.slice(),
       requests: requests.slice(-90),
       spikeCount,
+      lastFrameAt,
+      stale,
+      spikePeak,
     });
   }
 
@@ -211,6 +229,8 @@ export function createMetricsStore(on: (s: StoreState) => void) {
     live = true;
     frame = f;
     lastFrameMs = Date.now();
+    lastFrameAt = Date.now();
+    if (stale) stale = false;
     const now = Date.now();
     for (const b of f.backends) {
       let h = hist[b.name];
@@ -256,7 +276,7 @@ export function createMetricsStore(on: (s: StoreState) => void) {
 
   function setFeed(f: Feed) {
     feed = f;
-    health = f.kind === "sse" ? "live" : f.kind === "sse-mock" ? "live" : "paused";
+    health = f.kind === "sse" ? "live" : f.kind === "sse-mock" ? "live" : "degraded";
   }
 
   function closeEs() {
@@ -294,6 +314,33 @@ export function createMetricsStore(on: (s: StoreState) => void) {
     if (burstTimer) return;
     burstTimer = setInterval(pollBurst, 2000);
     void pollBurst();
+  }
+
+  // ── stale flag + spike peak ────────────────────────────────────────────
+  // The sheet must tell the operator when the last true number went old.
+  // One 1s watch: flags stale >6s after the last frame, and keeps a
+  // 60s peak of the spike counter so evidence does not decay away before
+  // the operator notices.
+
+  function staleTick() {
+    if (stop) return;
+    const s = live && lastFrameAt !== null ? Date.now() - lastFrameAt > 6000 : false;
+    if (s !== stale) {
+      stale = s;
+      emit();
+    }
+    spikeSamples.push(spikeCount);
+    if (spikeSamples.length > 60) spikeSamples.shift();
+    const peak = Math.max(0, ...spikeSamples);
+    if (peak !== spikePeak) {
+      spikePeak = peak;
+      emit();
+    }
+  }
+
+  function startStaleWatch() {
+    if (staleTimer) return;
+    staleTimer = setInterval(staleTick, 1000);
   }
 
   // ── stats polling fallback ─────────────────────────────────────────────
@@ -466,12 +513,16 @@ export function createMetricsStore(on: (s: StoreState) => void) {
       // route is absent, no router behind the dev proxy)
       void probe(f.url).then((res) => {
         if (stop || gen !== sseGen) return;
-        if (res === "gone") {
-          f.gone = true;
-          tryNext(idx + 1);
-          return;
-        }
-        if (res === "err") {
+        if (res === "gone" || res === "err") {
+          f.gone = res === "gone";
+          // In dev, a skipped feed is usually a misconfigured mock route —
+          // say so once instead of letting the dashboard sit hollow and
+          // the operator wonder why.
+          if (!import.meta.env.PROD) {
+            console.warn(
+              `[llm-router] skipped ${f.url} (${res}) — falling through the feed ladder`,
+            );
+          }
           tryNext(idx + 1);
           return;
         }
@@ -508,6 +559,7 @@ export function createMetricsStore(on: (s: StoreState) => void) {
   function start() {
     if (stop) return;
     startBurst();
+    startStaleWatch();
     startSse(0);
     startWatchdog();
   }
@@ -517,8 +569,10 @@ export function createMetricsStore(on: (s: StoreState) => void) {
     closeEs();
     if (burstTimer) clearInterval(burstTimer);
     if (statTimer) clearInterval(statTimer);
+    if (staleTimer) clearInterval(staleTimer);
     burstTimer = null;
     statTimer = null;
+    staleTimer = null;
   }
 
   if (browser) start();
