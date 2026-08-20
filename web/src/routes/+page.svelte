@@ -233,6 +233,12 @@
           <th scope="col">ttft (streaming)</th>
           <th scope="col">req/s</th>
           <th scope="col">tok/s (est)</th>
+          <th scope="col">engine running</th>
+          <th scope="col">engine queue</th>
+          <th scope="col">kv cache %</th>
+          <th scope="col">engine prefill tok/s (real)</th>
+          <th scope="col">engine decode tok/s (real)</th>
+          <th scope="col">engine ttft</th>
         </tr>
       </thead>
       <tbody>
@@ -251,6 +257,16 @@
             <td>{b.ttftSampleCount === 0 ? "no samples" : `${b.ttftMs}ms`}</td>
             <td>{b.reqRate}/s</td>
             <td>{b.tokEstRate}/s (estimated prefill)</td>
+            {#if b.engine?.status === "ok"}
+              <td>{Math.round(b.engine.running)}</td>
+              <td>{Math.round(b.engine.waiting)}</td>
+              <td>{b.engine.kvPct > 0 ? `${b.engine.kvPct.toFixed(0)}%` : "—"}</td>
+              <td>{Math.round(b.engine.prefillTokS)}/s</td>
+              <td>{Math.round(b.engine.decodeTokS)}/s</td>
+              <td>{b.engine.ttftMs > 0 ? `${Math.round(b.engine.ttftMs)}ms` : "—"}</td>
+            {:else}
+              <td colspan="6">no engine feed ({b.engine?.status === "err" ? "unreachable" : "endpoint off"})</td>
+            {/if}
           </tr>
         {/each}
       </tbody>

@@ -4,11 +4,12 @@
   // Bespoke canvas trace engine — a scrolling scope, not a stepped chart.
   // Samples are plotted at their SERVER timestamps on a continuous time axis;
   // a requestAnimationFrame loop scrolls the window at frame rate so the line
-  // glides instead of jumping every 500ms data tick. The newest third of the
-  // visible line is lit (the "live head"), older segments fade into the
-  // crease (afterglow). The y-axis eases toward its new scale instead of
-  // snapping. devicePixelRatio-aware. One canvas per instance; drawing is
-  // trivially cheap (≤120 segments) even with several live traces.
+  // glides instead of jumping every 500ms data tick. The whole visible line
+  // is one uniform color (gold or valley steel) — no afterglow fade — so a
+  // signal stays recognizable across the full history; the newest sample
+  // carries a lit head (dot + halo). The y-axis eases toward its new scale
+  // instead of snapping. devicePixelRatio-aware. One canvas per instance;
+  // drawing is trivially cheap (≤600 segments) even with several live traces.
   //
   // prefers-reduced-motion: the continuous scroll is disabled and the trace
   // redraws only on data ticks, with the window anchored to the newest sample.
@@ -48,10 +49,10 @@
   let cssW = 0;
   let cssH = 0;
 
-  const GOLD_DIM = "#8a6f35";
-  const GOLD_LIT = "#e4c264";
-  const VALLEY_DIM = "#5d7488";
-  const VALLEY_LIT = "#cfe0ef";
+  const GOLD = "#c9a24b";
+  const GOLD_HEAD = "#e4c264";
+  const VALLEY = "#8fa9c0";
+  const VALLEY_HEAD = "#cfe0ef";
 
   // latest props, read by the rAF loop without re-subscribing
   let curSamples: (number | null)[] = [];
@@ -107,7 +108,9 @@
   function visibleRange(): [number, number] | null {
     const n = curTs.length;
     if (n < 2) return null;
-    if (viewRight === 0) viewRight = curTs[n - 1];
+    if (viewRight === 0) viewRight = curTs[n - 1]; // anchor to NEWEST: a
+    // pre-filled 5-minute buffer must open on "now", not scroll a minute of
+    // history forward from the left
     // the right edge creeps forward in real time but never falls behind the
     // newest sample
     viewRight = Math.max(viewRight, curTs[n - 1]);
@@ -115,10 +118,16 @@
     return [left, viewRight];
   }
 
-  function targetHi(): number {
+  function targetHi(left: number, right: number): number {
     let hi = 0;
-    for (const v of curSamples) if (v !== null && v > hi) hi = v;
-    for (const v of curOverlay ?? []) if (v !== null && v > hi) hi = v;
+    for (let i = 0; i < curTs.length; i++) {
+      const t = curTs[i];
+      if (t < left || t > right) continue;
+      const v = curSamples[i];
+      if (v !== null && v > hi) hi = v;
+      const o = curOverlay?.[i];
+      if (o !== undefined && o !== null && o > hi) hi = o;
+    }
     if (curYMax !== null && curYMax > 0) hi = Math.max(hi, curYMax);
     if (curLimit !== null && curLimit > 0) hi = Math.max(hi, curLimit);
     return hi * 1.08 || 1;
@@ -139,39 +148,43 @@
     const [left, right] = range;
     const x = (t: number) => ((t - left) / (right - left)) * W;
 
-    // eased y scale so the axis glides, not snaps
-    const target = targetHi();
+    // eased y scale so the axis glides, not snaps — scoped to the visible
+    // window so a 5-minute view is not dominated by a long-gone spike
+    const target = targetHi(left, right);
     dispHi = dispHi === 0 ? target : dispHi + (target - dispHi) * 0.15;
     const hi = dispHi;
     const y = (v: number) => H - 3 - (v / hi) * (H - 8);
 
     if (!curBare) grid(c, left, right);
 
-    const dim = curColor === "gold" ? GOLD_DIM : VALLEY_DIM;
-    const lit = curColor === "gold" ? GOLD_LIT : VALLEY_LIT;
+    const dim = curColor === "gold" ? GOLD : VALLEY;
+    const lit = curColor === "gold" ? GOLD_HEAD : VALLEY_HEAD;
 
     const pass = (vals: (number | null)[], overlay: boolean) => {
       const n = vals.length;
       if (n < 2 || curTs.length < 2) return;
-      const headAge = 0.3; // newest 30% of the window is lit
+      c.strokeStyle = dim;
+      c.globalAlpha = overlay ? 0.45 : 0.9;
+      c.lineWidth = 1.5;
+      c.beginPath();
+      let started = false;
       for (let i = 1; i < n; i++) {
         const a = vals[i - 1];
         const b = vals[i];
         const ta = curTs[i - 1];
         const tb = curTs[i];
-        if (a === null || b === null) continue;
+        if (a === null || b === null) {
+          started = false;
+          continue;
+        }
         if (tb < left || ta > right) continue;
-        const age = (right - tb) / (right - left); // 0 = newest, 1 = oldest
-        const isLit = age < headAge;
-        const recency = 1 - age;
-        c.strokeStyle = isLit ? lit : dim;
-        c.globalAlpha = (isLit ? 0.95 : 0.1 + 0.55 * recency * recency) * (overlay ? 0.55 : 1);
-        c.lineWidth = isLit ? 1.6 : 1;
-        c.beginPath();
-        c.moveTo(x(ta), y(a));
+        if (!started) {
+          c.moveTo(x(ta), y(a));
+          started = true;
+        }
         c.lineTo(x(tb), y(b));
-        c.stroke();
       }
+      c.stroke();
       c.globalAlpha = 1;
     };
 
@@ -222,9 +235,14 @@
     if (left > 0) {
       g.strokeStyle = "rgba(166,166,160,0.12)";
       g.lineWidth = 1;
-      const step = 10000; // 10s ticks
-      const t0 = Math.ceil(left / step) * step;
-      for (let t = t0; t < right; t += step) {
+      // tick step follows the window: 10s over a glance, minutes over a
+      // 5-minute view — the grid stays readable at every span
+      const spanS = (right - left) / 1000;
+      const steps = [10, 30, 60, 300];
+      const step = steps.find((s) => spanS / s <= 8) ?? 300;
+      const stepMs = step * 1000;
+      const t0 = Math.ceil(left / stepMs) * stepMs;
+      for (let t = t0; t < right; t += stepMs) {
         const gx = Math.round(((t - left) / (right - left)) * W) + 0.5;
         g.beginPath();
         g.moveTo(gx, 0);

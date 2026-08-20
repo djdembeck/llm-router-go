@@ -24,6 +24,7 @@ interface MockBackend {
   prefillWaiting: number;
   ewmaMs: number;
   ttftMs: number;
+  ttftMsNow: number;
   ttftSampleCount: number;
   reqRate: number;
   bytesRate: number;
@@ -33,6 +34,13 @@ interface MockBackend {
   bytesOutTotal: number;
   tokEstTotal: number;
   spikeTicks: number;
+  // engine's own /metrics truth (simulated)
+  engRunning: number;
+  engWaiting: number;
+  engKV: number;
+  engPrefill: number;
+  engDecode: number;
+  engTTFT: number;
 }
 
 const BACKENDS: MockBackend[] = [
@@ -49,6 +57,7 @@ const BACKENDS: MockBackend[] = [
     prefillWaiting: 0,
     ewmaMs: 9200,
     ttftMs: 240,
+    ttftMsNow: 236,
     ttftSampleCount: 40,
     reqRate: 1.1,
     bytesRate: 52000,
@@ -58,6 +67,12 @@ const BACKENDS: MockBackend[] = [
     bytesOutTotal: 183000000,
     tokEstTotal: 4210000,
     spikeTicks: 0,
+    engRunning: 2,
+    engWaiting: 0,
+    engKV: 42,
+    engPrefill: 2600,
+    engDecode: 310,
+    engTTFT: 235,
   },
   {
     name: "sglang-subject",
@@ -72,6 +87,7 @@ const BACKENDS: MockBackend[] = [
     prefillWaiting: 0,
     ewmaMs: 14800,
     ttftMs: 610,
+    ttftMsNow: 590,
     ttftSampleCount: 22,
     reqRate: 0.6,
     bytesRate: 31000,
@@ -81,6 +97,12 @@ const BACKENDS: MockBackend[] = [
     bytesOutTotal: 74000000,
     tokEstTotal: 1810000,
     spikeTicks: 0,
+    engRunning: 1,
+    engWaiting: 0,
+    engKV: 58,
+    engPrefill: 1500,
+    engDecode: 190,
+    engTTFT: 590,
   },
 ];
 
@@ -173,7 +195,9 @@ function tick(): Frame {
     b.prefillInFlight = Math.round(walk(b.prefillInFlight, 0.6, 0, b.prefillMax));
     b.prefillWaiting = Math.random() < (spike ? 0.4 : 0.08) ? 1 : 0;
     b.ewmaMs = Math.round(walk(b.ewmaMs, 220, 3000, 26000));
-    b.ttftMs = Math.round(walk(b.ttftMs, 40, 90, 1500));
+    // ttftMsNow is the most recent first-byte sample; the EWMA trails it
+    b.ttftMsNow = Math.round(walk(b.ttftMsNow, 60, 80, 1600));
+    b.ttftMs = Math.round(0.7 * b.ttftMs + 0.3 * b.ttftMsNow);
     b.ttftSampleCount = clamp(
       b.ttftSampleCount + (Math.random() < 0.7 ? 1 : 0),
       0,
@@ -182,6 +206,14 @@ function tick(): Frame {
     b.reqRate = +walk(b.reqRate, spike ? 1.6 : 0.5, 0, spike ? 9 : 2.6).toFixed(2);
     b.bytesRate = Math.round(walk(b.bytesRate, spike ? 9000 : 4000, 2000, 160000));
     b.tokEstRate = Math.round(walk(b.tokEstRate, spike ? 700 : 300, 0, 9000));
+    // engine truth follows the traffic: KV climbs under saturation, decode
+    // throughput tracks in-flight, prefill bursts with arrivals.
+    b.engRunning = clamp(b.inFlight, 0, b.maxConcurrent + 2);
+    b.engWaiting = b.waiting + (spike ? 1 : 0);
+    b.engKV = Math.round(walk(b.engKV, spike ? 6 : 2, 15, spike ? 99 : 88));
+    b.engPrefill = Math.round(walk(b.engPrefill, spike ? 900 : 350, 0, 12000));
+    b.engDecode = Math.round(b.engRunning * walk(b.engDecode / Math.max(1, b.engRunning), 25, 80, 220));
+    b.engTTFT = Math.round(walk(b.engTTFT, 45, 90, 1400));
     const n = Math.random() < b.reqRate * 0.5
       ? Math.round(b.reqRate * 0.5) + 1
       : 0;
@@ -206,6 +238,7 @@ function tick(): Frame {
     avgDurationS: +(b.ewmaMs / 1000).toFixed(2),
     ewmaMs: b.ewmaMs,
     ttftMs: b.ttftMs,
+    ttftMsNow: b.ttftMsNow,
     ttftSampleCount: b.ttftSampleCount,
     reqRate: b.reqRate,
     bytesRate: b.bytesRate,
@@ -214,6 +247,15 @@ function tick(): Frame {
     bytesInTotal: b.bytesInTotal,
     bytesOutTotal: b.bytesOutTotal,
     tokEstTotal: b.tokEstTotal,
+    engine: {
+      running: b.engRunning,
+      waiting: b.engWaiting,
+      kvPct: b.engKV,
+      prefillTokS: b.engPrefill,
+      decodeTokS: b.engDecode,
+      ttftMs: b.engTTFT,
+      status: "ok" as const,
+    },
   }));
 
   return {

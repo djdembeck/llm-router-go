@@ -30,6 +30,8 @@ export interface BackendMetrics {
   ewmaMs: number;
   ttftMs: number;
   ttftSampleCount: number;
+  /** most recent single first-byte sample (ms); 0 until seen — the live value */
+  ttftMsNow: number;
   reqRate: number;
   bytesRate: number;
   tokEstRate: number;
@@ -37,7 +39,35 @@ export interface BackendMetrics {
   bytesInTotal: number;
   bytesOutTotal: number;
   tokEstTotal: number;
+  /** the backend's own engine state (scraped from its /metrics) */
+  engine: EngineMetrics;
 }
+
+/**
+ * In-engine truth, scraped from the backend's Prometheus /metrics at 1s.
+ * status "ok" = live; "off" = endpoint absent (e.g. SGLang without
+ * --enable-metrics); "err" = unreachable. Zero + non-ok means "no data".
+ */
+export interface EngineMetrics {
+  running: number;
+  waiting: number;
+  /** KV/token-pool pressure, 0..100; 0 = unknown */
+  kvPct: number;
+  prefillTokS: number;
+  decodeTokS: number;
+  ttftMs: number;
+  status: "ok" | "off" | "err";
+}
+
+export const emptyEngine: EngineMetrics = {
+  running: 0,
+  waiting: 0,
+  kvPct: 0,
+  prefillTokS: 0,
+  decodeTokS: 0,
+  ttftMs: 0,
+  status: "off",
+};
 
 export interface GpuMetrics {
   used: number;
@@ -108,8 +138,8 @@ interface StatsResponse {
 
 // ── history buffers ──────────────────────────────────────────────────────
 
-/** ~60s at the 500ms tick. */
-export const HISTORY_LEN = 120;
+/** ~5 min at the 500ms tick — the operator's glance unit is the minute. */
+export const HISTORY_LEN = 600;
 export const WINDOW_S = 60;
 
 export interface Sample {
@@ -122,6 +152,12 @@ export interface Sample {
   reqRate: number | null;
   bytesRate: number | null;
   tokEstRate: number | null;
+  /** engine's own running requests (null = no engine feed) */
+  engRunning: number | null;
+  /** engine's REAL prefill tokens/s (null = no engine feed) */
+  engPrefill: number | null;
+  /** engine's REAL decode tokens/s (null = no engine feed) */
+  engDecode: number | null;
 }
 
 /** Fleet-wide aggregate sample (for the fleet strip). */
@@ -132,6 +168,9 @@ export interface FleetSample {
   reqRate: number | null;
   ttftMs: number | null;
   tokEstRate: number | null;
+  /** sum of REAL engine token rates (null when no engine feed) */
+  engPrefill: number | null;
+  engDecode: number | null;
 }
 
 export function emptySample(t: number): Sample {
@@ -144,6 +183,9 @@ export function emptySample(t: number): Sample {
     reqRate: null,
     bytesRate: null,
     tokEstRate: null,
+    engRunning: null,
+    engPrefill: null,
+    engDecode: null,
   };
 }
 
@@ -239,6 +281,7 @@ export function createMetricsStore(on: (s: StoreState) => void) {
       }
       // /stats frames carry no rates/counters — leave them null (gap)
       const hasRate = origin === "sse" && f.t > 0 && f.t - now < 15000;
+      const engOk = origin === "sse" && b.engine?.status === "ok";
       h.push({
         t: f.t,
         inFlight: b.inFlight,
@@ -248,6 +291,9 @@ export function createMetricsStore(on: (s: StoreState) => void) {
         reqRate: hasRate ? b.reqRate : null,
         bytesRate: hasRate ? b.bytesRate : null,
         tokEstRate: hasRate ? b.tokEstRate : null,
+        engRunning: engOk ? b.engine.running : null,
+        engPrefill: engOk ? b.engine.prefillTokS : null,
+        engDecode: engOk ? b.engine.decodeTokS : null,
       });
       if (h.length > HISTORY_LEN) h.splice(0, h.length - HISTORY_LEN);
     }
@@ -260,6 +306,7 @@ export function createMetricsStore(on: (s: StoreState) => void) {
     const tVals = f.backends
       .filter((b) => b.ttftSampleCount > 0)
       .map((b) => b.ttftMs);
+    const eng = f.backends.filter((b) => b.engine?.status === "ok");
     fleetHist.push({
       t: f.t,
       inFlight: f.totals?.inFlight ?? 0,
@@ -269,6 +316,14 @@ export function createMetricsStore(on: (s: StoreState) => void) {
         ? tVals.reduce((a, v) => a + v, 0) / tVals.length
         : null,
       tokEstRate: origin === "sse" ? f.totals?.tokEstRate ?? null : null,
+      engPrefill:
+        origin === "sse" && eng.length
+          ? eng.reduce((a, b) => a + (b.engine?.prefillTokS ?? 0), 0)
+          : null,
+      engDecode:
+        origin === "sse" && eng.length
+          ? eng.reduce((a, b) => a + (b.engine?.decodeTokS ?? 0), 0)
+          : null,
     });
     if (fleetHist.length > HISTORY_LEN)
       fleetHist.splice(0, fleetHist.length - HISTORY_LEN);
@@ -361,6 +416,7 @@ export function createMetricsStore(on: (s: StoreState) => void) {
       avgDurationS: b.avgDurationS,
       ewmaMs: Math.round(b.avgDurationS * 1000),
       ttftMs: 0,
+      ttftMsNow: 0,
       ttftSampleCount: 0,
       reqRate: 0,
       bytesRate: 0,
@@ -369,6 +425,7 @@ export function createMetricsStore(on: (s: StoreState) => void) {
       bytesInTotal: 0,
       bytesOutTotal: 0,
       tokEstTotal: 0,
+      engine: { ...emptyEngine },
     }));
     const totals = backends.reduce(
       (a, b) => ({

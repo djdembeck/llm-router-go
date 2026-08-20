@@ -43,13 +43,23 @@ Frame schema (all numbers are `int`/`float64` as Go serializes them):
       "ewmaMs": 12400,
       "ttftMs": 320,
       "ttftSampleCount": 120,
+      "ttftMsNow": 315,
       "reqRate": 2.5,
       "bytesRate": 88000,
       "tokEstRate": 4100,
       "reqTotal": 1043,
       "bytesInTotal": 2100000,
       "bytesOutTotal": 158000000,
-      "tokEstTotal": 8812345
+      "tokEstTotal": 8812345,
+      "engine": {
+        "running": 3,
+        "waiting": 0,
+        "kvPct": 42.5,
+        "prefillTokS": 4100,
+        "decodeTokS": 320,
+        "ttftMs": 290,
+        "status": "ok"
+      }
     }
   ],
   "gpu": {
@@ -78,12 +88,13 @@ Field semantics (A implements, B displays):
 - `inFlight` / `waiting` / `maxConcurrent` / `maxQueueDepth` — live slot-manager state (in-flight, queued, limits). `maxConcurrent`/`maxQueueDepth` are `0` when unlimited/absent.
 - `prefillInFlight` / `prefillWaiting` / `prefillMax` — live large-prefill slot state; all `0` when the backend has no large-prefill limit.
 - `avgDurationS` / `ewmaMs` — per-backend EWMA of TOTAL request duration (seconds / milliseconds). Same value, two units. Existing behavior.
-- `ttftMs` / `ttftSampleCount` — per-backend EWMA (milliseconds) of **time-to-first-byte**, measured ONLY for streaming requests (first response byte minus request start). `ttftSampleCount` is the number of streaming samples behind the EWMA; `0` means "no streaming samples yet" → client renders "—" not "0". NEW instrumentation (first-byte timestamp captured in the response tracker).
-- `reqRate` / `bytesRate` / `tokEstRate` — per-backend rates over the streaming interval: requests/second, proxied bytes/second (in+out), and **estimated new prefill tokens/second** (see honest-boundary note). Computed server-side from counter deltas over the interval.
+- `ttftMs` / `ttftSampleCount` — per-backend EWMA (milliseconds) of **time-to-first-byte**, measured ONLY for streaming requests (first response byte minus request start). `ttftSampleCount` is the number of streaming samples behind the EWMA; `0` means "no streaming samples yet" → client renders "—" not "0". The EWMA updates at first response byte (while the request is still live), not at completion. `ttftMsNow` is the most recent single first-byte sample (ms) — the live readout value, no smoothing; `0` until the first streaming first-byte is seen.
+- `reqRate` / `bytesRate` / `tokEstRate` — per-backend **live arrival rates**, requests/second, admitted request-bytes/second, and **estimated new prefill tokens/second** (see honest-boundary note). Computed server-side from a 30s decaying pending window: every admitted request adds its demand (1 req, its body bytes, its est tokens) to the window the instant it is accepted, the window is divided by the tick interval for the rate, then decays by (interval / 30s) each tick. The rate therefore tracks ARRIVAL, not completion — a long decode contributes its true admission rate from the moment it is accepted, and the tail lingers ~30s after traffic stops instead of spiking to 2×-per-tick and collapsing to zero. Router-originated rejections (429/413) never enter the window — they are not backend demand.
 - `reqTotal` / `bytesInTotal` / `bytesOutTotal` / `tokEstTotal` — monotonically increasing counters since process start (bytesIn = request body bytes, bytesOut = response body bytes actually written, tokEst = sum of `estimateNewTokens` over accepted requests).
 - `gpu.used` / `gpu.budget` / `gpu.waiting` — live GPU-budget weighted state. `gpu.active` is `true` when `tier0Inflight > 0`. When no GPU budget is configured, `gpu.budget` is `0` and `active` is `false`.
 - `tier0Inflight` — total in-flight across all tier-0 backends.
 - `totals.*` — sum across backends (inFlight, waiting) plus aggregate rates/counters.
+- `engine` — the backend's OWN execution truth, scraped from its Prometheus `/metrics` endpoint at 1s (vLLM: always on; SGLang: only when started with `--enable-metrics`). `running`/`waiting` are the engine's internal running/waiting request gauges (vLLM sums across data-parallel engines; SGLang takes max across tp/pp ranks — the batch state is replicated per rank). `kvPct` is KV/token-pool pressure 0..100 (vLLM `kv_cache_usage_perc`, SGLang `token_usage`; 0 = unknown). `prefillTokS`/`decodeTokS` are REAL engine token throughput from counter deltas (`vllm:prompt_tokens_total`/`generation_tokens_total`; `sglang:realtime_tokens_total{mode=prefill_compute|prefill_cache}` / `{mode=decode}`) — these are the measured decode/prefill rates the body-based estimate cannot provide. `ttftMs` is the engine's own TTFT histogram mean. `status`: `"ok"` live, `"off"` endpoint absent (404 — SGLang without the flag), `"err"` unreachable. When status is not `"ok"` all numeric fields are 0 and the client renders "—". The router's own req/bytes/tok rates and TTFT stay authoritative for the router's admission view; the engine block is the execution view.
 
 ## 2. GET /metrics/burst
 

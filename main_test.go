@@ -522,15 +522,15 @@ func TestMetrics_RecordRequest_CounterIncrements(t *testing.T) {
 	}
 }
 
-func TestMetrics_TTFT_EWMAOnlyStreamingPositiveSamples(t *testing.T) {
+func TestMetrics_TTFT_FirstByteEWMA(t *testing.T) {
 	m := newTestMetrics()
-	now := time.Now()
-	m.recordRequest("b", requestSample{T: now, Backend: "b", Status: 200, Stream: true, TTFTMs: 100})
-	m.recordRequest("b", requestSample{T: now, Backend: "b", Status: 200, Stream: true, TTFTMs: 200})
-	// Non-streaming sample with a ttft value: ignored.
-	m.recordRequest("b", requestSample{T: now, Backend: "b", Status: 200, Stream: false, TTFTMs: 999})
-	// Streaming sample with ttft 0: ignored.
-	m.recordRequest("b", requestSample{T: now, Backend: "b", Status: 200, Stream: true, TTFTMs: 0})
+	m.recordAccept("b", 0, 0)
+	// recordFirstByte is the only TTFT entry point: it fires at first
+	// response byte, while the request is still live.
+	m.recordFirstByte("b", 100)
+	m.recordFirstByte("b", 200)
+	// zero/negative (non-streaming or unmeasured) is ignored.
+	m.recordFirstByte("b", 0)
 
 	s := m.snapshot("b")
 	if s.TTFTSampleCount != 2 {
@@ -540,37 +540,79 @@ func TestMetrics_TTFT_EWMAOnlyStreamingPositiveSamples(t *testing.T) {
 	if math.Abs(s.TTFTMs-130) > 1e-9 {
 		t.Errorf("ttftMs = %v, want 130", s.TTFTMs)
 	}
+	// ttftMsNow is the most recent sample — what the live readout shows.
+	if s.TTFTMsNow != 200 {
+		t.Errorf("ttftMsNow = %v, want 200", s.TTFTMsNow)
+	}
 }
 
-func TestMetrics_ComputeRates_KnownWindow(t *testing.T) {
+func TestMetrics_ComputeRates_LiveArrivalWindow(t *testing.T) {
 	m := newTestMetrics()
-	t0 := time.Now()
-	m.computeRates(t0) // baseline only: no prior snapshot
-	if s := m.snapshot("b"); s.ReqRate != 0 || s.BytesRate != 0 || s.TokEstRate != 0 {
-		t.Errorf("rates after baseline = %+v, want all zero", s)
-	}
 
-	// 5s later: 10 requests, 1000 bytesIn, 2000 bytesOut, 800 tokens.
+	// 10 requests admitted this tick: 100 bytesIn + 200 bytesOut each,
+	// 80 tokEst each. The live rate divides the pending window by the tick
+	// interval — a full 30s-window rate, not a 500ms spike.
 	for range 10 {
-		m.recordRequest("b", requestSample{
-			T: t0, Backend: "b", Status: 200,
-			NewTokensEst: 80, BytesIn: 100, BytesOut: 200,
-		})
+		m.recordAccept("b", 100, 80)
 	}
-	m.computeRates(t0.Add(5 * time.Second))
+	m.computeRates(500 * time.Millisecond)
 
 	s := m.snapshot("b")
-	if math.Abs(s.ReqRate-2.0) > 1e-9 {
-		t.Errorf("reqRate = %v, want 2.0", s.ReqRate)
+	// rate = pending / dt: (10*100 + 10*200)/0.5s in? No — the window
+	// carries only the ADMITTED demand (bytesIn + tokEst), not the future
+	// response bytes. reqRate = 10/0.5 = 20/s over the tick; that is the
+	// true arrival rate this tick.
+	if math.Abs(s.ReqRate-20.0) > 1e-9 {
+		t.Errorf("reqRate = %v, want 20 (10 arrivals / 0.5s tick)", s.ReqRate)
 	}
-	if math.Abs(s.BytesRate-600.0) > 1e-9 { // (1000+2000)/5
-		t.Errorf("bytesRate = %v, want 600", s.BytesRate)
+	// tokEstRate = 800/0.5 = 1600/s over the tick interval.
+	if math.Abs(s.TokEstRate-1600.0) > 1e-9 {
+		t.Errorf("tokEstRate = %v, want 1600 (800 est tokens / 0.5s)", s.TokEstRate)
 	}
-	if math.Abs(s.TokEstRate-160.0) > 1e-9 { // 800/5
-		t.Errorf("tokEstRate = %v, want 160", s.TokEstRate)
+	// bytesRate = 1000/0.5 = 2000 B/s (admitted request bytes only;
+	// response bytes are not demand — they are produced over the decode).
+	if math.Abs(s.BytesRate-2000.0) > 1e-9 {
+		t.Errorf("bytesRate = %v, want 2000", s.BytesRate)
 	}
-	if s.ReqTotal != 10 || s.BytesInTotal != 1000 || s.BytesOutTotal != 2000 || s.TokEstTotal != 800 {
-		t.Errorf("counters = %+v, want 10/1000/2000/800", s)
+
+	// Nothing new this tick: the window decays by (dt/window)=0.5/30=1/60.
+	// pending after tick 1: 10*(59/60)=9.8333; rate = pending/dt.
+	m.computeRates(500 * time.Millisecond)
+	s = m.snapshot("b")
+	if math.Abs(s.ReqRate-19.6666666667) > 1e-6 { // 9.8333/0.5
+		t.Errorf("reqRate after decay tick = %v, want 19.6667 (window decays, not resets)", s.ReqRate)
+	}
+	// pending is now 9.8333*(59/60) = 9.6667.
+
+	// Completion does NOT reset the rate — it retires pending demand.
+	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 200, BytesIn: 100, BytesOut: 200, NewTokensEst: 80, accepted: true})
+	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 200, BytesIn: 100, BytesOut: 200, NewTokensEst: 80, accepted: true})
+	m.computeRates(500 * time.Millisecond)
+	s = m.snapshot("b")
+	// pending after tick2 = 10*(59/60)^2 = 9.5056; minus 2 completions,
+	// divided by 0.5s: 15.3389
+	if math.Abs(s.ReqRate-15.338888888888885) > 1e-9 {
+		t.Errorf("reqRate after 2 completions = %v, want 15.3389 (completions retire demand, decay keeps the tail)", s.ReqRate)
+	}
+
+	// Lifetime totals count completions only.
+	if s.ReqTotal != 2 || s.BytesInTotal != 200 || s.BytesOutTotal != 400 || s.TokEstTotal != 160 {
+		t.Errorf("lifetime counters = %+v, want reqTotal=2 bytesIn=200 bytesOut=400 tokEst=160", s)
+	}
+}
+
+func TestMetrics_Rates_RejectionsDoNotInflate(t *testing.T) {
+	m := newTestMetrics()
+	// A 429 that never entered a backend has no accepted flag — it must not
+	// add to (or retire) the pending window.
+	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 429, BytesIn: 50, NewTokensEst: 8})
+	m.computeRates(500 * time.Millisecond)
+	s := m.snapshot("b")
+	if s.ReqRate != 0 || s.TokEstRate != 0 || s.BytesRate != 0 {
+		t.Errorf("rates after pure rejection = %+v, want all zero", s)
+	}
+	if s.ReqTotal != 1 {
+		t.Errorf("reqTotal = %d, want 1 (rejection is a completed sample)", s.ReqTotal)
 	}
 }
 
@@ -596,6 +638,205 @@ func TestMetrics_BurstRing_EvictionAndLimit(t *testing.T) {
 
 func firstTok(s []requestSample) int { return s[0].NewTokensEst }
 func lastTok(s []requestSample) int  { return s[len(s)-1].NewTokensEst }
+
+// ---------------------------------------------------------------------------
+// engine metrics: parser + scrape semantics
+// ---------------------------------------------------------------------------
+
+func TestEngine_ParsePromText(t *testing.T) {
+	body := []byte(`
+# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="m",engine="0"} 3
+vllm:num_requests_running{model_name="m",engine="1"} 2
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.4
+vllm:prompt_tokens_total{model_name="m",engine="0"} 1000
+# a comment that looks like data
+vllm:e2e_request_latency_seconds_bucket{le="+Inf"} 7
+vllm:e2e_request_latency_seconds_count 5
+vllm:e2e_request_latency_seconds_sum 12.5
+not_a_number 1.2.3
+`)
+	samples := parsePromText(body)
+	byName := map[string][]promSample{}
+	for _, s := range samples {
+		byName[s.name] = append(byName[s.name], s)
+	}
+	if len(byName["vllm:num_requests_running"]) != 2 {
+		t.Fatalf("running samples = %d, want 2 (HELP/TYPE skipped)", len(byName["vllm:num_requests_running"]))
+	}
+	if byName["vllm:num_requests_running"][0].labels["model_name"] != "m" ||
+		byName["vllm:num_requests_running"][0].labels["engine"] != "0" {
+		t.Errorf("labels = %v, want model_name=m engine=0", byName["vllm:num_requests_running"][0].labels)
+	}
+	if byName["vllm:kv_cache_usage_perc"][0].value != 0.4 {
+		t.Errorf("kv value = %v, want 0.4", byName["vllm:kv_cache_usage_perc"][0].value)
+	}
+	if byName["vllm:e2e_request_latency_seconds_sum"][0].value != 12.5 {
+		t.Errorf("hist sum = %v, want 12.5", byName["vllm:e2e_request_latency_seconds_sum"][0].value)
+	}
+	if len(byName["not_a_number"]) != 0 {
+		t.Errorf("unparseable line not skipped")
+	}
+}
+
+func TestEngine_ParsePromText_EscapedLabel(t *testing.T) {
+	body := []byte(`x{model_name="a\"b",engine="0"} 1
+`)
+	samples := parsePromText(body)
+	if len(samples) != 1 || samples[0].labels["model_name"] != `a"b` {
+		t.Fatalf("escaped label = %+v, want a\"b", samples)
+	}
+}
+
+// fakeExpo serves a fixed Prometheus body for one scrape.
+func TestEngine_ScrapeVllm(t *testing.T) {
+	r := newEngineRegistry()
+	r.add("king", "http://127.0.0.1:1/metrics") // url unused; we feed the body
+	r.mu.Lock()
+	s := r.backends["king"]
+	r.mu.Unlock()
+
+	// Prime the counter baseline ~2s ago: 1000 prompt tokens.
+	key := counterKey(promSample{name: "vllm:prompt_tokens_total", labels: map[string]string{"model_name": "m", "engine": "0"}})
+	s.counters[key] = 1000
+	s.cTimes[key] = time.Now().Add(-2 * time.Second)
+
+	// Two data-parallel engines: running sums, KV takes max, one scrape
+	// interval later the counter has advanced 3000-1000=2000 tokens.
+	body := `
+vllm:num_requests_running{model_name="m",engine="0"} 3
+vllm:num_requests_running{model_name="m",engine="1"} 2
+vllm:num_requests_waiting{model_name="m",engine="0"} 1
+vllm:num_requests_waiting{model_name="m",engine="1"} 0
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.4
+vllm:kv_cache_usage_perc{model_name="m",engine="1"} 0.6
+vllm:prompt_tokens_total{model_name="m",engine="0"} 3000
+vllm:generation_tokens_total{model_name="m",engine="0"} 500
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 10
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 2
+`
+	s.scrapeBody(parsePromText([]byte(body)))
+	first := s.view
+	if first.Status != "ok" {
+		t.Fatalf("status = %q, want ok", first.Status)
+	}
+	if first.Running != 5 || first.Waiting != 1 {
+		t.Errorf("vllm gauges = running %v / waiting %v, want 5/1 (sum across engines)", first.Running, first.Waiting)
+	}
+	if first.KVPct != 60 {
+		t.Errorf("kvPct = %v, want 60 (max across engines)", first.KVPct)
+	}
+	// ~2000 tokens over ~2s of real wall clock (wall-clock jitter ±1%).
+	if first.PrefillTokS < 980 || first.PrefillTokS > 1020 {
+		t.Errorf("prefillTokS = %v, want ~1000 (2000 tokens / ~2s)", first.PrefillTokS)
+	}
+	// TTFT mean needs two histogram samples: prime happened on this scrape,
+	// so the mean arrives on the next one.
+	body2 := `
+vllm:num_requests_running{model_name="m",engine="0"} 3
+vllm:num_requests_running{model_name="m",engine="1"} 2
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.6
+vllm:kv_cache_usage_perc{model_name="m",engine="1"} 0.4
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 30
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 4
+`
+	s.scrapeBody(parsePromText([]byte(body2)))
+	if got := s.view.TTFTms; got < 9900 || got > 10100 {
+		t.Errorf("ttftMs = %v, want ~10000 ((30-10)/(4-2) s)", got)
+	}
+	// Counter reset (engine restart) re-baselines to 0 instead of negative.
+	s2body := `
+vllm:prompt_tokens_total{model_name="m",engine="0"} 10
+`
+	s.scrapeBody(parsePromText([]byte(s2body)))
+	if s.view.PrefillTokS != 0 {
+		t.Errorf("prefillTokS after counter reset = %v, want 0 (re-baseline)", s.view.PrefillTokS)
+	}
+}
+
+func TestEngine_ScrapeSglang(t *testing.T) {
+	r := newEngineRegistry()
+	r.add("subject", "http://127.0.0.1:1/metrics")
+	r.mu.Lock()
+	s := r.backends["subject"]
+	r.mu.Unlock()
+
+	body := `
+# scheduler gauges: replicated per tp rank -> max
+sglang:num_running_reqs{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 4
+sglang:num_running_reqs{model_name="m",engine_type="a",tp_rank="1",pp_rank="0",moe_ep_rank="0"} 4
+sglang:num_queue_reqs{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 2
+sglang:num_queue_reqs{model_name="m",engine_type="a",tp_rank="1",pp_rank="0",moe_ep_rank="0"} 2
+sglang:token_usage{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 0.75
+sglang:token_usage{model_name="m",engine_type="a",tp_rank="1",pp_rank="0",moe_ep_rank="0"} 0.75
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_compute"} 4000
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_cache"} 2000
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="decode"} 6000
+`
+	s.scrapeBody(parsePromText([]byte(body)))
+	if s.view.Status != "ok" {
+		t.Fatalf("status = %q, want ok", s.view.Status)
+	}
+	if s.view.Running != 4 || s.view.Waiting != 2 {
+		t.Errorf("sglang gauges = %v/%v, want 4/2 (max across ranks)", s.view.Running, s.view.Waiting)
+	}
+	if s.view.KVPct != 75 {
+		t.Errorf("kvPct = %v, want 75", s.view.KVPct)
+	}
+	// First sight of a counter has no prior value: rates start at 0.
+	if s.view.PrefillTokS != 0 || s.view.DecodeTokS != 0 {
+		t.Errorf("first-sight rates = %v/%v, want 0/0 (no baseline yet)", s.view.PrefillTokS, s.view.DecodeTokS)
+	}
+
+	// realtime_tokens_total by mode: prefill = compute+cache, decode separate.
+	body2 := `
+sglang:num_running_reqs{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 4
+sglang:token_usage{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 0.75
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_compute"} 12000
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_cache"} 6000
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="decode"} 18000
+`
+	time.Sleep(300 * time.Millisecond)
+	s.scrapeBody(parsePromText([]byte(body2)))
+	// Δprefill = (12000-4000)+(6000-2000) = 12000 over ~0.3s wall clock.
+	if s.view.PrefillTokS < 30000 || s.view.PrefillTokS > 60000 {
+		t.Errorf("prefillTokS = %v, want ~40000/s (12000 tokens / ~0.3s)", s.view.PrefillTokS)
+	}
+	if s.view.DecodeTokS < 30000 {
+		t.Errorf("decodeTokS = %v, want ~40000/s (12000 tokens / ~0.3s)", s.view.DecodeTokS)
+	}
+}
+
+func TestEngine_EndpointOff(t *testing.T) {
+	// A 404 (SGLang without --enable-metrics) must land on status "off",
+	// not "err" — the sheet distinguishes "absent" from "unreachable".
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	r := newEngineRegistry()
+	r.add("king", srv.URL+"/metrics")
+	r.scrape("king")
+	r.mu.Lock()
+	status := r.backends["king"].status
+	r.mu.Unlock()
+	if status != "off" {
+		t.Errorf("status = %q, want off (404 endpoint)", status)
+	}
+
+	// A dead endpoint is "err".
+	r2 := newEngineRegistry()
+	r2.add("dead", "http://127.0.0.1:1/metrics")
+	r2.scrape("dead")
+	r2.mu.Lock()
+	status2 := r2.backends["dead"].status
+	r2.mu.Unlock()
+	if status2 != "err" {
+		t.Errorf("status = %q, want err (unreachable)", status2)
+	}
+}
 
 // frame mirrors the live metrics contract frame (field names, not types).
 type frame struct {
@@ -641,6 +882,7 @@ type frame_backends_entry struct {
 	EWMAms          float64 `json:"ewmaMs"`
 	TTFTms          float64 `json:"ttftMs"`
 	TTFTSampleCount int     `json:"ttftSampleCount"`
+	TTFTMsNow       float64 `json:"ttftMsNow"`
 	ReqRate         float64 `json:"reqRate"`
 	BytesRate       float64 `json:"bytesRate"`
 	TokEstRate      float64 `json:"tokEstRate"`
@@ -648,6 +890,15 @@ type frame_backends_entry struct {
 	BytesInTotal    int64   `json:"bytesInTotal"`
 	BytesOutTotal   int64   `json:"bytesOutTotal"`
 	TokEstTotal     int64   `json:"tokEstTotal"`
+	Engine          struct {
+		Running     float64 `json:"running"`
+		Waiting     float64 `json:"waiting"`
+		KVPct       float64 `json:"kvPct"`
+		PrefillTokS float64 `json:"prefillTokS"`
+		DecodeTokS  float64 `json:"decodeTokS"`
+		TTFTms      float64 `json:"ttftMs"`
+		Status      string  `json:"status"`
+	} `json:"engine"`
 }
 
 func frameBackend(t *testing.T, fr *frame, name string) *frame_backend {
@@ -878,6 +1129,11 @@ func TestMetricsStream_LiveSnapshot(t *testing.T) {
 	}
 	if subj.TTFTSampleCount < 1 || subj.TTFTms < 50 {
 		t.Errorf("subject ttft = %v/%d, want >= 50ms with 1 sample (150ms first-byte delay)", subj.TTFTms, subj.TTFTSampleCount)
+	}
+	// TTFT is live: the first-byte sample appears in the frame as soon as
+	// the head byte arrives — before the stream completes.
+	if subj.TTFTMsNow < 50 {
+		t.Errorf("subject.ttftMsNow = %v, want >= 50 (recorded at first byte, not completion)", subj.TTFTMsNow)
 	}
 	if subj.TokEstTotal != int64(wantTok) {
 		t.Errorf("subject.tokEstTotal = %d, want %d (estimate of the test body)", subj.TokEstTotal, wantTok)

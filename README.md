@@ -194,9 +194,13 @@ Requests rejected because a queue, GPU budget, or prefill limit is full receive 
 The router embeds a live operations dashboard (SvelteKit, served at `/` by the
 same binary). One tessellated "fold sheet" shows every backend as a live
 cell: current in-flight vs its limit, queue depth, large-prefill state, EWMA
-duration, streaming time-to-first-byte (TTFT), request/byte rates, and the GPU
-budget gauge while a King is active. A fleet strip shows aggregate
-requests/sec, TTFT, and estimated token rate; a live request tape streams the
+duration, streaming time-to-first-byte (TTFT), live request/byte/token rates,
+and the GPU budget gauge while a King is active. Opening a fold gives a 30s /
+60s / 5m trace (5-minute history buffer) with signal switcher — including the
+backend's **own** running/queue/KV-cache/prefill/decode state scraped from its
+Prometheus `/metrics` — plus full readout. A fleet strip shows aggregate
+requests/sec, TTFT, estimated prefill token rate (`est`), and **real decode
+token throughput** (`real`, from the engines); a live request tape streams the
 most recent requests including router rejections (429/413).
 
 The dashboard is served by the same listener as the management endpoints (so
@@ -205,7 +209,7 @@ proxy). It reads two streaming endpoints:
 
 | Endpoint | Description |
 | :--- | :--- |
-| `GET /metrics/stream` | SSE feed of full live snapshots every `?interval=` (default `500ms`, clamped `200ms`–`10s`). One JSON frame per `data:` line: per-backend slots, EWMA duration, streaming TTFT EWMA + sample count, request/byte/est-token rates (per-interval deltas), cumulative counters, GPU budget state, tier-0 in-flight, and fleet totals. |
+| `GET /metrics/stream` | SSE feed of full live snapshots every `?interval=` (default `500ms`, clamped `200ms`–`10s`). One JSON frame per `data:` line: per-backend slots, EWMA duration, streaming TTFT (EWMA + latest first-byte sample), live arrival rates (30s window), cumulative counters, engine metrics (running/waiting/kv/prefill/decode/ttft), GPU budget state, tier-0 in-flight, and fleet totals. |
 | `GET /metrics/burst` | The most recent completed requests (bounded ring, default capacity `500`, `?limit=` up to `1000`), newest last, including router-originated rejections. |
 
 The frontend connects to `/metrics/stream` via `EventSource` and falls back to
@@ -216,14 +220,23 @@ for the dashboard until `web/build` exists).
 
 ### Measurement boundary
 
-Token figures are **estimates, not measured decode throughput**. The router
-measures requests, bytes, queue/concurrency/GPU state, total-duration EWMA,
-and streaming first-byte TTFT directly. It does **not** count output tokens:
-it streams response bytes through without parsing upstream usage (vLLM/SGLang
-expose per-request token usage inconsistently). `tokEst*` figures are the
-router's existing estimate of **new prefill tokens** from the request body
-(~4 bytes/token, last-message-only for multi-turn). The dashboard labels
-these `est`; requests/sec and bytes/sec are measured.
+Two token figures coexist, labeled differently:
+
+- **`est` — estimated prefill tokens.** The router measures requests, bytes,
+  queue/concurrency/GPU state, total-duration EWMA, and streaming first-byte
+  TTFT directly. It does **not** count output tokens: it streams response
+  bytes through without parsing upstream usage. `tokEst*` figures are the
+  router's estimate of **new prefill tokens** from the request body (~4
+  bytes/token, last-message-only for multi-turn). Requests/sec and bytes/sec
+  are measured.
+- **`real` — engine token throughput.** The router scrapes each backend's own
+  Prometheus `/metrics` endpoint at 1s and derives real prompt/prefill and
+  completion/decode token rates from the engine's counters, plus in-engine
+  running/waiting gauges and KV-cache pressure. vLLM serves `/metrics`
+  always; SGLang only when started with `--enable-metrics` — when the endpoint
+  is absent or unreachable the dashboard says `off`/`err` and renders `—`
+  rather than guessing. This is additive truth, not a replacement for the
+  router's admission view.
 
 
 ## Architecture

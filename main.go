@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -250,7 +251,9 @@ func (d *durationTracker) avgSeconds() float64 {
 // ─── Metrics registry (live observability) ────────────────────────────────
 
 // requestSample is one completed (or rejected) request, kept in the burst
-// ring and folded into per-backend counters.
+// ring and folded into per-backend counters. accepted marks the demand side
+// that recordAccept registered at admission; only accepted samples are
+// retired from the pending window on completion.
 type requestSample struct {
 	T            time.Time
 	Backend      string
@@ -262,32 +265,44 @@ type requestSample struct {
 	NewTokensEst int
 	BytesIn      int64
 	BytesOut     int64
+	accepted     bool
 }
 
-// backendMetrics holds per-backend counters, the streaming TTFT EWMA (ms),
-// and precomputed rates (refreshed by computeRates on the 500ms tick).
+// backendMetrics holds per-backend lifetime counters (completed requests
+// only), the streaming TTFT EWMA (updated at first response byte), and the
+// pending window — requests accepted but not yet completed, which feeds the
+// live rates. Rates measure arrival, not completion: a decode can run for
+// minutes, but the request's demand began the moment it was admitted.
 type backendMetrics struct {
 	reqTotal      int64
 	bytesInTotal  int64
 	bytesOutTotal int64
 	tokEstTotal   int64
-	ttftEwma      float64 // ms
+	ttftEwma      float64 // ms — EWMA over first-byte times, updated at first byte
 	ttftSamples   int
+	ttftMsNow     float64 // ms — the most recent first-byte sample (no decay)
 	reqRate       float64
 	bytesRate     float64
 	tokEstRate    float64
-	lastT         time.Time
-	lastReq       int64
-	lastBytesIn   int64
-	lastBytesOut  int64
-	lastTokEst    int64
+	// pending: demand recorded at admission, not yet completed. computeRates
+	// divides it by the tick interval to get the live rate, then decays the
+	// remainder back by (interval / window).
+	pending       float64
+	pendingReq    float64
+	pendingTokEst float64
 }
+
+// rateWindowS is how far back the live-rate window reaches. A single tick's
+// arrivals produce a full-window rate, so even sparse traffic shows a real
+// sustained rate instead of a 2×-per-tick spike that returns to zero.
+const rateWindowS = 30
 
 // backendMetricSnapshot is the lock-free view of backendMetrics used by the
 // frame builder.
 type backendMetricSnapshot struct {
 	TTFTMs          float64
 	TTFTSampleCount int
+	TTFTMsNow       float64
 	ReqRate         float64
 	BytesRate       float64
 	TokEstRate      float64
@@ -300,11 +315,10 @@ type backendMetricSnapshot struct {
 // metricsRegistry is the mutex-guarded home for request counters, the TTFT
 // EWMA, and the bounded burst ring (newest appended, oldest evicted).
 type metricsRegistry struct {
-	mu         sync.Mutex
-	backends   map[string]*backendMetrics
-	ring       []requestSample
-	ringCap    int
-	rateBaseln time.Time // last tick at which per-backend baselines were taken
+	mu       sync.Mutex
+	backends map[string]*backendMetrics
+	ring     []requestSample
+	ringCap  int
 }
 
 func newMetricsRegistry() *metricsRegistry {
@@ -313,8 +327,51 @@ func newMetricsRegistry() *metricsRegistry {
 
 var metrics = newMetricsRegistry()
 
-// recordRequest folds one sample into per-backend counters and the ring.
-// The TTFT EWMA updates only for streaming samples with TTFTMs > 0.
+// recordAccept records the demand side of a request the moment it is
+// admitted for proxying: the pending window counters that feed the live
+// rates. Rejections (429/413) are not "accepted" — they never enter a
+// backend — and are not recorded here.
+func (m *metricsRegistry) recordAccept(backend string, bytesIn int64, tokEst int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bm, ok := m.backends[backend]
+	if !ok {
+		bm = &backendMetrics{}
+		m.backends[backend] = bm
+	}
+	bm.pendingReq += 1
+	bm.pending += float64(bytesIn)
+	bm.pendingTokEst += float64(tokEst)
+}
+
+// recordFirstByte captures TTFT at first response byte, while the request is
+// still live — not at completion, which would lag the operator by the full
+// decode. Only streaming requests carry a first-byte time; the EWMA updates
+// here so the dashboard sees the real current value as it arrives.
+func (m *metricsRegistry) recordFirstByte(backend string, ttftMs float64) {
+	if ttftMs <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bm, ok := m.backends[backend]
+	if !ok {
+		return
+	}
+	if bm.ttftSamples == 0 {
+		bm.ttftEwma = ttftMs
+	} else {
+		const alpha = 0.3
+		bm.ttftEwma = alpha*ttftMs + (1-alpha)*bm.ttftEwma
+	}
+	bm.ttftSamples++
+	bm.ttftMsNow = ttftMs
+}
+
+// recordRequest folds one COMPLETED (or rejected) request into per-backend
+// lifetime counters and the burst ring, and retires it from the pending
+// window if it had been accepted. Lifetime totals count completed work only;
+// the pending counters are the live-rate source until completion.
 func (m *metricsRegistry) recordRequest(backend string, s requestSample) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -323,19 +380,19 @@ func (m *metricsRegistry) recordRequest(backend string, s requestSample) {
 		bm = &backendMetrics{}
 		m.backends[backend] = bm
 	}
+	// Retire the pending demand for requests that were actually accepted and
+	// proxied. Router-originated rejections (413/429) never enter the
+	// pending window — counting them would inflate the live rate with
+	// demand that never reached a backend.
+	if s.accepted {
+		bm.pendingReq--
+		bm.pending -= float64(s.BytesIn)
+		bm.pendingTokEst -= float64(s.NewTokensEst)
+	}
 	bm.reqTotal++
 	bm.bytesInTotal += s.BytesIn
 	bm.bytesOutTotal += s.BytesOut
 	bm.tokEstTotal += int64(s.NewTokensEst)
-	if s.Stream && s.TTFTMs > 0 {
-		if bm.ttftSamples == 0 {
-			bm.ttftEwma = s.TTFTMs
-		} else {
-			alpha := 0.3
-			bm.ttftEwma = alpha*s.TTFTMs + (1-alpha)*bm.ttftEwma
-		}
-		bm.ttftSamples++
-	}
 	m.ring = append(m.ring, s)
 	if len(m.ring) > m.ringCap {
 		m.ring = m.ring[len(m.ring)-m.ringCap:]
@@ -359,30 +416,32 @@ func (m *metricsRegistry) burst(limit int) []requestSample {
 	return out
 }
 
-// computeRates refreshes per-backend req/bytes/tok-est rates from counter
-// deltas over the interval since the last call. The first call only takes a
-// registry-level baseline (rates start on the following tick), so a backend
-// first seen between ticks measures over the full interval.
-func (m *metricsRegistry) computeRates(now time.Time) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.rateBaseln.IsZero() {
-		m.rateBaseln = now
-		return
-	}
-	dt := now.Sub(m.rateBaseln).Seconds()
-	m.rateBaseln = now
+// computeRates refreshes per-backend req/bytes/tok-est live rates. Each tick,
+// the whole pending window is divided by the tick interval — a request
+// admitted this tick contributes a full window-length rate — and then the
+// window decays back by (interval / window) so its tail lingers for the
+// rest of rateWindowS instead of vanishing on the next tick. The result is a
+// sustained rate that tracks arrivals, not completion deltas: a 10-minute
+// decode shows its true admission rate from the moment it was accepted.
+func (m *metricsRegistry) computeRates(dt time.Duration) {
 	if dt <= 0 {
 		return
 	}
+	dtS := dt.Seconds()
+	window := float64(rateWindowS)
+	if window < dtS {
+		window = dtS
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, bm := range m.backends {
-		bm.reqRate = float64(bm.reqTotal-bm.lastReq) / dt
-		bm.bytesRate = float64(bm.bytesInTotal+bm.bytesOutTotal-bm.lastBytesIn-bm.lastBytesOut) / dt
-		bm.tokEstRate = float64(bm.tokEstTotal-bm.lastTokEst) / dt
-		bm.lastReq = bm.reqTotal
-		bm.lastBytesIn = bm.bytesInTotal
-		bm.lastBytesOut = bm.bytesOutTotal
-		bm.lastTokEst = bm.tokEstTotal
+		bm.reqRate = bm.pendingReq / dtS
+		bm.bytesRate = float64(bm.pending) / dtS
+		bm.tokEstRate = bm.pendingTokEst / dtS
+		decay := dtS / window
+		bm.pendingReq *= 1 - decay
+		bm.pending *= 1 - decay
+		bm.pendingTokEst *= 1 - decay
 	}
 }
 
@@ -397,6 +456,7 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 	return backendMetricSnapshot{
 		TTFTMs:          bm.ttftEwma,
 		TTFTSampleCount: bm.ttftSamples,
+		TTFTMsNow:       bm.ttftMsNow,
 		ReqRate:         bm.reqRate,
 		BytesRate:       bm.bytesRate,
 		TokEstRate:      bm.tokEstRate,
@@ -405,6 +465,445 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 		BytesOutTotal:   bm.bytesOutTotal,
 		TokEstTotal:     bm.tokEstTotal,
 	}
+}
+
+// ─── Engine metrics (the backends' own /metrics) ──────────────────────────
+//
+// The router measures demand at admission; the engine measures execution.
+// In-engine running/waiting, KV-cache pressure, and REAL token throughput
+// (prompt + completion — not the ~4 bytes/token body estimate) only exist
+// inside the engine, so we scrape each backend's Prometheus /metrics with a
+// stdlib text-exposition parser at 1s. vLLM always serves /metrics; SGLang
+// requires --enable-metrics. When the endpoint is absent or down the view
+// degrades to status "off"/"err" and the sheet renders "—" — never a guess.
+//
+// Aggregation rules (from the engines' source, verified 2026-08-20):
+//   - vLLM gauges are labeled [model_name, engine]; request counts SUM
+//     across data-parallel engines, KV usage is per-pool so MAX.
+//   - SGLang scheduler gauges are per tp/pp/moe rank (multiprocess
+//     mostrecent) and replicate the same batch state — MAX across ranks.
+//   - Token counters are rate-differenced between scrapes; a counter reset
+//     (engine restart) re-baselines instead of going negative.
+//   - TTFT mean comes from the histogram's _sum/_count deltas.
+//   - SGLang realtime_tokens_total{mode}: prefill = prefill_compute +
+//     prefill_cache, decode = decode.
+
+// engineView is the per-backend engine truth published in the frame.
+// Zero + status != "ok" means "no data" — the client renders "—".
+type engineView struct {
+	Running     float64 `json:"running"`
+	Waiting     float64 `json:"waiting"`
+	KVPct       float64 `json:"kvPct"` // 0..100
+	PrefillTokS float64 `json:"prefillTokS"`
+	DecodeTokS  float64 `json:"decodeTokS"`
+	TTFTms      float64 `json:"ttftMs"`
+	Status      string  `json:"status"` // "ok" | "off" | "err"
+}
+
+// promSample is one line of a Prometheus text exposition.
+type promSample struct {
+	name   string
+	labels map[string]string
+	value  float64
+}
+
+// histState tracks the previous _sum/_count pair for one histogram.
+type histState struct {
+	sum, cnt         float64
+	t                time.Time
+	lastSum, lastCnt float64
+}
+
+type engineScrape struct {
+	url    string
+	status string
+	view   engineView
+	// counters: rate-differenced between scrapes, keyed by name+labels.
+	counters map[string]float64
+	cTimes   map[string]time.Time
+	// histograms: only the ones the dashboard reads.
+	hists   map[string]*histState
+	lastT   time.Time
+	seenEng map[string]bool
+}
+
+type engineRegistry struct {
+	mu       sync.Mutex
+	backends map[string]*engineScrape
+	client   *http.Client
+}
+
+func newEngineRegistry() *engineRegistry {
+	return &engineRegistry{
+		backends: map[string]*engineScrape{},
+		client:   &http.Client{Timeout: 2 * time.Second},
+	}
+}
+
+func (e *engineRegistry) add(name, url string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.backends[name] = &engineScrape{
+		url:      url,
+		status:   "off",
+		counters: map[string]float64{},
+		cTimes:   map[string]time.Time{},
+		hists: map[string]*histState{
+			"vllm:time_to_first_token_seconds":   {},
+			"sglang:time_to_first_token_seconds": {},
+		},
+		seenEng: map[string]bool{},
+	}
+}
+
+func (e *engineRegistry) view(backend string) engineView {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if s, ok := e.backends[backend]; ok {
+		return s.view
+	}
+	return engineView{}
+}
+
+// loop scrapes every backend every second until the process exits.
+func (e *engineRegistry) loop() {
+	ticker := time.NewTicker(time.Second)
+	for range ticker.C {
+		e.mu.Lock()
+		names := make([]string, 0, len(e.backends))
+		for n := range e.backends {
+			names = append(names, n)
+		}
+		e.mu.Unlock()
+		for _, n := range names {
+			e.scrape(n)
+		}
+	}
+}
+
+func (e *engineRegistry) scrape(name string) {
+	e.mu.Lock()
+	s, ok := e.backends[name]
+	if !ok {
+		e.mu.Unlock()
+		return
+	}
+	url := s.url
+	e.mu.Unlock()
+
+	body, gone, ok := func() ([]byte, bool, bool) {
+		resp, err := e.client.Get(url)
+		if err != nil {
+			return nil, false, false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+			return nil, true, false
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, false, false
+		}
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if err != nil {
+			return nil, false, false
+		}
+		return b, false, true
+	}()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !ok {
+		if gone {
+			s.status = "off"
+		} else {
+			s.status = "err"
+		}
+		s.view.PrefillTokS = 0
+		s.view.DecodeTokS = 0
+		return
+	}
+	s.scrapeBody(parsePromText(body))
+}
+
+// scrapeBody folds one parsed exposition into the scrape state.
+func (s *engineScrape) scrapeBody(samples []promSample) {
+	now := time.Now()
+	view := s.view
+
+	// First pass: family detection + gauge accumulation.
+	vllm, sg := false, false
+	var running, waiting float64
+	var kvMax float64
+	haveKV := false
+	for _, sm := range samples {
+		switch {
+		case strings.HasPrefix(sm.name, "vllm:"):
+			vllm = true
+			switch sm.name {
+			case "vllm:num_requests_running":
+				running += sm.value // sum across data-parallel engines
+			case "vllm:num_requests_waiting":
+				waiting += sm.value
+			case "vllm:kv_cache_usage_perc":
+				if sm.value > kvMax {
+					kvMax = sm.value
+					haveKV = true
+				}
+			}
+		case strings.HasPrefix(sm.name, "sglang:"):
+			sg = true
+			switch sm.name {
+			case "sglang:num_running_reqs":
+				if sm.value > running {
+					running = sm.value
+				}
+			case "sglang:num_queue_reqs":
+				if sm.value > waiting {
+					waiting = sm.value
+				}
+			case "sglang:token_usage":
+				if sm.value > kvMax {
+					kvMax = sm.value
+					haveKV = true
+				}
+			}
+		}
+	}
+	if len(samples) == 0 {
+		s.status = "err"
+		return
+	}
+	s.status = "ok"
+	s.view = engineView{Status: "ok"}
+	view = s.view
+	if vllm {
+		s.seenEng["vllm"] = true
+		view.Running = running
+		view.Waiting = waiting
+	}
+	if sg && !vllm {
+		s.seenEng["sglang"] = true
+		view.Running = running
+		view.Waiting = waiting
+	}
+	if haveKV {
+		view.KVPct = kvMax * 100
+	}
+
+	// Second pass: token counters + TTFT histograms, in the detected family.
+	view.PrefillTokS = 0
+	view.DecodeTokS = 0
+	view.TTFTms = 0
+	if vllm {
+		for _, sm := range samples {
+			switch sm.name {
+			case "vllm:prompt_tokens_total":
+				view.PrefillTokS += s.counterRate(sm, now)
+			case "vllm:generation_tokens_total":
+				view.DecodeTokS += s.counterRate(sm, now)
+			}
+		}
+		s.updateHist("vllm:time_to_first_token_seconds", samples, now)
+		view.TTFTms = s.histMean("vllm:time_to_first_token_seconds")
+	} else if sg {
+		for _, sm := range samples {
+			if sm.name == "sglang:realtime_tokens_total" {
+				switch sm.labels["mode"] {
+				case "prefill_compute", "prefill_cache":
+					view.PrefillTokS += s.counterRate(sm, now)
+				case "decode":
+					view.DecodeTokS += s.counterRate(sm, now)
+				}
+			}
+		}
+		s.updateHist("sglang:time_to_first_token_seconds", samples, now)
+		view.TTFTms = s.histMean("sglang:time_to_first_token_seconds")
+	}
+	s.lastT = now
+	s.view = view
+}
+
+// counterKey distinguishes samples of the same metric with different
+// labels (mode, is_streaming, engine, rank...).
+func counterKey(sm promSample) string {
+	keys := make([]string, 0, len(sm.labels))
+	for k := range sm.labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(sm.name)
+	for _, k := range keys {
+		b.WriteByte('\x00')
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(sm.labels[k])
+	}
+	return b.String()
+}
+
+// counterRate returns Δ/Δt for one counter sample. First sight and counter
+// resets (engine restart) re-baseline: rate 0 for this scrape.
+func (s *engineScrape) counterRate(sm promSample, now time.Time) float64 {
+	k := counterKey(sm)
+	rate := 0.0
+	if prev, ok := s.counters[k]; ok {
+		if dt := now.Sub(s.cTimes[k]).Seconds(); dt > 0 {
+			if sm.value >= prev {
+				rate = (sm.value - prev) / dt
+			} else {
+				rate = 0 // reset: re-baseline below
+			}
+		}
+	}
+	s.counters[k] = sm.value
+	s.cTimes[k] = now
+	return rate
+}
+
+// updateHist folds _sum/_count samples into one histogram's state. All
+// label sets of the same histogram are summed, so multi-engine/multi-rank
+// instances produce one true mean.
+func (s *engineScrape) updateHist(base string, samples []promSample, now time.Time) {
+	h, ok := s.hists[base]
+	if !ok {
+		return
+	}
+	var sum, cnt float64
+	for _, sm := range samples {
+		if sm.name == base+"_sum" {
+			sum += sm.value
+		} else if sm.name == base+"_count" {
+			cnt += sm.value
+		}
+	}
+	// A histogram with no observations yet emits no lines — skip.
+	if sum == 0 && cnt == 0 {
+		return
+	}
+	if h.t.IsZero() {
+		h.sum, h.cnt = sum, cnt
+	} else if sum >= h.sum && cnt >= h.cnt {
+		if d := cnt - h.cnt; d > 0 {
+			h.lastSum = (sum - h.sum) / d
+		}
+		h.sum, h.cnt = sum, cnt
+	} else {
+		h.sum, h.cnt = sum, cnt // reset: re-baseline
+	}
+	h.t = now
+}
+
+// histMean is the mean (ms) over the most recent scrape interval.
+func (s *engineScrape) histMean(base string) float64 {
+	if h, ok := s.hists[base]; ok {
+		return h.lastSum * 1000
+	}
+	return 0
+}
+
+// ─── Prometheus text parser (stdlib, dashboard needs only) ────────────────
+
+// parsePromText parses the Prometheus text exposition format well enough
+// for gauges, counters, and histogram _sum/_count parts. HELP/TYPE lines,
+// openmetrics timestamps, and unparseable lines are skipped.
+func parsePromText(body []byte) []promSample {
+	var out []promSample
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimRight(line, " \r")
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		// Value is the last whitespace-delimited token; drop an optional
+		// trailing epoch-seconds timestamp first.
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		val := fields[len(fields)-1]
+		head := fields[0]
+		// Some collectors emit "name{labels} value ts" — head already has
+		// the labels; value is the token after it.
+		if len(fields) >= 3 && strings.ContainsAny(head, "{}") {
+			val = fields[len(fields)-2]
+		}
+		v, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			continue
+		}
+		name, labels, ok := splitPromHead(head)
+		if !ok {
+			continue
+		}
+		out = append(out, promSample{name: name, labels: labels, value: v})
+	}
+	return out
+}
+
+// splitPromHead splits "name{k=\"v\",...}" into name and labels.
+func splitPromHead(head string) (string, map[string]string, bool) {
+	brace := strings.IndexByte(head, '{')
+	if brace < 0 {
+		if head == "" || strings.ContainsAny(head, " \t") {
+			return "", nil, false
+		}
+		return head, nil, true
+	}
+	name := head[:brace]
+	if name == "" || strings.ContainsAny(name, " \t") {
+		return "", nil, false
+	}
+	inner := head[brace+1:]
+	if !strings.HasSuffix(inner, "}") {
+		return "", nil, false
+	}
+	inner = inner[:len(inner)-1]
+	labels := map[string]string{}
+	if inner != "" {
+		rest := inner
+		for {
+			eq := strings.IndexByte(rest, '=')
+			if eq <= 0 {
+				return "", nil, false
+			}
+			key := rest[:eq]
+			rest = rest[eq+1:]
+			if len(rest) < 2 || rest[0] != '"' {
+				return "", nil, false
+			}
+			var sb strings.Builder
+			closed := false
+			for j := 1; j < len(rest); j++ {
+				c := rest[j]
+				if c == '\\' && j+1 < len(rest) {
+					j++
+					sb.WriteByte(rest[j])
+					continue
+				}
+				if c == '"' {
+					rest = rest[j+1:]
+					closed = true
+					break
+				}
+				sb.WriteByte(c)
+			}
+			if !closed {
+				return "", nil, false
+			}
+			labels[key] = sb.String()
+			if rest == "" {
+				break
+			}
+			if !strings.HasPrefix(rest, ",") {
+				return "", nil, false
+			}
+			rest = rest[1:]
+			if rest == "" {
+				break
+			}
+		}
+	}
+	return name, labels, true
 }
 
 // ─── Global state ─────────────────────────────────────────────────────────
@@ -420,6 +919,7 @@ var (
 	prefillTokensPerSec int                         = 10000
 	durations           map[string]*durationTracker // per backend name
 	proxies             map[string]*httputil.ReverseProxy
+	engineMetrics       = newEngineRegistry() // per-backend /metrics scrape
 	proxyTransport      = &http.Transport{
 		ResponseHeaderTimeout: 5 * time.Minute,
 		IdleConnTimeout:       60 * time.Second,
@@ -525,6 +1025,13 @@ func main() {
 		}
 		log.Printf("  %s -> %s (%s)", b.Name, b.URL, strings.Join(fields, ", "))
 	}
+	// The engine's own /metrics: real in-engine running/waiting, KV pressure,
+	// and prompt+completion token rates. vLLM serves it always; SGLang only
+	// with --enable-metrics (the scrape degrades to "off" when absent).
+	for _, b := range backends {
+		engineMetrics.add(b.Name, b.URL+"/metrics")
+	}
+	go engineMetrics.loop()
 
 	if totalWeight > 0 {
 		maxBudget := 0
@@ -588,11 +1095,16 @@ func main() {
 	// webui build tag web.Handler() is a 404 stub, so this is a no-op there.
 	mux.Handle("/", web.Handler())
 
-	// Refresh per-backend + fleet rates for the live metrics feed.
+	// Refresh per-backend + fleet rates for the live metrics feed. The
+	// actual elapsed time between ticks feeds the window decay, so a
+	// scheduler stall does not under-count the interval.
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
+		last := time.Now()
 		for range ticker.C {
-			metrics.computeRates(time.Now())
+			now := time.Now()
+			metrics.computeRates(now.Sub(last))
+			last = now
 		}
 	}()
 
@@ -791,27 +1303,29 @@ func estimateRetryAfter(name string) int {
 // ─── /metrics/stream (SSE) + /metrics/burst ───────────────────────────────
 
 type backendFrame struct {
-	Name            string  `json:"name"`
-	URL             string  `json:"url"`
-	Tier            int     `json:"tier"`
-	InFlight        int32   `json:"inFlight"`
-	MaxConcurrent   int32   `json:"maxConcurrent"`
-	Waiting         int32   `json:"waiting"`
-	MaxQueueDepth   int32   `json:"maxQueueDepth"`
-	PrefillInFlight int32   `json:"prefillInFlight"`
-	PrefillWaiting  int32   `json:"prefillWaiting"`
-	PrefillMax      int32   `json:"prefillMax"`
-	AvgDurationS    float64 `json:"avgDurationS"`
-	EWMAms          float64 `json:"ewmaMs"`
-	TTFTms          float64 `json:"ttftMs"`
-	TTFTSampleCount int     `json:"ttftSampleCount"`
-	ReqRate         float64 `json:"reqRate"`
-	BytesRate       float64 `json:"bytesRate"`
-	TokEstRate      float64 `json:"tokEstRate"`
-	ReqTotal        int64   `json:"reqTotal"`
-	BytesInTotal    int64   `json:"bytesInTotal"`
-	BytesOutTotal   int64   `json:"bytesOutTotal"`
-	TokEstTotal     int64   `json:"tokEstTotal"`
+	Name            string     `json:"name"`
+	URL             string     `json:"url"`
+	Tier            int        `json:"tier"`
+	InFlight        int32      `json:"inFlight"`
+	MaxConcurrent   int32      `json:"maxConcurrent"`
+	Waiting         int32      `json:"waiting"`
+	MaxQueueDepth   int32      `json:"maxQueueDepth"`
+	PrefillInFlight int32      `json:"prefillInFlight"`
+	PrefillWaiting  int32      `json:"prefillWaiting"`
+	PrefillMax      int32      `json:"prefillMax"`
+	AvgDurationS    float64    `json:"avgDurationS"`
+	EWMAms          float64    `json:"ewmaMs"`
+	TTFTms          float64    `json:"ttftMs"`
+	TTFTSampleCount int        `json:"ttftSampleCount"`
+	TTFTMsNow       float64    `json:"ttftMsNow"`
+	ReqRate         float64    `json:"reqRate"`
+	BytesRate       float64    `json:"bytesRate"`
+	TokEstRate      float64    `json:"tokEstRate"`
+	ReqTotal        int64      `json:"reqTotal"`
+	BytesInTotal    int64      `json:"bytesInTotal"`
+	BytesOutTotal   int64      `json:"bytesOutTotal"`
+	TokEstTotal     int64      `json:"tokEstTotal"`
+	Engine          engineView `json:"engine"`
 }
 
 type gpuFrame struct {
@@ -864,6 +1378,7 @@ func buildMetricsFrame() metricsFrame {
 		bf.EWMAms = bf.AvgDurationS * 1000
 		bf.TTFTms = ms.TTFTMs
 		bf.TTFTSampleCount = ms.TTFTSampleCount
+		bf.TTFTMsNow = ms.TTFTMsNow
 		bf.ReqRate = ms.ReqRate
 		bf.BytesRate = ms.BytesRate
 		bf.TokEstRate = ms.TokEstRate
@@ -871,6 +1386,7 @@ func buildMetricsFrame() metricsFrame {
 		bf.BytesInTotal = ms.BytesInTotal
 		bf.BytesOutTotal = ms.BytesOutTotal
 		bf.TokEstTotal = ms.TokEstTotal
+		bf.Engine = engineMetrics.view(b.Name)
 		f.Backends = append(f.Backends, bf)
 
 		f.Totals.InFlight += bf.InFlight
@@ -1263,6 +1779,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// matching the existing per-backend EWMA semantics. Rejections record
 	// queue-wait time from reqStart instead.
 	start := time.Now()
+	// The request is now admitted: its demand enters the live-rate window.
+	// Completion retires it again via the accepted flag.
+	reqContext.accepted = true
+	metrics.recordAccept(target.Name, int64(len(body)), newTokens)
 	proxy := proxies[target.Name]
 	// Wrap ResponseWriter to capture status + detect completion for duration
 	// tracking. Also releases the prefill slot on first response byte.
@@ -1270,6 +1790,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		ResponseWriter: w,
 		status:         200,
 		onFirstByte:    prefillRelease,
+		backend:        target.Name,
+		ttftStart:      start,
 		reqStart:       start,
 		stream:         parsed.Stream,
 		newTokensEst:   newTokens,
@@ -1303,10 +1825,13 @@ type respTracker struct {
 	bytesOut    int64
 
 	// Request context for metrics recording (set at construction).
+	backend      string
+	ttftStart    time.Time // admission time; TTFT is first-byte minus this
 	reqStart     time.Time
 	stream       bool
 	newTokensEst int
 	bytesIn      int64
+	ttftSent     bool // first-byte TTFT already recorded (once)
 	recorded     bool // finish guard: exactly one sample per request
 }
 
@@ -1336,6 +1861,12 @@ func (t *respTracker) Write(b []byte) (int, error) {
 		if !t.bodyByte {
 			t.firstByteAt = time.Now()
 			t.bodyByte = true
+			// TTFT is live truth: record it now, while the request is still
+			// decoding, so the dashboard sees it the moment it happens.
+			if t.stream && !t.ttftSent {
+				t.ttftSent = true
+				metrics.recordFirstByte(t.backend, float64(t.firstByteAt.Sub(t.ttftStart)/time.Millisecond))
+			}
 		}
 		t.bytesOut += int64(n)
 	}

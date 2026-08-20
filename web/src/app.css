@@ -800,6 +800,14 @@ textarea {
   box-shadow: inset 0 1px 0 rgba(228, 194, 100, 0.35);
 }
 /* the fold control is distinct from a signal option — it is the exit */
+/* the window group is visually set apart from the signal group — a thin
+   crease between the two decisions */
+.switcher-row .win-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 4px;
+  background: rgba(166, 166, 160, 0.25);
+}
 .switcher-row .esc {
   margin-left: auto;
   font-size: 10px;
@@ -831,6 +839,7 @@ textarea {
   padding: 5px 0;
   border-bottom: 1px solid rgba(166, 166, 160, 0.12);
   font-size: 11px;
+  min-width: 0;
 }
 .readout .row:last-child {
   border-bottom: none;
@@ -840,10 +849,18 @@ textarea {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   font-size: 10px;
+  flex: none;
 }
 .readout .v {
   color: var(--tx-1);
   font-variant-numeric: tabular-nums;
+  /* long values (backend names, "1843 ms · 62 samples", URLs) truncate
+     inside the column instead of running off the fold */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
 }
 .readout .v .est {
   color: var(--gold);
@@ -866,7 +883,7 @@ textarea {
 .fleet-strip {
   margin-top: 16px;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 1px;
   background: var(--recess);
   border: 1px solid rgba(166, 166, 160, 0.3);
@@ -915,6 +932,12 @@ textarea {
   transform: skewX(var(--skew));
   transform-origin: 50% 0;
   padding: 0 8px;
+}
+.fleet-foot-real {
+  color: var(--tx-2);
+}
+.fleet-foot-sep {
+  margin: 0 6px;
 }
 
 /* ── request tape: the continuous transcript ──────────────────────────── */

@@ -210,7 +210,7 @@ bearing mitigation for the skew.
 
 The sheet is a CSS grid: `repeat(auto-fit, minmax(252px, 1fr))` with a **1px gap**, and the
 grid background is the recess color — so the seams between cells are 1px recessed creases,
-not borders. The fleet strip is `repeat(3, 1fr)`, same 1px seam treatment. An opened fold
+not borders. The fleet strip is `repeat(4, 1fr)`, same 1px seam treatment. An opened fold
 cell spans the full row (`grid-column: 1 / -1`). The opened cell is a two-column grid
 (trace column + 272px readout column, 18px gap), collapsing to one column under 720px.
 
@@ -302,7 +302,8 @@ place.
   Top row: crease-ID (11px 500, 0.08em, lit mountain, with tier chip — 9px, steel-blue
   border; King chips are gold-bordered) and the value (30px 500 tabular, lit mountain,
   `n/max` with the max at 13px muted). Below: the trace canvas (30s window — the
-  operator's glance unit; the opened fold keeps the full 60s). Bottom: a hidden 10px
+  operator's glance unit; the opened fold carries a window selector: 30s / 60s / 5m,
+  default 60s, over a 5-minute history buffer). Bottom: a hidden 10px
   detail row (inf/wait/prefill/ewma/ttft) that fades in on hover and `:focus-visible`.
 - **Hover:** translateY(-3px), face-hi background, deep shadow + gold inset top, and the
   2px gold lit-edge sweep across the fold (0.3s opacity, 0.8s travel).
@@ -310,11 +311,17 @@ place.
   halo, value in red. State inverts, it doesn't just tint.
 - **Opened:** spans the row, 308px, face-hi, gold ring + 48px halo. The face is replaced
   by a full-height trace (1px `rgba(166,166,160,0.18)` border) with a signal switcher
-  above (the `fold ✕` control sits at the row's right end, visually distinct from a
-  signal option — it is the exit), a legend below (gold swatch for the primary signal,
+  above (router signals, then a crease-separated engine group — engine run / engine
+  prefill / engine decode — shown only when the backend's /metrics feed is live, then a
+  window selector 30s/60s/5m; the `fold ✕` control sits at the row's right end,
+  visually distinct from a signal option — it is the exit), a legend below (gold swatch
+  for the primary signal,
   steel-blue for the ttft overlay), and a 272px readout column that leads with a
   **live-state block** (in-flight / queue / prefill / ewma / ttft), then a **rates**
-  group, then a **lifetime totals** group collapsed behind a `＋` toggle — progressive
+  group, then an **engine** group (scraped from the backend's own /metrics: running /
+  queue / kv cache / real prefill tok/s / real decode tok/s / engine ttft — when the
+  endpoint is absent it says so in one line instead of faking data), then a
+  **lifetime totals** group collapsed behind a `＋` toggle — progressive
   disclosure, so a 15-second glance sees state first. The `fold ✕` button is at the
   switcher row's right end, visually distinct from a signal option. `role="button"`,
   `tabindex=0`, Enter/Space toggle, Esc refolds and returns focus to the cell (a
@@ -329,9 +336,11 @@ place.
 **Character:** a scrolling oscilloscope, not a stepped chart — the gold line glides
 because a requestAnimationFrame loop advances the virtual clock at frame rate while data
 arrives on 500ms server ticks, with samples plotted at their *server* timestamps (skew-
-free). The newest 30% of the visible window is drawn lit (gold #e4c264, 1.6px, α 0.95);
-older segments fade into the crease (dim gold #8a6f35, 1px, α falling to 0.1) — the
-afterglow persistence. The newest sample is a glowing head (2px dot + 5px α 0.35 halo).
+free). Every visible segment is one uniform color — gold (#c9a24b, α 0.9, 1.5px) for the
+primary signal, steel blue (#8fa9c0, α 0.45) for the ttft overlay — so a signal stays
+recognizable across the full history; there is no afterglow fade, which made long lines
+unreadable and made each segment's position in the window guessable by brightness alone.
+The newest sample is a lit head (2px dot + 5px α 0.35 halo in the signal's lit shade).
 The y-axis eases toward its target scale (lerp 0.15/frame) instead of snapping. A limit,
 when set, is a dashed 4/4 steel-blue line with a 9px mono value label. A secondary
 overlay (ttft) draws in steel blue at 0.55× alpha on the same time axis. Canvas is
@@ -341,12 +350,15 @@ are read from the table, not the scope.
 the trace redraws only on data ticks, anchored to the newest sample.
 
 ### Fleet Strip Cell
-**Character:** three wide aggregate cells (req/s, ttft, tok-est/s) on the same skewed
-grid as the sheet — 118px min-height, `10px 16px 8px` padding, face #0e0e10, 1px seams.
-Label 10px uppercase muted (with gold `est` on the token cell), value 26px tabular lit
-mountain, and a live trace under each (gold for req/s and tok-est, steel-blue for ttft).
-A 10px muted footnote below the strip (also skewed) states what is estimated and what is
-measured.
+**Character:** four wide aggregate cells (req/s, ttft, tok-est/s, decode-tok/s · real) on
+the same skewed grid as the sheet — 118px min-height, `10px 16px 8px` padding, face
+#0e0e10, 1px seams. Label 10px uppercase muted (with gold `est` on the prefill cell,
+steel-blue `real` on the decode cell), value 26px tabular lit mountain, and a live
+trace under each (gold for req/s and tok-est, steel-blue for ttft and the real decode
+throughput). The est/real pairing is the honest data boundary made visible: the body-
+based prefill estimate and the engine's measured token throughput sit side by side. The
+10px muted footnote below the strip (also skewed) states what is estimated, what is
+scraped from the engines' /metrics, and what is measured.
 
 ### Request Tape Entry
 **Character:** the continuous transcript — the last requests as one horizontally scrolling

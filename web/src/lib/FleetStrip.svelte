@@ -3,9 +3,12 @@
   import { fmtRate, fmtMs } from "./fmt.js";
   import type { FleetSample, Frame } from "./metrics.js";
 
-  // Fleet strip: three wide cells — aggregate req/s, ttft, tok-est/s — each
-  // a live trace. The token one is labeled "est" (estimated new-prefill
-  // tokens; never presented as measured decode throughput).
+  // Fleet strip: four wide aggregates — req/s (measured), ttft (router
+  // first byte), tok-est/s (estimated prefill, gold, est-labeled), and real
+  // decode tok/s (scraped from the engines' own /metrics, valley, "real"
+  // — never presented as estimated). The est/real pairing is the honest
+  // data boundary made visible: the operator sees both the router's body-
+  // based estimate and the engine's actual token throughput side by side.
 
   interface Props {
     frame: Frame | null;
@@ -24,6 +27,25 @@
           const vals = frame.backends.filter((b) => b.ttftSampleCount > 0);
           if (!vals.length) return null;
           return vals.reduce((a, b) => a + b.ttftMs, 0) / vals.length;
+        })()
+      : null,
+  );
+  // REAL decode throughput: sum across backends whose engine feed is live.
+  const decodeNow = $derived(
+    frame
+      ? (() => {
+          const eng = frame.backends.filter((b) => b.engine?.status === "ok");
+          if (!eng.length) return null;
+          return eng.reduce((a, b) => a + (b.engine?.decodeTokS ?? 0), 0);
+        })()
+      : null,
+  );
+  const prefillNow = $derived(
+    frame
+      ? (() => {
+          const eng = frame.backends.filter((b) => b.engine?.status === "ok");
+          if (!eng.length) return null;
+          return eng.reduce((a, b) => a + (b.engine?.prefillTokS ?? 0), 0);
         })()
       : null,
   );
@@ -56,16 +78,32 @@
         <Trace samples={hist.map((s) => s.tokEstRate)} ts={ts} color="gold" />
       </div>
     </div>
+    <div class="fleet-cell unskew">
+      <span class="label">decode tok/s · <span class="real">real</span></span>
+      <span class="value">{decodeNow === null ? '—' : fmtRate(decodeNow, 0)}</span>
+      <div class="trace-wrap">
+        <Trace samples={hist.map((s) => s.engDecode)} ts={ts} color="valley" />
+      </div>
+    </div>
   </div>
   <div class="fleet-foot">
+    {#if prefillNow !== null}
+      <span class="fleet-foot-real">
+        real (scraped from engine /metrics): prefill {fmtRate(prefillNow, 0)} tok/s · decode {fmtRate(decodeNow, 0)} tok/s
+      </span>
+      <span class="fleet-foot-sep">·</span>
+    {/if}
     token figures are estimated new-prefill tokens (request-body based, ~4
-    bytes/token) — not measured decode throughput. requests/s and bytes/s are
-    measured.
+    bytes/token) — <b>real</b> tok/s is the engine's own measured throughput.
+    requests/s and bytes/s are measured.
   </div>
 </div>
 
 <style>
   .est {
     color: var(--gold);
+  }
+  .real {
+    color: var(--vl-lit);
   }
 </style>

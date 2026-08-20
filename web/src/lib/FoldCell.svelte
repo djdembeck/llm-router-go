@@ -10,7 +10,15 @@
   // readout + signal switcher). In packet mode (folded / mobile) it
   // renders a thin live line; tapping it expands an inline readout.
 
-  type SignalKey = "inflight" | "reqRate" | "ttft" | "tokEst" | "bytesRate";
+  type SignalKey =
+    | "inflight"
+    | "reqRate"
+    | "ttft"
+    | "tokEst"
+    | "bytesRate"
+    | "engRunning"
+    | "engPrefill"
+    | "engDecode";
 
   interface Props {
     backend: BackendMetrics;
@@ -31,6 +39,10 @@
   onDestroy(() => registerEl(b.name, null));
 
   let signal: SignalKey = $state("inflight");
+  // history window for the opened trace: 30s glance, 60s default, 5min
+  // history. The buffer holds 5 minutes; the collapsed face keeps its own
+  // 30s glance window.
+  let win: number = $state(60);
 
   const ts = $derived(hist.map((s) => s.t));
 
@@ -45,19 +57,38 @@
     return hist.map((s) =>
       k === "inflight" ? s.inFlight :
       k === "ttft" ? s.ttftMs :
-      k === "tokEst" ? s.tokEstRate : s[k],
+      k === "tokEst" ? s.tokEstRate :
+      k === "engRunning" ? s.engRunning :
+      k === "engPrefill" ? s.engPrefill :
+      k === "engDecode" ? s.engDecode : s[k],
     );
   }
 
   const pickTtft = $derived(hist.map((s) => s.ttftMs));
 
-  const signals: [SignalKey, string][] = [
+  const routerSignals: [SignalKey, string][] = [
     ["inflight", "in-flight"],
     ["reqRate", "req/s"],
     ["ttft", "ttft"],
     ["tokEst", "tok-est"],
     ["bytesRate", "bytes/s"],
   ];
+  const engSignals: [SignalKey, string][] = [
+    ["engRunning", "engine run"],
+    ["engPrefill", "eng prefill"],
+    ["engDecode", "eng decode"],
+  ];
+  const engOk = $derived(b.engine?.status === "ok");
+  const signalLabel = $derived(
+    signal === "inflight" ? "in-flight" :
+    signal === "reqRate" ? "req/s (router)" :
+    signal === "ttft" ? "ttft (router, streaming)" :
+    signal === "tokEst" ? "tok-est/s (est. prefill)" :
+    signal === "bytesRate" ? "bytes/s (measured)" :
+    signal === "engRunning" ? "engine running (from /metrics)" :
+    signal === "engPrefill" ? "engine prefill tok/s (real)" :
+    "engine decode tok/s (real)",
+  );
 
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Enter" || e.key === " ") {
@@ -117,7 +148,7 @@
       <div class="open-trace-wrap">
         <div class="switcher-row unskew">
           <div class="switcher" role="group" aria-label="signal">
-            {#each signals as [k, label] (k)}
+            {#each routerSignals as [k, label] (k)}
               <button
                 class:on={signal === k}
                 aria-pressed={signal === k}
@@ -126,6 +157,36 @@
                   signal = k;
                 }}>
                 {label}{k === 'tokEst' ? ' est' : ''}
+              </button>
+            {/each}
+          </div>
+          {#if engOk}
+            <span class="win-sep" aria-hidden="true"></span>
+            <div class="switcher" role="group" aria-label="engine signal (scraped from the backend's /metrics)">
+              {#each engSignals as [k, label] (k)}
+                <button
+                  class:on={signal === k}
+                  aria-pressed={signal === k}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    signal = k;
+                  }}>
+                  {label}
+                </button>
+              {/each}
+            </div>
+          {/if}
+          <span class="win-sep" aria-hidden="true"></span>
+          <div class="switcher win" role="group" aria-label="history window">
+            {#each [30, 60, 300] as w (w)}
+              <button
+                class:on={win === w}
+                aria-pressed={win === w}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  win = w;
+                }}>
+                {w === 300 ? '5m' : w + 's'}
               </button>
             {/each}
           </div>
@@ -146,10 +207,11 @@
             limit={signal === 'inflight' && b.maxConcurrent > 0 ? b.maxConcurrent : null}
             color="gold"
             overlay={signal === 'ttft' ? null : pickTtft}
+            windowS={win}
           />
         </div>
         <div class="open-legend unskew">
-          <span><i class="swatch gold"></i>{signal === 'inflight' ? 'in-flight' : signal === 'reqRate' ? 'req/s' : signal === 'ttft' ? 'ttft (streaming)' : signal === 'tokEst' ? 'tok-est/s (est. prefill)' : 'bytes/s (measured)'}</span>
+          <span><i class="swatch gold"></i>{signalLabel}</span>
           {#if signal !== 'ttft'}
             <span><i class="swatch valley"></i>ttft overlay</span>
           {/if}
@@ -174,7 +236,7 @@
         </div>
         <div class="row"><span class="k">ewma dur</span><span class="v">{fmtMs(b.ewmaMs)}</span></div>
         <div class="row"><span class="k">ttft</span>
-          <span class="v">{b.ttftSampleCount === 0 ? '— (no streaming samples)' : fmtMs(b.ttftMs) + ` · ${b.ttftSampleCount} samples`}</span>
+          <span class="v">{b.ttftSampleCount === 0 ? '— (no streaming samples)' : fmtMs(b.ttftMsNow > 0 ? b.ttftMsNow : b.ttftMs) + ` · ewma ${fmtMs(b.ttftMs)} · ${b.ttftSampleCount} samples`}</span>
         </div>
 
         <div class="group-head"><span class="gk">rates</span></div>
@@ -183,6 +245,29 @@
         <div class="row"><span class="k">tok rate</span>
           <span class="v">{fmtRate(b.tokEstRate, 0)} <span class="est">est</span></span>
         </div>
+
+        <div class="group-head"><span class="gk">engine (scraped /metrics)</span></div>
+        {#if engOk}
+          <div class="row"><span class="k">running</span><span class="v">{Math.round(b.engine.running)}</span></div>
+          <div class="row"><span class="k">queue</span><span class="v">{Math.round(b.engine.waiting)}</span></div>
+          <div class="row"><span class="k">kv cache</span>
+            <span class="v">{b.engine.kvPct > 0 ? b.engine.kvPct.toFixed(0) + '%' : '—'}</span>
+          </div>
+          <div class="row"><span class="k">prefill</span>
+            <span class="v">{fmtRate(b.engine.prefillTokS, 0)} tok/s (real)</span>
+          </div>
+          <div class="row"><span class="k">decode</span>
+            <span class="v">{fmtRate(b.engine.decodeTokS, 0)} tok/s (real)</span>
+          </div>
+          <div class="row"><span class="k">ttft</span>
+            <span class="v">{b.engine.ttftMs > 0 ? fmtMs(b.engine.ttftMs) : '—'} (engine)</span>
+          </div>
+        {:else}
+          <div class="row"><span class="k">status</span>
+            <span class="v">off — {b.engine?.status === 'err' ? 'endpoint unreachable' : `no /metrics${(b.url || '').toLowerCase().startsWith('http') ? ' (engine flag?)' : ''}`}</span>
+          </div>
+          <div class="row"><span class="k">source</span><span class="v">{b.url}/metrics</span></div>
+        {/if}
 
         <button
           class="totals-toggle"
