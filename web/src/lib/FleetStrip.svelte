@@ -49,6 +49,32 @@
         })()
       : null,
   );
+  // REAL prefix-cache hit rate: mean across backends whose engine feed is
+  // live — the engines' own gauges, not the router's estimate.
+  const hitNow = $derived(
+    frame
+      ? (() => {
+          const eng = frame.backends
+            .map((b) => (b.engine?.status === "ok" ? (b.engine?.hitRate ?? 0) * 100 : null))
+            .filter((v): v is number => v !== null && v > 0);
+          if (!eng.length) return null;
+          return eng.reduce((a, v) => a + v, 0) / eng.length;
+        })()
+      : null,
+  );
+  // Hottest KV pool across backends: where the next retraction/eviction
+  // lands first.
+  const kvNow = $derived(
+    frame
+      ? (() => {
+          const vals = frame.backends
+            .map((b) => (b.engine?.status === "ok" ? b.engine?.kvPct ?? 0 : 0))
+            .filter((v) => v > 0);
+          if (!vals.length) return null;
+          return Math.max(...vals);
+        })()
+      : null,
+  );
 </script>
 
 <div>
@@ -61,7 +87,7 @@
       </div>
     </div>
     <div class="fleet-cell unskew">
-      <span class="label">ttft · streaming first byte</span>
+      <span class="label">ttft · first byte</span>
       <span class="value">{fmtMs(ttftNow)}</span>
       <div class="trace-wrap">
         <Trace
@@ -83,6 +109,32 @@
       <span class="value">{decodeNow === null ? '—' : fmtRate(decodeNow, 0)}</span>
       <div class="trace-wrap">
         <Trace samples={hist.map((s) => s.engDecode)} ts={ts} color="valley" />
+      </div>
+    </div>
+    <div class="fleet-cell unskew">
+      <span class="label">cache hit · <span class="real">real</span></span>
+      <span class="value">{hitNow === null ? '—' : Math.round(hitNow) + '%'}</span>
+      <div class="trace-wrap">
+        <Trace
+          samples={hist.map((s) => s.hitRate)}
+          ts={ts}
+          color="valley"
+          yMax={100}
+        />
+      </div>
+    </div>
+    <div class="fleet-cell unskew">
+      <span class="label">kv peak · <span class="real">real</span></span>
+      <span class="value" class:hot={kvNow !== null && kvNow >= 90}>
+        {kvNow === null ? '—' : Math.round(kvNow) + '%'}
+      </span>
+      <div class="trace-wrap">
+        <Trace
+          samples={hist.map((s) => s.kvPeak)}
+          ts={ts}
+          color="valley"
+          yMax={100}
+        />
       </div>
     </div>
   </div>

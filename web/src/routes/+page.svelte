@@ -3,6 +3,7 @@
   import Masthead from "$lib/Masthead.svelte";
   import Sheet from "$lib/Sheet.svelte";
   import FleetStrip from "$lib/FleetStrip.svelte";
+  import CacheSheet from "$lib/CacheSheet.svelte";
   import RequestTape from "$lib/RequestTape.svelte";
   import SessionSheet from "$lib/SessionSheet.svelte";
   import { clock } from "$lib/fmt.js";
@@ -46,6 +47,9 @@
   let cascadeTimer: ReturnType<typeof setTimeout> | null = null;
   let nowTimer: ReturnType<typeof setInterval> | null = null;
   let sessTimer: ReturnType<typeof setInterval> | null = null;
+  // one-time affordance hint: the page's best features (open a fold, hover
+  // detail, esc) are discoverable only by accident — say it once, then stop
+  let hint = $state(false);
 
   // per-cell element registry: closing a fold returns focus to its cell
   // (otherwise a keyboard user is stranded at <body>)
@@ -53,6 +57,16 @@
   function registerEl(name: string, el: HTMLElement | null) {
     if (el) cellEls.set(name, el);
     else cellEls.delete(name);
+  }
+
+  function dismissHint() {
+    if (!hint) return;
+    hint = false;
+    try {
+      sessionStorage.setItem("lr-go-hint-seen", "1");
+    } catch {
+      /* private mode: the hint simply returns next visit */
+    }
   }
 
   // narrow viewport: the sheet folds to the packet row (mobile/compact)
@@ -97,6 +111,11 @@
     mq = window.matchMedia("(max-width: 720px)");
     narrow = mq.matches;
     if (narrow) deployed = false; // narrow is folded — keep the state honest
+    try {
+      hint = !sessionStorage.getItem("lr-go-hint-seen");
+    } catch {
+      /* private mode */
+    }
     const onMq = (e: MediaQueryListEvent) => {
       const wasNarrow = narrow;
       narrow = e.matches;
@@ -147,6 +166,7 @@
   }
 
   function toggleCell(name: string) {
+    dismissHint();
     if (open === name) closeFold();
     else open = name;
   }
@@ -174,7 +194,7 @@
     onToggle={toggleDeploy}
   />
 
-  <div class="feed-row unskew">
+  <div class="feed-row">
     <span class="health" data-h={mstate.health}>
       <i></i>{mstate.health}
     </span>
@@ -192,7 +212,7 @@
   </div>
 
   {#if showStale}
-    <div class="stale-banner unskew" role="alert">
+    <div class="stale-banner" role="alert">
       <span>
         stale — last data {clock(mstate.lastFrameAt ?? 0)} · {staleAgo} ago
       </span>
@@ -217,7 +237,16 @@
       registerEl={registerEl}
     />
 
+    {#if hint}
+      <div class="sheet-hint">
+        <span>click a fold to open · hover for detail · esc refolds</span>
+        <button class="hint-x" aria-label="dismiss hint" onclick={dismissHint}>✕</button>
+      </div>
+    {/if}
+
     <FleetStrip frame={frame} hist={mstate.fleetHist} />
+
+    <CacheSheet frame={frame} hist={mstate.hist} />
 
     <RequestTape
       requests={mstate.requests}
@@ -255,6 +284,8 @@
           <th scope="col">engine running</th>
           <th scope="col">engine queue</th>
           <th scope="col">kv cache %</th>
+          <th scope="col">mamba pool %</th>
+          <th scope="col">cache hit %</th>
           <th scope="col">engine prefill tok/s (real)</th>
           <th scope="col">engine decode tok/s (real)</th>
           <th scope="col">engine ttft</th>
@@ -280,11 +311,13 @@
               <td>{Math.round(b.engine.running)}</td>
               <td>{Math.round(b.engine.waiting)}</td>
               <td>{b.engine.kvPct > 0 ? `${b.engine.kvPct.toFixed(0)}%` : "—"}</td>
+              <td>{b.engine.mambaPct !== null ? `${b.engine.mambaPct.toFixed(0)}%` : "—"}</td>
+              <td>{b.engine.hitRate > 0 ? `${(b.engine.hitRate * 100).toFixed(0)}%` : "—"}</td>
               <td>{Math.round(b.engine.prefillTokS)}/s</td>
               <td>{Math.round(b.engine.decodeTokS)}/s</td>
               <td>{b.engine.ttftMs > 0 ? `${Math.round(b.engine.ttftMs)}ms` : "—"}</td>
             {:else}
-              <td colspan="6">no engine feed ({b.engine?.status === "err" ? "unreachable" : "endpoint off"})</td>
+              <td colspan="8">no engine feed ({b.engine?.status === "err" ? "unreachable" : "endpoint off"})</td>
             {/if}
           </tr>
         {/each}

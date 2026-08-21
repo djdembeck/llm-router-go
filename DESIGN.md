@@ -65,6 +65,13 @@ components:
     backgroundColor: "{colors.cell-face}"
     height: "118px"
     padding: "10px 16px 8px"
+  pool-bar:
+    backgroundColor: "rgba(143, 169, 192, 0.1)"
+    height: "8px"
+    fill: "{colors.valley-dim}"
+  pool-bar-hot:
+    fill: "{colors.signal-red}"
+    hotThreshold: "90"
   gpu-seg:
     backgroundColor: "rgba(143, 169, 192, 0.1)"
     width: "12px"
@@ -201,7 +208,7 @@ horizontal weight has broken the sheet's calm.
 
 A centered 1320px frame (`max-width: 1320px`, padding 18px 28px 48px; 14px inline / 36px
 bottom under 720px). The page is a single vertical stack: masthead → feed row → the sheet
-→ fleet strip → request tape → sessions sheet → (sr-only flat table). The sheet
+→ fleet strip → engine pools band → request tape → sessions sheet → (sr-only flat table). The sheet
 and every block below it
 live on a shared isometric skew: `skewX(-6deg)` with `transform-origin: 50% 0`, applied to
 the *containers* (`.sheet`, `.fleet-strip`, `.tape-wrap`, `.hollow`, `.fleet-foot`) — never
@@ -303,21 +310,30 @@ place.
   Top row: crease-ID (11px 500, 0.08em, lit mountain, with tier chip — 9px, steel-blue
   border; King chips are gold-bordered) and the value (30px 500 tabular, lit mountain,
   `n/max` with the max at 13px muted). Below: the trace canvas (30s window — the
-  operator's glance unit; the opened fold carries a window selector: 30s / 60s / 5m,
-  default 60s, over a 5-minute history buffer). Bottom: a hidden 10px
-  detail row (inf/wait/prefill/ewma/ttft) that fades in on hover and `:focus-visible`.
+  operator's glance unit). Bottom: a hidden 10px
+  detail row (inf/wait/prefill/kv/ewma/ttft) that fades in on hover and `:focus-visible`.
+  When the cell is saturated a persistent 10px story line carries the state's meaning:
+  `queue full · 429 + retry-after — bounded, clears on its own` (the 429 in valley blue —
+  the inversion is status, not alarm).
 - **Hover:** translateY(-3px), face-hi background, deep shadow + gold inset top, and the
   2px gold lit-edge sweep across the fold (0.3s opacity, 0.8s travel).
 - **Saturated:** `.is-saturated` — red top crease (`rgba(192,86,75,0.85)`), red inset +
-  halo, value in red. State inverts, it doesn't just tint.
-- **Opened:** spans the row, 308px, face-hi, gold ring + 48px halo. The face is replaced
+  halo, value in red. State inverts, it doesn't just tint. And the inversion carries its
+  story: a persistent 10px line — `queue full · 429 + retry-after — bounded, clears on
+  its own` (the `429` in valley blue, never red) — so the loudest state on screen says
+  *policy working*, not *broken*.
+- **Opened:** spans the row, **fixed at 308px** (`min-height = max-height`: the readout
+  scrolls inside, the sheet never grows, and the opened scope keeps the same glance
+  scale as the collapsed cell), face-hi, gold ring + 48px halo. The face is replaced
   by a full-height trace (1px `rgba(166,166,160,0.18)` border) with a signal switcher
-  above (router signals, then a crease-separated engine group — engine run / engine
-  prefill / engine decode — shown only when the backend's /metrics feed is live, then a
-  window selector 30s/60s/5m; the `fold ✕` control sits at the row's right end,
-  visually distinct from a signal option — it is the exit), a legend below (gold swatch
-  for the primary signal,
-  steel-blue for the ttft overlay), and a 272px readout column that leads with a
+  above in two crease-labeled groups — `router` (in-flight / req/s / ttft / tok-est /
+  bytes/s) and `engine · /metrics` (engine run / engine prefill / engine decode, shown
+  only when the backend's /metrics feed is live) — and the `fold ✕` control at the
+  row's right end, visually distinct from a signal option. The history window (30s /
+  60s / 5m, default 60s, over a 5-minute buffer) is a small 3-button group at the
+  legend row's right end — it scales what you are looking at, so it sits with the
+  legend, not with the signal choice. A legend below (gold swatch for the primary
+  signal, steel-blue for the ttft overlay), and a 272px readout column that leads with a
   **live-state block** (in-flight / queue / prefill / ewma / ttft), then a **rates**
   group, then the **engine** block (scraped from the backend's own /metrics — the
   grouped engine readout: requests · real / tokens · real / cache / latency · real /
@@ -379,15 +395,43 @@ are read from the table, not the scope.
 the trace redraws only on data ticks, anchored to the newest sample.
 
 ### Fleet Strip Cell
-**Character:** four wide aggregate cells (req/s, ttft, tok-est/s, decode-tok/s · real) on
+**Character:** six wide aggregate cells (req/s, ttft, tok-est/s, decode-tok/s · real,
+cache hit · real, kv peak · real) on
 the same skewed grid as the sheet — 118px min-height, `10px 16px 8px` padding, face
 #0e0e10, 1px seams. Label 10px uppercase muted (with gold `est` on the prefill cell,
-steel-blue `real` on the decode cell), value 26px tabular lit mountain, and a live
-trace under each (gold for req/s and tok-est, steel-blue for ttft and the real decode
-throughput). The est/real pairing is the honest data boundary made visible: the body-
+steel-blue `real` on the four measured cells), value 26px tabular lit mountain (the kv
+peak value goes red at ≥90 — the engine's own saturation threshold), and a live
+trace under each (gold for req/s and tok-est; steel-blue for ttft, the real decode
+throughput, cache hit, and kv peak — engine truth is never gold). The est/real pairing is the honest data boundary made visible: the body-
 based prefill estimate and the engine's measured token throughput sit side by side. The
 10px muted footnote below the strip (also skewed) states what is estimated, what is
 scraped from the engines' /metrics, and what is measured.
+
+### Engine Pools Band (kv / mamba cache)
+**Character:** the backends' memory pools, read from the engines' own /metrics — the
+engine's side of the est/real boundary. A skewed band on the sheet (same 1px seams,
+zero radius) between the fleet strip and the request tape: `ENGINE POOLS · KV / MAMBA
+CACHE` head with a `real` tag and the source note ("scraped from the backends' own
+/metrics — the engines' gauges, not the router's estimate"), then one cell per backend
+(min 252px auto-fit grid, 118px min-height, `10px 16px 8px` padding) carrying:
+- **crease-gauge pool bars** — kv, and for SGLang the full / SWA / mamba split: an 8px
+  valley-blue bar (`scaleX` fill, 0.5s eased; no rest glow) in a 44px-label / bar /
+  64px-value grid, tabular % on the right. Mamba carries `used/cap` in the value column
+  when the engine reports token counts, % otherwise. Family differences are silent — a
+  vLLM backend simply has no swa/mamba rows.
+- **foot row** — `hit 32%` (prefix-cache hit rate), `pool 1.2M/2.5M`, `evict 102.2k`
+  (only when nonzero), 10px muted keys / tx-2 tabular values.
+- **a 5-minute kv-pressure scope** under the foot — the same `Trace` scope as the fleet
+  strip, steel blue, `yMax=100`, so the bar's current value has a history.
+**Color law:** this band is valley-only. The engines' gauges are *measured* engine
+truth, not the router's live signal — gold never appears in this band (gold is the
+router's line, not the engine's). Red is the saturation reservation: a pool at ≥90%
+goes red (bar fill + value) — the engine's own retraction/eviction threshold, the same
+red the saturated fold-cell uses. Absence is never red: an engine without /metrics
+shows one muted `no /metrics` line in its cell; with no engines reporting at all, the
+band keeps its shell and one muted `no engine pools` line.
+**Accessibility:** every bar is `role="img"` with a `kv cache N% used` aria-label —
+the gauges are real state, not decoration.
 
 ### Request Tape Entry
 **Character:** the continuous transcript — the last requests as one horizontally scrolling
@@ -467,7 +511,7 @@ honest-data boundary and ships with the sheet.
 ## Do's and Don'ts
 
 ### Do:
-- **Do** use gold (#c9a24b / #e4c264) only for live signals and active states: the trace line and its lit head, hover/selection edges, the packet control, focus outlines, and the `est` label.
+- **Do** use gold (#c9a24b / #e4c264) only for live signals and active states: the trace line and its lit head, hover/selection edges, the packet control, focus outlines, and the `est` label. Engine-scraped data (engine pools band, `real` fleet cells) is valley blue — the engines' gauges are not the router's live signal.
 - **Do** counter-skew (`.unskew`) every text element inside a skewed container, so numbers stay horizontal, crisp, and selectable.
 - **Do** keep a gold `est` label on every token figure (fleet strip, readout, tape column) — token numbers are estimated prefill, not decode.
 - **Do** use tabular numerals on every value that ticks.

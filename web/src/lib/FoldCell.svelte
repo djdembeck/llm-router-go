@@ -181,16 +181,24 @@
         <span>inf <b>{b.inFlight}/{b.maxConcurrent > 0 ? b.maxConcurrent : '∞'}</b></span>
         <span>wait <b class:red={b.waiting > 0}>{b.waiting}</b></span>
         <span>prefill <b>{b.prefillInFlight}/{b.prefillMax || '∞'}</b></span>
+        <span>kv <b>{b.engine?.status === 'ok' && b.engine.kvPct > 0 ? b.engine.kvPct.toFixed(0) + '%' : '—'}</b></span>
         <span>ewma <b>{fmtMs(b.ewmaMs)}</b></span>
         <span>ttft <b>{b.ttftSampleCount === 0 ? '—' : fmtMs(b.ttftMs)}</b></span>
       </div>
+      {#if sat}
+        <!-- the red inversion is status, not alarm: say what it means -->
+        <div class="sat-note unskew">
+          queue full · <span class="st-throttle">429</span> + retry-after — bounded, clears on its own
+        </div>
+      {/if}
     </div>
   {:else}
     <!-- opened fold: full-height trace + overlay + readout column -->
     <div class="cell-open">
       <div class="open-trace-wrap">
         <div class="switcher-row unskew">
-          <div class="switcher" role="group" aria-label="signal">
+          <span class="sig-head">router</span>
+          <div class="switcher" role="group" aria-label="router signal">
             {#each routerSignals as [k, label] (k)}
               <button
                 class:on={signal === k}
@@ -204,7 +212,7 @@
             {/each}
           </div>
           {#if engOk}
-            <span class="win-sep" aria-hidden="true"></span>
+            <span class="sig-head">engine · /metrics</span>
             <div class="switcher" role="group" aria-label="engine signal (scraped from the backend's /metrics)">
               {#each engSignals as [k, label] (k)}
                 <button
@@ -219,20 +227,6 @@
               {/each}
             </div>
           {/if}
-          <span class="win-sep" aria-hidden="true"></span>
-          <div class="switcher win" role="group" aria-label="history window">
-            {#each [30, 60, 300] as w (w)}
-              <button
-                class:on={win === w}
-                aria-pressed={win === w}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  win = w;
-                }}>
-                {w === 300 ? '5m' : w + 's'}
-              </button>
-            {/each}
-          </div>
           <button
             class="esc"
             aria-label="fold this cell"
@@ -259,6 +253,22 @@
             <span><i class="swatch valley"></i>ttft overlay</span>
           {/if}
           <span>{b.inFlight} in-flight · {b.waiting} waiting</span>
+          <span class="legend-right">
+            <span class="win-head">window</span>
+            <div class="switcher win" role="group" aria-label="history window">
+              {#each [30, 60, 300] as w (w)}
+                <button
+                  class:on={win === w}
+                  aria-pressed={win === w}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    win = w;
+                  }}>
+                  {w === 300 ? '5m' : w + 's'}
+                </button>
+              {/each}
+            </div>
+          </span>
         </div>
       </div>
 

@@ -57,7 +57,7 @@
     <div class="mast-sub">fleet sheet · gpu-aware inference routing</div>
   </div>
 
-  <div class="mast-mid unskew">
+  <div class="mast-mid">
     <div class="status-line">
       <span>in-flight <b>{totalInFlight}</b></span>
       <span class="stat-dot">·</span>
@@ -66,7 +66,10 @@
       <span>tier0 <b>{tier0Inflight}{tier0Limit ? ` / ${tier0Limit}` : ''}</b></span>
       <span class="stat-dot">·</span>
       {#if gpu && gpu.budget > 0}
-        <span class="gpu-gauge" aria-label="gpu budget {gpu.used} of {gpu.budget} used">
+        <span
+          class="gpu-gauge"
+          aria-label="gpu budget {gpu.used} of {gpu.budget} used"
+          title="gpu budget — {gpu.used} of {gpu.budget} slots held by tier-0 (king) inflight{gpu.waiting > 0 ? ` · +${gpu.waiting} waiting for a slot` : ''}">
           {#each segs as s (s.i)}
             <i class="gpu-seg {s.on ? 'on' : ''} {s.wait ? 'wait' : ''}"></i>
           {/each}
@@ -79,7 +82,7 @@
     </div>
   </div>
 
-  <div class="mast-right unskew">
+  <div class="mast-right">
     <time class="clock">{clock(now)}</time>
     {#if showPacketControl}
       <button

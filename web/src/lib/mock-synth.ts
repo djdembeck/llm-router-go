@@ -421,7 +421,7 @@ function stepEngineV2(i: number, spike: boolean): void {
       (e.kvCapTok * e.fullPct) / 100 + (Math.random() * 2 - 1) * 40000,
     );
     e.kvUsedTok = clamp(e.kvUsedTok, 0, e.kvCapTok);
-    e.mambaUsedTok = Math.round(walk(e.mambaUsedTok, 6, 20, 480));
+    e.mambaUsedTok = Math.round((e.mambaCapTok * e.mambaPct) / 100);
     e.retracted = Math.round(walk(e.retracted, spike ? 1.2 : 0.6, 0, 3));
     e.retractedTokS =
       e.retracted === 0 ? 0 : Math.round(walk(e.retractedTokS, 120, 400, 6000));

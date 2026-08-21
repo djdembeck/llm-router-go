@@ -338,6 +338,12 @@ export interface Sample {
   engPrefill: number | null;
   /** engine's REAL decode tokens/s (null = no engine feed) */
   engDecode: number | null;
+  /** engine KV/token-pool pressure, 0..100 (null = no engine feed / not reported) */
+  kvPct: number | null;
+  /** sglang mamba pool pressure, 0..100 (null = not reported) */
+  mambaPct: number | null;
+  /** engine prefix-cache hit rate, 0..100 (null = no engine feed / not reported) */
+  hitRate: number | null;
 }
 
 /** Fleet-wide aggregate sample (for the fleet strip). */
@@ -351,6 +357,10 @@ export interface FleetSample {
   /** sum of REAL engine token rates (null when no engine feed) */
   engPrefill: number | null;
   engDecode: number | null;
+  /** mean prefix-cache hit rate across reporting backends, 0..100 */
+  hitRate: number | null;
+  /** hottest KV pool pressure across backends, 0..100 */
+  kvPeak: number | null;
 }
 
 export function emptySample(t: number): Sample {
@@ -366,6 +376,9 @@ export function emptySample(t: number): Sample {
     engRunning: null,
     engPrefill: null,
     engDecode: null,
+    kvPct: null,
+    mambaPct: null,
+    hitRate: null,
   };
 }
 
@@ -474,6 +487,9 @@ export function createMetricsStore(on: (s: StoreState) => void) {
         engRunning: engOk ? b.engine.running : null,
         engPrefill: engOk ? b.engine.prefillTokS : null,
         engDecode: engOk ? b.engine.decodeTokS : null,
+        kvPct: engOk && b.engine.kvPct > 0 ? b.engine.kvPct : null,
+        mambaPct: engOk ? b.engine.mambaPct ?? null : null,
+        hitRate: engOk && b.engine.hitRate > 0 ? b.engine.hitRate * 100 : null,
       });
       if (h.length > HISTORY_LEN) h.splice(0, h.length - HISTORY_LEN);
     }
@@ -487,6 +503,12 @@ export function createMetricsStore(on: (s: StoreState) => void) {
       .filter((b) => b.ttftSampleCount > 0)
       .map((b) => b.ttftMs);
     const eng = f.backends.filter((b) => b.engine?.status === "ok");
+    const hitVals = eng
+      .map((b) => (b.engine?.hitRate ?? 0) * 100)
+      .filter((v) => v > 0);
+    const kvVals = eng
+      .map((b) => b.engine?.kvPct ?? 0)
+      .filter((v) => v > 0);
     fleetHist.push({
       t: f.t,
       inFlight: f.totals?.inFlight ?? 0,
@@ -503,6 +525,14 @@ export function createMetricsStore(on: (s: StoreState) => void) {
       engDecode:
         origin === "sse" && eng.length
           ? eng.reduce((a, b) => a + (b.engine?.decodeTokS ?? 0), 0)
+          : null,
+      hitRate:
+        origin === "sse" && hitVals.length
+          ? hitVals.reduce((a, v) => a + v, 0) / hitVals.length
+          : null,
+      kvPeak:
+        origin === "sse" && kvVals.length
+          ? Math.max(...kvVals)
           : null,
     });
     if (fleetHist.length > HISTORY_LEN)
