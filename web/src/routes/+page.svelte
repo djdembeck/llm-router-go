@@ -4,8 +4,14 @@
   import Sheet from "$lib/Sheet.svelte";
   import FleetStrip from "$lib/FleetStrip.svelte";
   import RequestTape from "$lib/RequestTape.svelte";
+  import SessionSheet from "$lib/SessionSheet.svelte";
   import { clock } from "$lib/fmt.js";
-  import { createMetricsStore, type StoreState } from "$lib/metrics.js";
+  import {
+    createMetricsStore,
+    fetchSessions,
+    type StoreState,
+    type SessionsFeed,
+  } from "$lib/metrics.js";
 
   // The sheet: masthead → tessellated fold-cells → fleet strip → request
   // tape. Deploy state drives every cell's fold angle (one pull, whole
@@ -33,11 +39,13 @@
   let open: string | null = $state(null);
   let narrow = $state(false);
   let now = $state(Date.now());
+  let sessFeed: SessionsFeed | null = $state(null);
 
   let mq: MediaQueryList | null = null;
   let store: { destroy: () => void } | null = null;
   let cascadeTimer: ReturnType<typeof setTimeout> | null = null;
   let nowTimer: ReturnType<typeof setInterval> | null = null;
+  let sessTimer: ReturnType<typeof setInterval> | null = null;
 
   // per-cell element registry: closing a fold returns focus to its cell
   // (otherwise a keyboard user is stranded at <body>)
@@ -108,10 +116,19 @@
     };
     window.addEventListener("keydown", onKey);
     nowTimer = setInterval(() => (now = Date.now()), 1000);
+    // the session feed (live stack + conversations) is a separate poll —
+    // the SSE frame stream does not carry it
+    const pollSessions = async () => {
+      const f = await fetchSessions();
+      if (f) sessFeed = f;
+    };
+    void pollSessions();
+    sessTimer = setInterval(() => void pollSessions(), 1000);
     return () => {
       mq?.removeEventListener("change", onMq);
       window.removeEventListener("keydown", onKey);
       if (nowTimer) clearInterval(nowTimer);
+      if (sessTimer) clearInterval(sessTimer);
       if (cascadeTimer) clearTimeout(cascadeTimer);
       store?.destroy();
     };
@@ -209,6 +226,8 @@
       live={mstate.live}
       stale={mstate.stale}
     />
+
+    <SessionSheet feed={sessFeed} />
   {:else}
     <div class="hollow" role="status">
       <span>{hollowMsg}</span>

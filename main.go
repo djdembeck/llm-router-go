@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -263,6 +265,7 @@ type requestSample struct {
 	DurMs        float64
 	TTFTMs       float64
 	NewTokensEst int
+	CtxTok       int // est context tokens (all messages/prompt, ~4 bytes/token)
 	BytesIn      int64
 	BytesOut     int64
 	accepted     bool
@@ -488,16 +491,94 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 //   - SGLang realtime_tokens_total{mode}: prefill = prefill_compute +
 //     prefill_cache, decode = decode.
 
-// engineView is the per-backend engine truth published in the frame.
+// engineView is the per-backend engine truth published in the frame (v2).
 // Zero + status != "ok" means "no data" — the client renders "—".
+//
+// Field classes:
+//   - gauges — live right now (running, waiting, kvPct, hitRate, pool *Pct,
+//     *Tok pool stats, retracted, sloCap, ctxLen, *MemGB, hicache)
+//   - interval means — histogram means over the last scrape interval
+//     (ttftMs, itlMs, e2eMs, queueMs, prefillMs, decodeMs, perTokMs,
+//     meanPromptTok, meanGenTok, ttftStreamMs, ttftNonStreamMs)
+//   - rates — counter deltas over the last scrape interval (prefillTokS,
+//     prefillCacheTokS, decodeTokS, retractedTokS)
+//   - lifetime — engine-side counters since its own start (reqDoneTotal,
+//     preemptedTotal, abortedTotal, finReasons, *Total token/req counters)
+//
+// On a non-ok scrape ("off"/"err") the interval fields and rates are zeroed
+// (stale deltas would be misleading), while gauges and lifetime fields keep
+// their last known values: they are lifetime facts, and an engine that
+// restarts legitimately re-zeros them on its next ok scrape.
+//
+// Optional fields are pointers; nil → JSON null when the engine/feature
+// doesn't report them (e.g. Mamba pool gauges absent on a non-hybrid model).
 type engineView struct {
-	Running     float64 `json:"running"`
-	Waiting     float64 `json:"waiting"`
-	KVPct       float64 `json:"kvPct"` // 0..100
-	PrefillTokS float64 `json:"prefillTokS"`
-	DecodeTokS  float64 `json:"decodeTokS"`
-	TTFTms      float64 `json:"ttftMs"`
-	Status      string  `json:"status"` // "ok" | "off" | "err"
+	Status string `json:"status"` // "ok" | "off" | "err"
+	Engine string `json:"engine"` // "vllm" | "sglang" | ""
+
+	// Core gauges + rates (frozen field names).
+	Running          float64 `json:"running"`
+	Waiting          float64 `json:"waiting"`
+	KVPct            float64 `json:"kvPct"` // 0..100
+	HitRate          float64 `json:"hitRate"`
+	PrefillTokS      float64 `json:"prefillTokS"`
+	PrefillCacheTokS float64 `json:"prefillCacheTokS"`
+	DecodeTokS       float64 `json:"decodeTokS"`
+	TTFTms           float64 `json:"ttftMs"`
+
+	// Interval means (ms).
+	ITLms   float64 `json:"itlMs"`
+	E2EMs   float64 `json:"e2eMs"`
+	QueueMs float64 `json:"queueMs"`
+
+	// Optional per-stage means (ms) — pointer; nil when the family/feature
+	// doesn't report them (prefill/decode/perTok are vLLM-only, the TTFT
+	// stream split is SGLang-only).
+	PrefillMs *float64 `json:"prefillMs"`
+	DecodeMs  *float64 `json:"decodeMs"`
+	PerTokMs  *float64 `json:"perTokMs"`
+
+	// Per-request means, last interval (tokens, NOT ms).
+	MeanPromptTok float64 `json:"meanPromptTok"`
+	MeanGenTok    float64 `json:"meanGenTok"`
+
+	// Optional gauges (nil = not reported).
+	WaitCap            *float64 `json:"waitCap"`
+	WaitDefer          *float64 `json:"waitDefer"`
+	Retracted          *float64 `json:"retracted"`
+	RetractedTokS      *float64 `json:"retractedTokS"`
+	FullPct            *float64 `json:"fullPct"`
+	SwaPct             *float64 `json:"swaPct"`
+	MambaPct           *float64 `json:"mambaPct"`
+	KVUsedTok          *float64 `json:"kvUsedTok"`
+	KVCapTok           *float64 `json:"kvCapTok"`
+	KVFreeTok          *float64 `json:"kvFreeTok"`
+	KVEvictTok         *float64 `json:"kvEvictTok"`
+	MambaUsedTok       *float64 `json:"mambaUsedTok"`
+	MambaCapTok        *float64 `json:"mambaCapTok"`
+	HiCacheHostUsedTok *float64 `json:"hicacheHostUsedTok"`
+	HiCacheHostCapTok  *float64 `json:"hicacheHostCapTok"`
+	TTFTStreamMs       *float64 `json:"ttftStreamMs"`
+	TTFTNonStreamMs    *float64 `json:"ttftNonStreamMs"`
+	KVMemGB            *float64 `json:"kvMemGB"`
+	WeightMemGB        *float64 `json:"weightMemGB"`
+	SLOCap             *float64 `json:"sloCap"`
+	CTXLen             *float64 `json:"ctxLen"`
+
+	// Optional lifetime counters (nil = not reported).
+	PreemptedTotal     *int64 `json:"preemptedTotal"`
+	AbortedTotal       *int64 `json:"abortedTotal"`
+	StreamDoneTotal    *int64 `json:"streamDoneTotal"`
+	NonStreamDoneTotal *int64 `json:"nonStreamDoneTotal"`
+	PromptTokTotal     *int64 `json:"promptTokTotal"`
+	GenTokTotal        *int64 `json:"genTokTotal"`
+	HitQueriesTotal    *int64 `json:"hitQueriesTotal"`
+	HitHitsTotal       *int64 `json:"hitHitsTotal"`
+	MmQueriesTotal     *int64 `json:"mmQueriesTotal"`
+	MmHitsTotal        *int64 `json:"mmHitsTotal"`
+
+	ReqDoneTotal int64            `json:"reqDoneTotal"`
+	FinReasons   map[string]int64 `json:"finReasons"` // vllm only; nil for sglang
 }
 
 // promSample is one line of a Prometheus text exposition.
@@ -507,11 +588,14 @@ type promSample struct {
 	value  float64
 }
 
-// histState tracks the previous _sum/_count pair for one histogram.
+// histState tracks the previous _sum/_count pair for one histogram state
+// key. A key is the base name (blended over all label sets) or
+// base+"|"+is_streaming for SGLang's is_streaming-split histograms.
 type histState struct {
-	sum, cnt         float64
-	t                time.Time
-	lastSum, lastCnt float64
+	sum, cnt float64
+	t        time.Time
+	lastSum  float64
+	have     bool // a delta mean has been computed (else lastSum is stale/zero)
 }
 
 type engineScrape struct {
@@ -521,7 +605,7 @@ type engineScrape struct {
 	// counters: rate-differenced between scrapes, keyed by name+labels.
 	counters map[string]float64
 	cTimes   map[string]time.Time
-	// histograms: only the ones the dashboard reads.
+	// histograms: the ones the dashboard reads, keyed per label set.
 	hists   map[string]*histState
 	lastT   time.Time
 	seenEng map[string]bool
@@ -548,11 +632,8 @@ func (e *engineRegistry) add(name, url string) {
 		status:   "off",
 		counters: map[string]float64{},
 		cTimes:   map[string]time.Time{},
-		hists: map[string]*histState{
-			"vllm:time_to_first_token_seconds":   {},
-			"sglang:time_to_first_token_seconds": {},
-		},
-		seenEng: map[string]bool{},
+		hists:    map[string]*histState{},
+		seenEng:  map[string]bool{},
 	}
 }
 
@@ -618,23 +699,97 @@ func (e *engineRegistry) scrape(name string) {
 		} else {
 			s.status = "err"
 		}
-		s.view.PrefillTokS = 0
-		s.view.DecodeTokS = 0
+		// Rates and interval means are deltas over a scrape interval; a stale
+		// delta would mislead, so zero them. Gauges and lifetime counters keep
+		// their last known values (lifetime facts).
+		s.zeroIntervalFields()
 		return
 	}
 	s.scrapeBody(parsePromText(body))
 }
 
+// zeroIntervalFields blanks the rate + interval-mean fields (stale deltas
+// would mislead) while keeping gauges and lifetime fields at their last
+// known values. status is read from the scrape state.
+func (s *engineScrape) zeroIntervalFields() {
+	v := s.view
+	v.Status = s.status
+	v.PrefillTokS = 0
+	v.PrefillCacheTokS = 0
+	v.DecodeTokS = 0
+	v.TTFTms = 0
+	v.ITLms = 0
+	v.E2EMs = 0
+	v.QueueMs = 0
+	v.MeanPromptTok = 0
+	v.MeanGenTok = 0
+	if v.TTFTStreamMs != nil {
+		*v.TTFTStreamMs = 0
+	}
+	if v.TTFTNonStreamMs != nil {
+		*v.TTFTNonStreamMs = 0
+	}
+	if v.RetractedTokS != nil {
+		*v.RetractedTokS = 0
+	}
+	if v.PrefillMs != nil {
+		*v.PrefillMs = 0
+	}
+	if v.DecodeMs != nil {
+		*v.DecodeMs = 0
+	}
+	if v.PerTokMs != nil {
+		*v.PerTokMs = 0
+	}
+	s.view = v
+}
+
 // scrapeBody folds one parsed exposition into the scrape state.
+//
+// Lifetime counters (the *_Total fields, finReasons, reqDoneTotal) are
+// assigned the LATEST raw value each ok scrape, with no reset logic: when an
+// engine restarts its own lifetime counters re-zero, so the latest value is
+// always the honest engine-side lifetime. Rates (prefillTokS, ...) and
+// interval histogram means come from counterRate/updateHist deltas and are
+// re-baselined on reset.
 func (s *engineScrape) scrapeBody(samples []promSample) {
 	now := time.Now()
-	view := s.view
+	if len(samples) == 0 {
+		s.status = "err"
+		s.zeroIntervalFields()
+		return
+	}
 
 	// First pass: family detection + gauge accumulation.
 	vllm, sg := false, false
 	var running, waiting float64
 	var kvMax float64
 	haveKV := false
+	var waitCap, waitDefer float64
+	haveCap, haveDefer := false, false
+	var hitRate, sloCap, ctxLen float64
+	var haveSLO, haveCTX bool
+	var kvMemGB, weightMemGB float64
+	var haveKVMem, haveWMem bool
+	var retracted float64
+	haveRetr := false
+	var haveRetrTok bool
+	var fullPct, swaPct, mambaPct float64
+	var haveFull, haveSWA, haveMamba bool
+	var kvUsed, kvCap, kvFree, kvEvict float64
+	var haveKVUsed, haveKVCap, haveKVFree, haveKVEvict bool
+	var mambaUsed, mambaAvail, mambaEvict float64
+	var haveMambaUsed, haveMambaAvail, haveMambaEvict bool
+	var hicacheUsed, hicacheCap float64
+	var haveHCUsed, haveHCCap bool
+	var preempted, aborted, streamDone, nonStreamDone int64
+	var havePreempted, haveAborted, haveStreamDone, haveNonStreamDone bool
+	var promptTok, genTok int64
+	var havePromptTok, haveGenTok bool
+	var hitQ, hitH, mmQ, mmH int64
+	var haveHitQ, haveHitH, haveMMQ, haveMMH bool
+	finReasons := map[string]int64{}
+	haveFin := false
 	for _, sm := range samples {
 		switch {
 		case strings.HasPrefix(sm.name, "vllm:"):
@@ -644,11 +799,38 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 				running += sm.value // sum across data-parallel engines
 			case "vllm:num_requests_waiting":
 				waiting += sm.value
+			case "vllm:num_requests_waiting_by_reason":
+				switch sm.labels["reason"] {
+				case "capacity":
+					waitCap += sm.value
+					haveCap = true
+				case "deferred":
+					waitDefer += sm.value
+					haveDefer = true
+				}
 			case "vllm:kv_cache_usage_perc":
 				if sm.value > kvMax {
 					kvMax = sm.value
 					haveKV = true
 				}
+			case "vllm:num_preemptions_total":
+				preempted += int64(sm.value)
+				havePreempted = true
+			case "vllm:request_success_total":
+				finReasons[sm.labels["finished_reason"]] += int64(sm.value)
+				haveFin = true
+			case "vllm:prefix_cache_queries_total":
+				hitQ += int64(sm.value)
+				haveHitQ = true
+			case "vllm:prefix_cache_hits_total":
+				hitH += int64(sm.value)
+				haveHitH = true
+			case "vllm:mm_cache_queries_total":
+				mmQ += int64(sm.value)
+				haveMMQ = true
+			case "vllm:mm_cache_hits_total":
+				mmH += int64(sm.value)
+				haveMMH = true
 			}
 		case strings.HasPrefix(sm.name, "sglang:"):
 			sg = true
@@ -666,23 +848,143 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 					kvMax = sm.value
 					haveKV = true
 				}
+			case "sglang:full_token_usage":
+				if sm.value > fullPct {
+					fullPct = sm.value
+					haveFull = true
+				}
+			case "sglang:swa_token_usage":
+				if sm.value > swaPct {
+					swaPct = sm.value
+					haveSWA = true
+				}
+			case "sglang:mamba_usage":
+				if sm.value > mambaPct {
+					mambaPct = sm.value
+					haveMamba = true
+				}
+			case "sglang:num_used_tokens":
+				if sm.value > kvUsed {
+					kvUsed = sm.value
+					haveKVUsed = true
+				}
+			case "sglang:max_total_num_tokens":
+				if sm.value > kvCap {
+					kvCap = sm.value
+					haveKVCap = true
+				}
+			case "sglang:kv_available_tokens":
+				if sm.value > kvFree {
+					kvFree = sm.value
+					haveKVFree = true
+				}
+			case "sglang:kv_evictable_tokens":
+				if sm.value > kvEvict {
+					kvEvict = sm.value
+					haveKVEvict = true
+				}
+			case "sglang:mamba_used_tokens":
+				if sm.value > mambaUsed {
+					mambaUsed = sm.value
+					haveMambaUsed = true
+				}
+			case "sglang:mamba_available_tokens":
+				if sm.value > mambaAvail {
+					mambaAvail = sm.value
+					haveMambaAvail = true
+				}
+			case "sglang:mamba_evictable_tokens":
+				if sm.value > mambaEvict {
+					mambaEvict = sm.value
+					haveMambaEvict = true
+				}
+			case "sglang:num_retracted_reqs":
+				if sm.value > retracted {
+					retracted = sm.value
+					haveRetr = true
+				}
+			case "sglang:cache_hit_rate":
+				if sm.value > hitRate {
+					hitRate = sm.value
+				}
+			case "sglang:max_running_requests_under_SLO":
+				if sm.value > sloCap {
+					sloCap = sm.value
+					haveSLO = true
+				}
+			case "sglang:context_len":
+				if sm.value > ctxLen {
+					ctxLen = sm.value
+					haveCTX = true
+				}
+			case "sglang:kv_cache_memory_usage_gb":
+				if sm.value > kvMemGB {
+					kvMemGB = sm.value
+					haveKVMem = true
+				}
+			case "sglang:weight_memory_usage_gb":
+				if sm.value > weightMemGB {
+					weightMemGB = sm.value
+					haveWMem = true
+				}
+			case "sglang:hicache_host_used_tokens":
+				if sm.value > hicacheUsed {
+					hicacheUsed = sm.value
+					haveHCUsed = true
+				}
+			case "sglang:hicache_host_total_tokens":
+				if sm.value > hicacheCap {
+					hicacheCap = sm.value
+					haveHCCap = true
+				}
+			case "sglang:num_aborted_requests_total":
+				aborted += int64(sm.value)
+				haveAborted = true
+			case "sglang:num_retracted_input_tokens_total":
+				haveRetrTok = true
+			case "sglang:num_requests_total":
+				if sm.labels["is_streaming"] == "true" {
+					streamDone += int64(sm.value)
+					haveStreamDone = true
+				} else {
+					nonStreamDone += int64(sm.value)
+					haveNonStreamDone = true
+				}
+			case "sglang:prompt_tokens_total":
+				promptTok += int64(sm.value)
+				havePromptTok = true
+			case "sglang:generation_tokens_total":
+				genTok += int64(sm.value)
+				haveGenTok = true
 			}
 		}
 	}
-	if len(samples) == 0 {
-		s.status = "err"
-		return
-	}
+
 	s.status = "ok"
-	s.view = engineView{Status: "ok"}
-	view = s.view
+	// A new ok scrape publishes a fresh view: optional fields default to nil
+	// (null) and are re-filled only when the engine reports them.
+	view := engineView{Status: "ok"}
+
+	// Family: the most recently detected engine wins the view; both stay
+	// recorded in seenEng for the Engine label.
+	eng := ""
 	if vllm {
 		s.seenEng["vllm"] = true
-		view.Running = running
-		view.Waiting = waiting
+		eng = "vllm"
 	}
-	if sg && !vllm {
+	if sg {
 		s.seenEng["sglang"] = true
+		eng = "sglang"
+	}
+	if eng == "" {
+		if s.seenEng["vllm"] {
+			eng = "vllm"
+		} else if s.seenEng["sglang"] {
+			eng = "sglang"
+		}
+	}
+	view.Engine = eng
+	if vllm || sg {
 		view.Running = running
 		view.Waiting = waiting
 	}
@@ -690,22 +992,217 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 		view.KVPct = kvMax * 100
 	}
 
-	// Second pass: token counters + TTFT histograms, in the detected family.
-	view.PrefillTokS = 0
-	view.DecodeTokS = 0
-	view.TTFTms = 0
+	// Optional gauges: pointer only when the metric appeared this scrape.
 	if vllm {
+		if haveCap {
+			v := waitCap
+			view.WaitCap = &v
+		}
+		if haveDefer {
+			v := waitDefer
+			view.WaitDefer = &v
+		}
+		if havePreempted {
+			view.PreemptedTotal = &preempted
+		}
+		if haveFin {
+			view.FinReasons = finReasons
+		}
+		if haveHitQ {
+			view.HitQueriesTotal = &hitQ
+		}
+		if haveHitH {
+			view.HitHitsTotal = &hitH
+		}
+		if hitQ != 0 {
+			view.HitRate = float64(hitH) / float64(hitQ)
+		}
+		if haveMMQ {
+			view.MmQueriesTotal = &mmQ
+		}
+		if haveMMH {
+			view.MmHitsTotal = &mmH
+		}
+	} else if sg {
+		if haveRetr {
+			v := retracted
+			view.Retracted = &v
+		}
+		if haveFull {
+			v := fullPct * 100
+			view.FullPct = &v
+		}
+		if haveSWA {
+			v := swaPct * 100
+			view.SwaPct = &v
+		}
+		if haveMamba {
+			v := mambaPct * 100
+			view.MambaPct = &v
+		}
+		if haveKVUsed {
+			v := kvUsed
+			view.KVUsedTok = &v
+		}
+		if haveKVCap {
+			v := kvCap
+			view.KVCapTok = &v
+		}
+		if haveKVFree {
+			v := kvFree
+			view.KVFreeTok = &v
+		}
+		if haveKVEvict {
+			v := kvEvict
+			view.KVEvictTok = &v
+		}
+		if haveMambaUsed || haveMambaAvail || haveMambaEvict {
+			u := mambaUsed
+			c := mambaUsed + mambaAvail + mambaEvict
+			view.MambaUsedTok = &u
+			view.MambaCapTok = &c
+		}
+		if haveHCUsed {
+			v := hicacheUsed
+			view.HiCacheHostUsedTok = &v
+		}
+		if haveHCCap {
+			v := hicacheCap
+			view.HiCacheHostCapTok = &v
+		}
+		if hitRate > 0 {
+			if hitRate > 1 { // some builds report a percent, not a fraction
+				hitRate /= 100
+			}
+			view.HitRate = hitRate
+		}
+		if haveSLO {
+			v := sloCap
+			view.SLOCap = &v
+		}
+		if haveCTX {
+			v := ctxLen
+			view.CTXLen = &v
+		}
+		if haveKVMem {
+			v := kvMemGB
+			view.KVMemGB = &v
+		}
+		if haveWMem {
+			v := weightMemGB
+			view.WeightMemGB = &v
+		}
+		if haveAborted {
+			view.AbortedTotal = &aborted
+		}
+		if haveStreamDone {
+			view.StreamDoneTotal = &streamDone
+		}
+		if haveNonStreamDone {
+			view.NonStreamDoneTotal = &nonStreamDone
+		}
+		if havePromptTok {
+			view.PromptTokTotal = &promptTok
+		}
+		if haveGenTok {
+			view.GenTokTotal = &genTok
+		}
+		if haveStreamDone || haveNonStreamDone {
+			view.ReqDoneTotal = streamDone + nonStreamDone
+		}
+	}
+
+	// Second pass: token counter rates + histograms, in the detected family.
+	if vllm {
+		var promptTokS float64
+		var bySrc bool
 		for _, sm := range samples {
 			switch sm.name {
+			case "vllm:prompt_tokens_by_source_total":
+				switch sm.labels["source"] {
+				case "local_compute":
+					view.PrefillTokS += s.counterRate(sm, now)
+					bySrc = true
+				case "local_cache_hit":
+					view.PrefillCacheTokS += s.counterRate(sm, now)
+					bySrc = true
+				}
 			case "vllm:prompt_tokens_total":
-				view.PrefillTokS += s.counterRate(sm, now)
+				promptTokS += s.counterRate(sm, now)
 			case "vllm:generation_tokens_total":
 				view.DecodeTokS += s.counterRate(sm, now)
 			}
 		}
-		s.updateHist("vllm:time_to_first_token_seconds", samples, now)
+		// Compute-only prefill comes from by_source when present; older vLLM
+		// builds without it fall back to prompt_tokens_total (0 cache rate).
+		if !bySrc {
+			view.PrefillTokS = promptTokS
+		}
+		// Lifetime token totals: latest raw counter values (sum across engines).
+		var vllmPrompt, vllmGen int64
+		haveP, haveG := false, false
+		for _, sm := range samples {
+			switch sm.name {
+			case "vllm:prompt_tokens_total":
+				vllmPrompt += int64(sm.value)
+				haveP = true
+			case "vllm:generation_tokens_total":
+				vllmGen += int64(sm.value)
+				haveG = true
+			}
+		}
+		if haveP {
+			view.PromptTokTotal = &vllmPrompt
+		}
+		if haveG {
+			view.GenTokTotal = &vllmGen
+		}
+		for _, base := range []string{
+			"vllm:time_to_first_token_seconds",
+			"vllm:inter_token_latency_seconds",
+			"vllm:e2e_request_latency_seconds",
+			"vllm:request_queue_time_seconds",
+			"vllm:request_prefill_time_seconds",
+			"vllm:request_decode_time_seconds",
+			"vllm:request_time_per_output_token_seconds",
+		} {
+			s.updateHist(base, samples, now)
+		}
+		s.updateHist("vllm:request_prompt_tokens", samples, now)
+		s.updateHist("vllm:request_generation_tokens", samples, now)
 		view.TTFTms = s.histMean("vllm:time_to_first_token_seconds")
+		view.ITLms = s.histMean("vllm:inter_token_latency_seconds")
+		view.E2EMs = s.histMean("vllm:e2e_request_latency_seconds")
+		view.QueueMs = s.histMean("vllm:request_queue_time_seconds")
+		if v := s.histMean("vllm:request_prefill_time_seconds"); s.histHas("vllm:request_prefill_time_seconds") {
+			view.PrefillMs = &v
+		}
+		if v := s.histMean("vllm:request_decode_time_seconds"); s.histHas("vllm:request_decode_time_seconds") {
+			view.DecodeMs = &v
+		}
+		if v := s.histMean("vllm:request_time_per_output_token_seconds"); s.histHas("vllm:request_time_per_output_token_seconds") {
+			view.PerTokMs = &v
+		}
+		// Token histograms: the mean is already in tokens, no ms conversion.
+		view.MeanPromptTok = s.histMeanRaw("vllm:request_prompt_tokens")
+		view.MeanGenTok = s.histMeanRaw("vllm:request_generation_tokens")
+		if haveFin {
+			for _, n := range finReasons {
+				view.ReqDoneTotal += n
+			}
+		}
 	} else if sg {
+		var retrTokS float64
+		// The retracted-token rate is published only once every rank's
+		// counter has baselined; until then each scrape is baseline-only,
+		// so a mid-scale-up rank never yields a bogus single-rank rate.
+		retrTokReady := haveRetrTok
+		for _, x := range samples {
+			if x.name == "sglang:num_retracted_input_tokens_total" && !s.counterSeen(x) {
+				retrTokReady = false
+				break
+			}
+		}
 		for _, sm := range samples {
 			if sm.name == "sglang:realtime_tokens_total" {
 				switch sm.labels["mode"] {
@@ -715,12 +1212,66 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 					view.DecodeTokS += s.counterRate(sm, now)
 				}
 			}
+			if sm.name == "sglang:num_retracted_input_tokens_total" {
+				if retrTokReady {
+					retrTokS += s.counterRate(sm, now)
+				} else {
+					s.counterRate(sm, now) // baseline only
+				}
+			}
 		}
-		s.updateHist("sglang:time_to_first_token_seconds", samples, now)
+		for _, base := range []string{
+			"sglang:time_to_first_token_seconds",
+			"sglang:inter_token_latency_seconds",
+			"sglang:e2e_request_latency_seconds",
+			"sglang:queue_time_seconds",
+		} {
+			s.updateHist(base, samples, now)
+		}
+		s.updateHist("sglang:prompt_tokens_histogram", samples, now)
+		s.updateHist("sglang:generation_tokens_histogram", samples, now)
 		view.TTFTms = s.histMean("sglang:time_to_first_token_seconds")
+		view.ITLms = s.histMean("sglang:inter_token_latency_seconds")
+		view.E2EMs = s.histMean("sglang:e2e_request_latency_seconds")
+		view.QueueMs = s.histMean("sglang:queue_time_seconds")
+		if v := s.histMean("sglang:time_to_first_token_seconds|true"); s.histHas("sglang:time_to_first_token_seconds|true") {
+			view.TTFTStreamMs = &v
+		}
+		if v := s.histMean("sglang:time_to_first_token_seconds|false"); s.histHas("sglang:time_to_first_token_seconds|false") {
+			view.TTFTNonStreamMs = &v
+		}
+		view.MeanPromptTok = s.histMeanRaw("sglang:prompt_tokens_histogram")
+		view.MeanGenTok = s.histMeanRaw("sglang:generation_tokens_histogram")
+		if haveRetrTok {
+			v := retrTokS
+			view.RetractedTokS = &v
+		}
 	}
 	s.lastT = now
 	s.view = view
+}
+
+// histMean is the mean (ms) over the most recent scrape interval for a
+// state key; 0 until a delta has been computed.
+func (s *engineScrape) histMean(key string) float64 {
+	if h, ok := s.hists[key]; ok && h.have {
+		return h.lastSum * 1000
+	}
+	return 0
+}
+
+// histMeanRaw is like histMean but the histogram is already in the unit we
+// display (e.g. token counts — no seconds→ms conversion).
+func (s *engineScrape) histMeanRaw(key string) float64 {
+	if h, ok := s.hists[key]; ok && h.have {
+		return h.lastSum
+	}
+	return 0
+}
+
+func (s *engineScrape) histHas(key string) bool {
+	h, ok := s.hists[key]
+	return ok && h.have
 }
 
 // counterKey distinguishes samples of the same metric with different
@@ -761,45 +1312,66 @@ func (s *engineScrape) counterRate(sm promSample, now time.Time) float64 {
 	return rate
 }
 
-// updateHist folds _sum/_count samples into one histogram's state. All
-// label sets of the same histogram are summed, so multi-engine/multi-rank
-// instances produce one true mean.
+// updateHist folds _sum/_count samples into histogram state. Each sample
+// feeds the blended base key (all label sets summed — the existing behavior
+// for the core mean) and, when it carries an is_streaming label, also its
+// per-label key base+"|"+value, so SGLang's split histograms get per-label
+// means on top of the blended one.
 func (s *engineScrape) updateHist(base string, samples []promSample, now time.Time) {
-	h, ok := s.hists[base]
-	if !ok {
-		return
-	}
-	var sum, cnt float64
+	type acc struct{ sum, cnt float64 }
+	keyed := map[string]*acc{}
 	for _, sm := range samples {
-		if sm.name == base+"_sum" {
-			sum += sm.value
-		} else if sm.name == base+"_count" {
-			cnt += sm.value
+		if sm.name != base+"_sum" && sm.name != base+"_count" {
+			continue
+		}
+		keys := []string{base}
+		if v, ok := sm.labels["is_streaming"]; ok {
+			keys = append(keys, base+"|"+v)
+		}
+		for _, k := range keys {
+			a, ok := keyed[k]
+			if !ok {
+				a = &acc{}
+				keyed[k] = a
+			}
+			if sm.name == base+"_sum" {
+				a.sum += sm.value
+			} else {
+				a.cnt += sm.value
+			}
 		}
 	}
-	// A histogram with no observations yet emits no lines — skip.
-	if sum == 0 && cnt == 0 {
-		return
-	}
-	if h.t.IsZero() {
-		h.sum, h.cnt = sum, cnt
-	} else if sum >= h.sum && cnt >= h.cnt {
-		if d := cnt - h.cnt; d > 0 {
-			h.lastSum = (sum - h.sum) / d
+	for key, a := range keyed {
+		// A histogram with no observations yet emits no lines — skip.
+		if a.sum == 0 && a.cnt == 0 {
+			continue
 		}
-		h.sum, h.cnt = sum, cnt
-	} else {
-		h.sum, h.cnt = sum, cnt // reset: re-baseline
+		h, ok := s.hists[key]
+		if !ok {
+			h = &histState{}
+			s.hists[key] = h
+		}
+		if h.t.IsZero() {
+			h.sum, h.cnt = a.sum, a.cnt
+		} else if a.sum >= h.sum && a.cnt >= h.cnt {
+			if d := a.cnt - h.cnt; d > 0 {
+				h.lastSum = (a.sum - h.sum) / d
+			}
+			h.have = true
+			h.sum, h.cnt = a.sum, a.cnt
+		} else {
+			h.sum, h.cnt = a.sum, a.cnt // reset: re-baseline
+			h.have = false
+		}
+		h.t = now
 	}
-	h.t = now
 }
 
-// histMean is the mean (ms) over the most recent scrape interval.
-func (s *engineScrape) histMean(base string) float64 {
-	if h, ok := s.hists[base]; ok {
-		return h.lastSum * 1000
-	}
-	return 0
+// counterSeen reports whether a counter sample was already baselined on a
+// previous scrape.
+func (s *engineScrape) counterSeen(sm promSample) bool {
+	_, ok := s.counters[counterKey(sm)]
+	return ok
 }
 
 // ─── Prometheus text parser (stdlib, dashboard needs only) ────────────────
@@ -906,6 +1478,424 @@ func splitPromHead(head string) (string, map[string]string, bool) {
 	return name, labels, true
 }
 
+// ─── Sessions (live stack + conversation view) ───────────────────────────
+//
+// The router's in-flight request stack and per-conversation session
+// aggregate, served at GET /metrics/sessions. Token figures here are
+// router-side ESTIMATES (~4 bytes/token, body-based) — the honest-boundary
+// counterpart to the engine's measured figures.
+//
+// Session identity: for chat requests, the sha1 of the raw JSON of every
+// message except the last, joined by "\n" (a single message uses itself),
+// truncated to 12 hex chars. Same conversation prefix → same session; a
+// conversation forks a new session at its second turn. Non-chat requests
+// (completions with a prompt string, unparseable bodies) get sess "".
+//
+// Live requests are registered at admission (phase "admitted"), flip to
+// "streaming" on the first response body byte, and are removed on finish.
+// Rejections (429/413) never enter live — they bypass it via
+// finishRejection and land directly in the session ring/aggregates.
+//
+// Caps (evict-on-insert, no janitor): live 1024 (oldest start), feed live 256,
+// session store 512 (LRU by lastMs), feed sessions 100 (least-recent), reqs
+// ring 32 per session.
+
+const (
+	sessLiveCap      = 1024
+	sessStoreCap     = 512
+	sessFeedLiveCap  = 256
+	sessFeedCap      = 100
+	sessReqsRing     = 32
+	sessReqsWindowMs = 60_000  // reqs included for sessions active within 60s
+	sessActiveMs     = 120_000 // "active" = liveN>0 or lastMs within 120s
+)
+
+// sessReqFrame is one completed (or rejected) request in a session's ring.
+type sessReqFrame struct {
+	TMs       int64   `json:"tMs"`
+	Status    int     `json:"status"`
+	Stream    bool    `json:"stream"`
+	DurMs     float64 `json:"durMs"`
+	TTFTms    float64 `json:"ttftMs"`
+	CtxTok    int     `json:"ctxTok"`
+	NewTok    int     `json:"newTok"`
+	CachedTok int     `json:"cachedTok"`
+	TokOut    int     `json:"tokOut"`
+	TokS      float64 `json:"tokS"`
+}
+
+type liveReq struct {
+	ID        uint64
+	Sess      string
+	Backend   string
+	Path      string
+	Stream    bool
+	Streaming bool
+	Start     time.Time
+	CtxTok    int
+	NewTok    int
+}
+
+type sessionAgg struct {
+	ID          string
+	Backend     string
+	N           int
+	FirstMs     int64
+	LastMs      int64
+	LiveN       int
+	CtxTok      int
+	NewTok      int
+	TTFTSum     float64
+	TTFTN       int
+	TotalDurS   float64
+	TokOutTotal int64
+	LastStatus  int
+	reqs        [sessReqsRing]sessReqFrame
+	reqN        int // filled slots (≤ sessReqsRing)
+	reqIdx      int // next write slot
+}
+
+type sessLiveFrame struct {
+	ID      uint64 `json:"id"`
+	Sess    string `json:"sess"`
+	Backend string `json:"backend"`
+	Path    string `json:"path"`
+	Stream  bool   `json:"stream"`
+	Phase   string `json:"phase"` // "admitted" | "streaming"
+	StartMs int64  `json:"startMs"`
+	CtxTok  int    `json:"ctxTok"`
+	NewTok  int    `json:"newTok"`
+}
+
+type sessFrame struct {
+	ID          string         `json:"id"`
+	Backend     string         `json:"backend"`
+	N           int            `json:"n"`
+	FirstMs     int64          `json:"firstMs"`
+	LastMs      int64          `json:"lastMs"`
+	Active      bool           `json:"active"`
+	LiveN       int            `json:"liveN"`
+	CtxTok      int            `json:"ctxTok"`
+	NewTok      int            `json:"newTok"`
+	CachedTok   int            `json:"cachedTok"`
+	AvgTTFTMs   float64        `json:"avgTTFTMs"`
+	TotalDurS   float64        `json:"totalDurS"`
+	TokOutTotal int64          `json:"tokOutTotal"`
+	LastStatus  int            `json:"lastStatus"`
+	Reqs        []sessReqFrame `json:"reqs"` // nil unless active+recent+top-20
+}
+
+type sessionsFeed struct {
+	T        int64           `json:"t"`
+	Live     []sessLiveFrame `json:"live"`
+	Sessions []sessFrame     `json:"sessions"`
+}
+
+type sessionRegistry struct {
+	mu       sync.Mutex
+	live     map[uint64]*liveReq
+	sessions map[string]*sessionAgg
+	nextID   atomic.Uint64
+}
+
+func newSessionRegistry() *sessionRegistry {
+	return &sessionRegistry{
+		live:     map[uint64]*liveReq{},
+		sessions: map[string]*sessionAgg{},
+	}
+}
+
+var sessions = newSessionRegistry()
+
+// put stores the aggregate under its key, evicting the least-recent
+// session (by lastMs) when the store overflows its cap. Caller holds mu.
+func (r *sessionRegistry) put(key string, a *sessionAgg) {
+	if _, ok := r.sessions[key]; !ok && len(r.sessions) >= sessStoreCap {
+		var oldestKey string
+		var oldestMs int64 = math.MaxInt64
+		for k, v := range r.sessions {
+			if v.LastMs < oldestMs {
+				oldestMs = v.LastMs
+				oldestKey = k
+			}
+		}
+		if oldestKey != "" {
+			delete(r.sessions, oldestKey)
+		}
+	}
+	r.sessions[key] = a
+}
+
+// start registers an admitted request in the live stack and returns its
+// process-wide unique id.
+func (r *sessionRegistry) start(backend, path string, stream bool, sess string, ctxTok, newTok int) uint64 {
+	id := r.nextID.Add(1)
+	now := time.Now().UnixMilli()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.live[id] = &liveReq{
+		ID: id, Sess: sess, Backend: backend, Path: path,
+		Stream: stream, Start: time.Now(), CtxTok: ctxTok, NewTok: newTok,
+	}
+	if len(r.live) > sessLiveCap {
+		// IDs are assigned monotonically at admission, so the smallest
+		// live ID is the oldest (ties are safe either way).
+		var oldestID uint64
+		for i := range r.live {
+			if oldestID == 0 || i < oldestID {
+				oldestID = i
+			}
+		}
+		delete(r.live, oldestID)
+	}
+	if sess != "" {
+		a, ok := r.sessions[sess]
+		if !ok {
+			a = &sessionAgg{ID: sess, Backend: backend, FirstMs: now}
+			r.put(sess, a)
+		}
+		a.Backend = backend
+		a.LiveN++
+		a.CtxTok = ctxTok
+		a.NewTok = newTok
+	}
+	return id
+}
+
+func (r *sessionRegistry) firstByte(id uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l, ok := r.live[id]; ok {
+		l.Streaming = true
+	}
+}
+
+// appendReq folds one completed request into a session's aggregates and
+// last-32 ring (oldest first).
+func (a *sessionAgg) appendReq(req sessReqFrame) {
+	a.N++
+	if a.N == 1 {
+		a.FirstMs = req.TMs
+	}
+	a.LastMs = req.TMs
+	a.CtxTok = req.CtxTok
+	a.NewTok = req.NewTok
+	a.LastStatus = req.Status
+	a.TotalDurS += req.DurMs / 1000
+	a.TokOutTotal += int64(req.TokOut)
+	if req.Stream && req.TTFTms > 0 {
+		a.TTFTSum += req.TTFTms
+		a.TTFTN++
+	}
+	a.reqs[a.reqIdx] = req
+	a.reqIdx = (a.reqIdx + 1) % sessReqsRing
+	if a.reqN < sessReqsRing {
+		a.reqN++
+	}
+}
+
+// finish removes a live request and folds it into its session.
+func (r *sessionRegistry) finish(id uint64, status int, durMs, ttftMs float64, bytesOut int64) {
+	r.mu.Lock()
+	l, ok := r.live[id]
+	if ok {
+		delete(r.live, id)
+	}
+	if !ok {
+		r.mu.Unlock()
+		return
+	}
+	tokOut := int(bytesOut / 4)
+	cached := l.CtxTok - l.NewTok
+	if cached < 0 {
+		cached = 0
+	}
+	req := sessReqFrame{
+		TMs: l.Start.UnixMilli(), Status: status, Stream: l.Stream,
+		DurMs: durMs, TTFTms: ttftMs, CtxTok: l.CtxTok, NewTok: l.NewTok,
+		CachedTok: cached, TokOut: tokOut,
+	}
+	if durMs > 0 {
+		req.TokS = float64(tokOut) / (durMs / 1000)
+	}
+	if l.Sess != "" {
+		// The session aggregate may already be evicted from the store (LRU);
+		// LiveN still decrements so no phantom liveness lingers, and the
+		// ring/appends are best-effort against whatever survives.
+		if a, ok := r.sessions[l.Sess]; ok {
+			a.LiveN--
+			a.appendReq(req)
+			r.put(l.Sess, a)
+		}
+	}
+	r.mu.Unlock()
+}
+
+// finishRejection folds a router-side rejection (429/413) directly into the
+// session ring/aggregates — rejections never enter the live stack.
+func (r *sessionRegistry) finishRejection(backend, path, sess string, ctxTok, newTok, status int, durMs float64) {
+	if sess == "" {
+		return
+	}
+	cached := ctxTok - newTok
+	if cached < 0 {
+		cached = 0
+	}
+	now := time.Now().UnixMilli()
+	req := sessReqFrame{
+		TMs: now, Status: status, Stream: false,
+		DurMs: durMs, TTFTms: 0, CtxTok: ctxTok, NewTok: newTok, CachedTok: cached,
+		TokOut: 0, TokS: 0,
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.sessions[sess]
+	if !ok {
+		a = &sessionAgg{ID: sess, Backend: backend, FirstMs: now}
+	}
+	a.Backend = backend
+	a.appendReq(req)
+	r.put(sess, a)
+}
+
+// feed assembles the /metrics/sessions payload per the contract:
+// live sorted startMs ASC (oldest on top), capped 256; sessions sorted
+// active-first then lastMs DESC, capped 100; reqs included only for
+// active+recent sessions among the first 20.
+func (r *sessionRegistry) feed() sessionsFeed {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	nowMs := time.Now().UnixMilli()
+
+	live := make([]sessLiveFrame, 0, len(r.live))
+	for _, l := range r.live {
+		phase := "admitted"
+		if l.Streaming {
+			phase = "streaming"
+		}
+		live = append(live, sessLiveFrame{
+			ID: l.ID, Sess: l.Sess, Backend: l.Backend, Path: l.Path,
+			Stream: l.Stream, Phase: phase, StartMs: l.Start.UnixMilli(),
+			CtxTok: l.CtxTok, NewTok: l.NewTok,
+		})
+	}
+	sort.Slice(live, func(i, j int) bool {
+		if live[i].StartMs == live[j].StartMs {
+			return live[i].ID < live[j].ID
+		}
+		return live[i].StartMs < live[j].StartMs
+	})
+	if len(live) > sessFeedLiveCap {
+		live = live[len(live)-sessFeedLiveCap:]
+	}
+
+	// A fresh conversation whose first request is still in flight has no
+	// completed requests yet (LastMs is its start time, but it must not
+	// sink behind finished sessions) — its effective recency is the newest
+	// live start it owns.
+	liveStarts := map[string]int64{}
+	for _, l := range r.live {
+		if l.Sess != "" {
+			if st := l.Start.UnixMilli(); st > liveStarts[l.Sess] {
+				liveStarts[l.Sess] = st
+			}
+		}
+	}
+
+	type sessSort struct {
+		a   *sessionAgg
+		eff int64
+		act bool
+	}
+	list := make([]sessSort, 0, len(r.sessions))
+	for _, a := range r.sessions {
+		act := a.LiveN > 0 || nowMs-a.LastMs < sessActiveMs
+		eff := a.LastMs
+		if ls, ok := liveStarts[a.ID]; ok && ls > eff {
+			eff = ls
+		}
+		list = append(list, sessSort{a: a, eff: eff, act: act})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].act != list[j].act {
+			return list[i].act
+		}
+		if list[i].eff == list[j].eff {
+			return list[i].a.ID < list[j].a.ID
+		}
+		return list[i].eff > list[j].eff
+	})
+	if len(list) > sessFeedCap {
+		list = list[:sessFeedCap]
+	}
+	out := make([]sessFrame, 0, len(list))
+	for i, e := range list {
+		a := e.a
+		f := sessFrame{
+			ID: a.ID, Backend: a.Backend, N: a.N,
+			FirstMs: a.FirstMs, LastMs: a.LastMs,
+			Active: e.act, LiveN: a.LiveN,
+			CtxTok: a.CtxTok, NewTok: a.NewTok,
+			TotalDurS: a.TotalDurS, TokOutTotal: a.TokOutTotal,
+			LastStatus: a.LastStatus,
+		}
+		if c := a.CtxTok - a.NewTok; c > 0 {
+			f.CachedTok = c
+		}
+		if a.TTFTN > 0 {
+			f.AvgTTFTMs = a.TTFTSum / float64(a.TTFTN)
+		}
+		// reqs: only for sessions that are live or recently active (60s
+		// window — tighter than the 120s "active" flag) and within the
+		// first 20 after sorting; otherwise null to keep the feed small.
+		include := (a.LiveN > 0 || nowMs-a.LastMs < sessReqsWindowMs) && i < 20
+		if include {
+			// Ring is newest-at-(reqIdx-1); emit oldest first.
+			reqs := make([]sessReqFrame, a.reqN)
+			start := (a.reqIdx - a.reqN + sessReqsRing) % sessReqsRing
+			copy(reqs, a.reqs[start:start+a.reqN])
+			f.Reqs = reqs
+		}
+		out = append(out, f)
+	}
+	return sessionsFeed{T: nowMs, Live: live, Sessions: out}
+}
+
+// sessionKeyFor derives the 12-hex conversation id: sha1 over the raw JSON
+// of every message except the last (a single message uses itself), joined
+// by "\n". Non-chat bodies return "".
+func sessionKeyFor(parsed *parsedBody) string {
+	if len(parsed.Messages) == 0 {
+		return ""
+	}
+	prefix := parsed.Messages[:len(parsed.Messages)-1]
+	if len(prefix) == 0 {
+		prefix = parsed.Messages[:1]
+	}
+	var b strings.Builder
+	for i, m := range prefix {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.Write(m.Content)
+	}
+	sum := sha1.Sum([]byte(b.String()))
+	return fmt.Sprintf("%x", sum)[:12]
+}
+
+// estimateCtxTokens estimates the conversation context (all messages, or
+// the prompt) in tokens, ~4 bytes/token.
+func estimateCtxTokens(parsed *parsedBody) int {
+	if len(parsed.Messages) > 0 {
+		chars := 0
+		for _, m := range parsed.Messages {
+			chars += rawContentLen(m.Content)
+		}
+		return chars / 4
+	}
+	return rawContentLen(parsed.Prompt) / 4
+}
+
 // ─── Global state ─────────────────────────────────────────────────────────
 
 var (
@@ -955,6 +1945,7 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/metrics/stream", handleMetricsStream)
 	mux.HandleFunc("/metrics/burst", handleBurst)
+	mux.HandleFunc("/metrics/sessions", handleSessions)
 	mux.HandleFunc("/v1/", handleProxy)
 	return mux
 }
@@ -1502,6 +2493,13 @@ func handleBurst(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"requests": out})
 }
 
+// handleSessions serves the live in-flight request stack plus the
+// conversation-grouped session aggregates (est token semantics).
+func handleSessions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sessions.feed())
+}
+
 // ─── Proxy ────────────────────────────────────────────────────────────────
 
 // handleProxyError converts upstream transport failures into clean,
@@ -1619,15 +2617,23 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Computed once, before any admission decision: the large-prefill
 	// throttle and metrics both use this value.
 	newTokens := estimateNewTokens(&parsed)
+	// Est context tokens (whole conversation/prompt) + the conversation
+	// session id, for the live sessions view. Both are body estimates.
+	ctxTok := estimateCtxTokens(&parsed)
+	sessKey := sessionKeyFor(&parsed)
 	reqContext := requestSample{
 		T:            time.Now(),
 		Backend:      target.Name,
 		Path:         r.URL.Path,
 		NewTokensEst: newTokens,
+		CtxTok:       ctxTok,
 	}
 	recordRejection := func(status int) {
 		reqContext.Status = status
 		reqContext.DurMs = float64(time.Since(reqStart) / time.Millisecond)
+		// Rejections never enter the live stack, but they DO belong to the
+		// conversation — fold them into the session ring/aggregates.
+		sessions.finishRejection(reqContext.Backend, r.URL.Path, sessKey, ctxTok, newTokens, status, reqContext.DurMs)
 		metrics.recordRequest(reqContext.Backend, reqContext)
 	}
 
@@ -1783,6 +2789,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Completion retires it again via the accepted flag.
 	reqContext.accepted = true
 	metrics.recordAccept(target.Name, int64(len(body)), newTokens)
+	// The request enters the live session stack at admission.
+	reqID := sessions.start(target.Name, r.URL.Path, parsed.Stream, sessKey, ctxTok, newTokens)
 	proxy := proxies[target.Name]
 	// Wrap ResponseWriter to capture status + detect completion for duration
 	// tracking. Also releases the prefill slot on first response byte.
@@ -1796,6 +2804,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		stream:         parsed.Stream,
 		newTokensEst:   newTokens,
 		bytesIn:        int64(len(body)),
+		reqID:          reqID,
+		sessKey:        sessKey,
+		ctxTok:         ctxTok,
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
@@ -1831,8 +2842,11 @@ type respTracker struct {
 	stream       bool
 	newTokensEst int
 	bytesIn      int64
-	ttftSent     bool // first-byte TTFT already recorded (once)
-	recorded     bool // finish guard: exactly one sample per request
+	reqID        uint64 // session registry live id (0 = none)
+	sessKey      string // conversation id ("" = non-chat)
+	ctxTok       int    // est context tokens
+	ttftSent     bool   // first-byte TTFT already recorded (once)
+	recorded     bool   // finish guard: exactly one sample per request
 }
 
 func (t *respTracker) WriteHeader(code int) {
@@ -1867,6 +2881,10 @@ func (t *respTracker) Write(b []byte) (int, error) {
 				t.ttftSent = true
 				metrics.recordFirstByte(t.backend, float64(t.firstByteAt.Sub(t.ttftStart)/time.Millisecond))
 			}
+			// The live session stack flips to "streaming" on the first byte.
+			if t.reqID != 0 {
+				sessions.firstByte(t.reqID)
+			}
 		}
 		t.bytesOut += int64(n)
 	}
@@ -1881,15 +2899,20 @@ func (t *respTracker) finish(backend, path string, status int, ttftMs float64, b
 		return
 	}
 	t.recorded = true
+	durMs := float64(time.Since(t.reqStart) / time.Millisecond)
+	if t.reqID != 0 {
+		sessions.finish(t.reqID, status, durMs, ttftMs, bytesOut)
+	}
 	metrics.recordRequest(backend, requestSample{
 		T:            time.Now(),
 		Backend:      backend,
 		Path:         path,
 		Status:       status,
 		Stream:       t.stream,
-		DurMs:        float64(time.Since(t.reqStart) / time.Millisecond),
+		DurMs:        durMs,
 		TTFTMs:       ttftMs,
 		NewTokensEst: t.newTokensEst,
+		CtxTok:       t.ctxTok,
 		BytesIn:      t.bytesIn,
 		BytesOut:     bytesOut,
 	})

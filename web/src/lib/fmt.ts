@@ -37,6 +37,15 @@ export function fmtS(v: number | null | undefined): string {
   return v.toFixed(2) + " s";
 }
 
+/** compact token/byte counts → 132k / 2.4M / 1.2B */
+export function fmtCompact(v: number | null | undefined, digits = 1): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+  if (v >= 1e9) return (v / 1e9).toFixed(digits) + "B";
+  if (v >= 1e6) return (v / 1e6).toFixed(digits) + "M";
+  if (v >= 1e4) return (v / 1e3).toFixed(digits) + "k";
+  return v >= 1e3 ? (v / 1e3).toFixed(0) + "k" : v.toFixed(0);
+}
+
 /** epoch ms → HH:MM:SS */
 export function clock(epochMs: number): string {
   const d = new Date(epochMs);

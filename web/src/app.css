@@ -831,6 +831,25 @@ textarea {
   flex-direction: column;
   gap: 0;
   min-width: 0;
+  /* the engine v2 readout is long — the column scrolls against the
+     opened fold's fixed height */
+  overflow-y: auto;
+  min-height: 0;
+  max-height: 100%;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(166, 166, 160, 0.3) transparent;
+}
+.readout .grp {
+  margin-top: 6px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(166, 166, 160, 0.18);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+}
+.readout .v .err {
+  color: var(--red);
 }
 .readout .row {
   display: flex;
@@ -938,6 +957,216 @@ textarea {
 }
 .fleet-foot-sep {
   margin: 0 6px;
+}
+
+/* ── sessions: live in-flight stack + conversations ───────────────────── */
+.sessions {
+  margin-top: 16px;
+  transform: skewX(var(--skew));
+  transform-origin: 50% 0;
+  border: 1px solid rgba(166, 166, 160, 0.3);
+  background: var(--face);
+}
+.sessions > .unskew {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.sess-head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 6px 12px 5px;
+  border-bottom: 1px solid rgba(166, 166, 160, 0.3);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.sess-label {
+  color: var(--tx-3);
+}
+.sess-inflight {
+  color: var(--tx-2);
+  font-variant-numeric: tabular-nums;
+}
+.sess-inflight.hot {
+  color: var(--gold-lit);
+}
+.sess-est-note {
+  margin-left: auto;
+  color: var(--tx-3);
+  letter-spacing: 0.05em;
+}
+.sess-est-note em {
+  color: var(--gold);
+  font-style: normal;
+}
+.sess-subhead {
+  padding: 4px 12px 2px;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+}
+.sess-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 5px 12px;
+  border-bottom: 1px solid rgba(166, 166, 160, 0.12);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  border-left: none;
+  border-right: none;
+  cursor: default;
+  font-family: inherit;
+  letter-spacing: 0.02em;
+}
+.sess-wrap > .sess-row {
+  cursor: pointer;
+}
+.sess-wrap > .sess-row:hover {
+  background: var(--face-hi);
+}
+.sess-elapsed {
+  color: var(--tx-1);
+  min-width: 52px;
+  text-align: right;
+}
+.sess-be {
+  color: var(--tx-1);
+}
+.sess-path {
+  color: var(--tx-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sess-sess,
+.sess-id {
+  color: var(--tx-3);
+  font-size: 10px;
+}
+.sess-phase {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.sess-phase-admitted {
+  color: var(--vl-dim);
+}
+.sess-phase-streaming {
+  color: var(--gold-lit);
+}
+.sess-tok {
+  color: var(--tx-2);
+  white-space: nowrap;
+}
+.sess-tok .est,
+.sess-head .est {
+  color: var(--gold);
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+}
+.sess-n {
+  color: var(--tx-2);
+  white-space: nowrap;
+}
+.sess-live-chip {
+  color: var(--gold-lit);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.sess-age {
+  color: var(--tx-3);
+}
+.sess-ttft {
+  color: var(--tx-2);
+}
+.sess-st {
+  color: var(--tx-2);
+  margin-left: auto;
+  font-weight: 500;
+}
+.sess-st.st-ok {
+  color: var(--gold);
+}
+.sess-st.st-throttle {
+  color: var(--vl-dim);
+}
+.sess-st.st-err {
+  color: var(--red);
+}
+.sess-wrap {
+  position: relative;
+}
+.sess-wrap.sess-active {
+  box-shadow: inset 2px 0 0 var(--gold);
+}
+.sess-scroll {
+  max-height: 360px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(166, 166, 160, 0.3) transparent;
+}
+.sess-detail {
+  padding: 4px 12px 8px;
+  border-bottom: 1px solid rgba(166, 166, 160, 0.12);
+  background: var(--face);
+}
+.sess-reqs {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.sess-reqs th {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--tx-3);
+  text-align: left;
+  padding: 2px 8px 3px 0;
+  border-bottom: 1px solid rgba(166, 166, 160, 0.18);
+  white-space: nowrap;
+}
+.sess-reqs td {
+  padding: 3px 8px 3px 0;
+  border-bottom: 1px solid rgba(166, 166, 160, 0.12);
+  color: var(--tx-2);
+  white-space: nowrap;
+}
+.sess-reqs tr:last-child td {
+  border-bottom: none;
+}
+.sess-reqs .st-ok {
+  color: var(--gold);
+}
+.sess-reqs .st-throttle {
+  color: var(--vl-dim);
+}
+.sess-reqs .st-err {
+  color: var(--red);
+}
+.sess-no-reqs {
+  font-size: 10px;
+  color: var(--tx-3);
+  letter-spacing: 0.04em;
+}
+.sess-hollow {
+  padding: 18px 12px;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--tx-3);
 }
 
 /* ── request tape: the continuous transcript ──────────────────────────── */
@@ -1125,5 +1354,13 @@ textarea {
   }
   .cell-open {
     grid-template-columns: 1fr !important;
+  }
+  .sess-row {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .sess-reqs {
+    display: block;
+    overflow-x: auto;
   }
 }

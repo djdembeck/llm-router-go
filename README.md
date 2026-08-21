@@ -205,18 +205,73 @@ most recent requests including router rejections (429/413).
 
 The dashboard is served by the same listener as the management endpoints (so
 it inherits the same deployment boundary: put it behind your TLS/auth reverse
-proxy). It reads two streaming endpoints:
+proxy). It reads three endpoints:
 
 | Endpoint | Description |
 | :--- | :--- |
-| `GET /metrics/stream` | SSE feed of full live snapshots every `?interval=` (default `500ms`, clamped `200ms`–`10s`). One JSON frame per `data:` line: per-backend slots, EWMA duration, streaming TTFT (EWMA + latest first-byte sample), live arrival rates (30s window), cumulative counters, engine metrics (running/waiting/kv/prefill/decode/ttft), GPU budget state, tier-0 in-flight, and fleet totals. |
+| `GET /metrics/stream` | SSE feed of full live snapshots every `?interval=` (default `500ms`, clamped `200ms`–`10s`). One JSON frame per `data:` line: per-backend slots, EWMA duration, streaming TTFT (EWMA + latest first-byte sample), live arrival rates (30s window), cumulative counters, engine metrics (v2 — see below), GPU budget state, tier-0 in-flight, and fleet totals. |
 | `GET /metrics/burst` | The most recent completed requests (bounded ring, default capacity `500`, `?limit=` up to `1000`), newest last, including router-originated rejections. |
+| `GET /metrics/sessions` | The in-flight request stack plus conversation-grouped sessions (polling endpoint, see below). |
 
 The frontend connects to `/metrics/stream` via `EventSource` and falls back to
 polling `/stats` if the stream is unavailable. Rebuilt on every code change
 with `cd web && bun run build` and embedded with the `webui` build tag (the
 Docker image does this automatically; the plain `go build` ships a 404 stub
 for the dashboard until `web/build` exists).
+
+### Engine metrics (v2)
+
+Each backend's fold now exposes the backend's **own** execution truth scraped
+from its Prometheus `/metrics` at 1s, as a full v2 `engine` block. Beyond the
+original running / waiting / KV% / prefill / decode / TTFT, the sheet now
+shows:
+
+- **Requests** — lifetime completed requests (`reqDoneTotal`) with a
+  **finished-reason breakdown** (`finReasons`: stop / length / abort / error /
+  repetition; vLLM), plus streaming vs non-streaming splits and aborted /
+  preempted / retracted counts.
+- **Token totals + rates** — lifetime prompt/generation token totals, real
+  prefill throughput split into **compute-only** (`prefillTokS`) and
+  **cache-hit** (`prefillCacheTokS`) prefill, decode throughput, and retracted
+  input-token rate. Prefix-cache and multimodal-cache hit rates with raw
+  query/hit totals.
+- **Memory pools** — full / SWA / Mamba pool usage % and pool token stats
+  (used / capacity / free / evictable, Mamba used / capacity), host-tier
+  (HiCache) token usage, KV and weight memory (GB).
+- **Per-stage latency** — prefill / decode / queue / inter-token / end-to-end
+  means (ms), plus the streaming vs non-streaming TTFT split and per-request
+  mean prompt / generation token length.
+- **Capacity** — SLO-constrained running-request cap and context length
+  (SGLang); waiting-by-reason (capacity / deferred) for vLLM.
+
+Engine fields the engine doesn't report render as `null` (the sheet shows
+`—`). The field table lives in `.impeccable/metrics-contract.md`.
+
+Availability / capability flags:
+
+| Condition | Effect |
+| :--- | :--- |
+| **SGLang started without `--enable-metrics`** (default) | `/metrics` returns 404 → engine `status: "off"`, sheet renders `—`. Start SGLang with `--enable-metrics` to populate it. |
+| **vLLM** | Always serves `/metrics`; no flag needed. |
+| **SGLang Mamba pool** (`mambaPct`, `mambaUsedTok`, `mambaCapTok`) | Appears only with a hybrid / Mamba model; `null` otherwise. |
+| **vLLM finished-reason breakdown** (`finReasons`) | Always available — requires no extra flag. |
+| **SGLang HiCache** (`hicacheHostUsedTok` / `hicacheHostCapTok`) | Appears only when host-tier caching is enabled. |
+
+### Sessions
+
+`GET /metrics/sessions` returns the router's **in-flight request stack**
+(`live`, oldest on top) plus **conversation-grouped sessions** (`sessions`).
+A session is identified by the SHA-1 of the conversation prefix — the raw
+JSON of every message except the last, truncated to 12 hex chars — so the same
+conversation groups together and a new conversation forks at its second turn.
+Non-chat requests (completions with a `prompt`) have no session.
+
+Each session shows its request count, first/last activity, active flag,
+in-flight count, the latest request's context/new/cached token estimates,
+mean streaming TTFT, total duration, total output tokens, and last status;
+recent sessions expand to their last 32 requests. All token figures here are
+**estimates** (body-based, ~4 bytes/token) — see the measurement boundary
+below — never measured decode tokens.
 
 ### Measurement boundary
 

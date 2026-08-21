@@ -47,26 +47,134 @@ export interface BackendMetrics {
  * In-engine truth, scraped from the backend's Prometheus /metrics at 1s.
  * status "ok" = live; "off" = endpoint absent (e.g. SGLang without
  * --enable-metrics); "err" = unreachable. Zero + non-ok means "no data".
+ * Core fields are always present; family-specific fields are null when the
+ * engine (or feature) does not report them. Engine figures are measured —
+ * never estimated.
  */
 export interface EngineMetrics {
+  status: "ok" | "off" | "err";
+  /** engine family: "vllm" | "sglang" | "" (unknown) */
+  engine: string;
   running: number;
   waiting: number;
   /** KV/token-pool pressure, 0..100; 0 = unknown */
   kvPct: number;
+  /** prefix-cache hit rate, 0..1 */
+  hitRate: number;
+  /** compute-only prefill tok/s (cache misses) */
   prefillTokS: number;
+  /** cache-hit prefill tok/s */
+  prefillCacheTokS: number;
   decodeTokS: number;
+  /** mean TTFT over the last scrape interval, ms */
   ttftMs: number;
-  status: "ok" | "off" | "err";
+  itlMs: number;
+  e2eMs: number;
+  queueMs: number;
+  /** per-request means over the last interval */
+  meanPromptTok: number;
+  meanGenTok: number;
+  /** lifetime completed requests */
+  reqDoneTotal: number;
+  /** vllm: waiting split by reason (capacity / deferred) */
+  waitCap: number | null;
+  waitDefer: number | null;
+  /** sglang: retracted requests + retraction tok/s */
+  retracted: number | null;
+  retractedTokS: number | null;
+  /** sglang: full/SWA/mamba pool pressure, 0..100 */
+  fullPct: number | null;
+  swaPct: number | null;
+  mambaPct: number | null;
+  /** sglang: KV pool token counts */
+  kvUsedTok: number | null;
+  kvCapTok: number | null;
+  kvFreeTok: number | null;
+  kvEvictTok: number | null;
+  mambaUsedTok: number | null;
+  mambaCapTok: number | null;
+  /** sglang: hicache host offload tokens */
+  hicacheHostUsedTok: number | null;
+  hicacheHostCapTok: number | null;
+  /** sglang: TTFT means split by is_streaming */
+  ttftStreamMs: number | null;
+  ttftNonStreamMs: number | null;
+  /** vllm: per-stage request-time means (ms) */
+  prefillMs: number | null;
+  decodeMs: number | null;
+  perTokMs: number | null;
+  /** sglang: memory + capacity */
+  kvMemGB: number | null;
+  weightMemGB: number | null;
+  sloCap: number | null;
+  ctxLen: number | null;
+  preemptedTotal: number | null;
+  abortedTotal: number | null;
+  streamDoneTotal: number | null;
+  nonStreamDoneTotal: number | null;
+  /** lifetime prompt / generation tokens */
+  promptTokTotal: number | null;
+  genTokTotal: number | null;
+  hitQueriesTotal: number | null;
+  hitHitsTotal: number | null;
+  mmQueriesTotal: number | null;
+  mmHitsTotal: number | null;
+  /** vllm: lifetime finished requests by reason */
+  finReasons: Record<string, number> | null;
 }
 
 export const emptyEngine: EngineMetrics = {
+  status: "off",
+  engine: "",
   running: 0,
   waiting: 0,
   kvPct: 0,
+  hitRate: 0,
   prefillTokS: 0,
+  prefillCacheTokS: 0,
   decodeTokS: 0,
   ttftMs: 0,
-  status: "off",
+  itlMs: 0,
+  e2eMs: 0,
+  queueMs: 0,
+  meanPromptTok: 0,
+  meanGenTok: 0,
+  reqDoneTotal: 0,
+  waitCap: null,
+  waitDefer: null,
+  retracted: null,
+  retractedTokS: null,
+  fullPct: null,
+  swaPct: null,
+  mambaPct: null,
+  kvUsedTok: null,
+  kvCapTok: null,
+  kvFreeTok: null,
+  kvEvictTok: null,
+  mambaUsedTok: null,
+  mambaCapTok: null,
+  hicacheHostUsedTok: null,
+  hicacheHostCapTok: null,
+  ttftStreamMs: null,
+  ttftNonStreamMs: null,
+  prefillMs: null,
+  decodeMs: null,
+  perTokMs: null,
+  kvMemGB: null,
+  weightMemGB: null,
+  sloCap: null,
+  ctxLen: null,
+  preemptedTotal: null,
+  abortedTotal: null,
+  streamDoneTotal: null,
+  nonStreamDoneTotal: null,
+  promptTokTotal: null,
+  genTokTotal: null,
+  hitQueriesTotal: null,
+  hitHitsTotal: null,
+  mmQueriesTotal: null,
+  mmHitsTotal: null,
+  finReasons: null,
 };
 
 export interface GpuMetrics {
@@ -112,6 +220,78 @@ export interface BurstRequest {
 
 export interface BurstResponse {
   requests: BurstRequest[];
+}
+
+// ── session feed (GET /metrics/sessions) ─────────────────────────────────
+
+/** One in-flight request (router-side, live stack). Token figures are est. */
+export interface LiveReq {
+  id: number;
+  /** conversation session id (12-hex); "" = not a chat request */
+  sess: string;
+  backend: string;
+  path: string;
+  stream: boolean;
+  phase: "admitted" | "streaming";
+  startMs: number;
+  ctxTok: number;
+  newTok: number;
+}
+
+/** One completed request inside a session. Token figures are est. */
+export interface SessionReq {
+  tMs: number;
+  status: number;
+  stream: boolean;
+  durMs: number;
+  ttftMs: number;
+  ctxTok: number;
+  newTok: number;
+  cachedTok: number;
+  tokOut: number;
+  tokS: number;
+}
+
+/** One conversation, aggregated. Token figures are est (body-based). */
+export interface SessionRow {
+  id: string;
+  backend: string;
+  n: number;
+  firstMs: number;
+  lastMs: number;
+  active: boolean;
+  liveN: number;
+  ctxTok: number;
+  newTok: number;
+  cachedTok: number;
+  avgTTFTMs: number;
+  totalDurS: number;
+  tokOutTotal: number;
+  lastStatus: number;
+  /** last 32 completed requests, oldest first; null when not fresh enough */
+  reqs: SessionReq[] | null;
+}
+
+export interface SessionsFeed {
+  t: number;
+  live: LiveReq[];
+  sessions: SessionRow[];
+}
+
+/** The session feed: /metrics/sessions (router), dev-metrics fallback. */
+export async function fetchSessions(): Promise<SessionsFeed | null> {
+  for (const url of ["/metrics/sessions", "/dev-metrics/sessions"]) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) continue;
+      const j = (await res.json()) as SessionsFeed;
+      if (j && Array.isArray(j.live) && Array.isArray(j.sessions)) return j;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 // /stats fallback shape (pre-dates the SSE fields).

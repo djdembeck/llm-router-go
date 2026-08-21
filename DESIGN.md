@@ -201,7 +201,8 @@ horizontal weight has broken the sheet's calm.
 
 A centered 1320px frame (`max-width: 1320px`, padding 18px 28px 48px; 14px inline / 36px
 bottom under 720px). The page is a single vertical stack: masthead → feed row → the sheet
-→ fleet strip → request tape → (sr-only flat table). The sheet and every block below it
+→ fleet strip → request tape → sessions sheet → (sr-only flat table). The sheet
+and every block below it
 live on a shared isometric skew: `skewX(-6deg)` with `transform-origin: 50% 0`, applied to
 the *containers* (`.sheet`, `.fleet-strip`, `.tape-wrap`, `.hollow`, `.fleet-foot`) — never
 to individual text, which is counter-skewed (`.unskew`, `skewX(6deg)`) so it stays crisp,
@@ -318,11 +319,14 @@ place.
   for the primary signal,
   steel-blue for the ttft overlay), and a 272px readout column that leads with a
   **live-state block** (in-flight / queue / prefill / ewma / ttft), then a **rates**
-  group, then an **engine** group (scraped from the backend's own /metrics: running /
-  queue / kv cache / real prefill tok/s / real decode tok/s / engine ttft — when the
-  endpoint is absent it says so in one line instead of faking data), then a
-  **lifetime totals** group collapsed behind a `＋` toggle — progressive
-  disclosure, so a 15-second glance sees state first. The `fold ✕` button is at the
+  group, then the **engine** block (scraped from the backend's own /metrics — the
+  grouped engine readout: requests · real / tokens · real / cache / latency · real /
+  capacity; see the Engine Readout entry below), then a **lifetime totals** group
+  collapsed behind a `＋` toggle — progressive disclosure, so a 15-second glance
+  sees state first. The engine block is long, so the readout column **scrolls**
+  (thin scrollbar, no glow) against the opened fold's fixed 308px height —
+  scroll is depth's price, the value still wins: nothing overlaps, every number
+  is tabular and horizontal. The `fold ✕` button is at the
   switcher row's right end, visually distinct from a signal option. `role="button"`,
   `tabindex=0`, Enter/Space toggle, Esc refolds and returns focus to the cell (a
   keyboard user is never stranded at `<body>`).
@@ -331,6 +335,31 @@ place.
   value 15px right. Tapping a packet row expands it to 72px with an inline readout
   (inf / wait / prefill) — on mobile the packet row is data, not a dead tap. The sheet
   becomes `grid-template-columns: 1fr` — one thin live line per backend.
+
+### Engine Readout
+**Character:** the opened fold's engine block — the backend's own /metrics truth,
+grouped under small crease sub-headers (9px uppercase muted, 1px crease above each):
+- **top rows (no header):** running, waiting (+ `cap N / defer M` split when vLLM
+  reports it), retracted (SGLang).
+- **requests · real:** lifetime completed requests, the finished-reason breakdown
+  inline on one row (stop / length / abort / error — the error number is the only
+  thing that may go red, and only when it is > 0), aborted (SGLang), preempted
+  (vLLM), streaming / batch completed split (SGLang).
+- **tokens · real:** compute-only prefill tok/s, cache-hit prefill tok/s, decode
+  tok/s, lifetime prompt and generation token totals (compact 2.4M / 132k), and the
+  gen:prompt ratio. Every figure here is *measured* — none carry `est`.
+- **cache:** kv cache pressure % (with the full / SWA / mamba pool split for
+  SGLang), pool used / capacity in tokens (+ free · evictable), mamba pool
+  used / cap, prefix-cache hit rate (+ lifetime hits / queries for vLLM), mm-cache
+  hit rate, hicache host offload, and memory (KV GB · weights GB).
+- **latency · real:** TTFT (with the stream / batch split for SGLang), ITL, e2e,
+  queue, prefill / decode stage means (vLLM), per-token ms, and the average
+  request shape (mean prompt in / mean gen out).
+- **capacity:** SLO running-request cap and context length (SGLang).
+
+Fields the engine does not report render as `—` or the row is absent — family
+differences (vLLM vs SGLang) are silent, never faked. When the endpoint is
+absent the whole block is two honest lines (`status: off — …`, `source: …/metrics`).
 
 ### Trace Scope
 **Character:** a scrolling oscilloscope, not a stepped chart — the gold line glides
@@ -374,6 +403,39 @@ a `429s+ only` toggle that filters the transcript to rejections, and a `spikes n
 counter that goes red when nonzero and carries a 60s `peak` so the evidence does not
 decay away before it is read. When the feed drops, the tape freezes in place (the
 transcript is still the last truth). Idle state: one muted line — "the sheet is quiet."
+
+### Sessions Sheet
+**Character:** the router's conversation memory, under the tape — the in-flight
+request stack and the live sessions, as one more skewed band on the sheet (same
+`skewX(-6deg)` container, counter-skewed content, 1px creases, zero radius). The
+header row reads `sessions · in flight · N` (the count is gold when N > 0 — the
+live signal) with the est note `token figures · est` at the right end.
+- **In-flight stack:** one row per live request, oldest on top (the operator reads
+  the stack like a queue: whatever is on top has been waiting longest). Each row:
+  ticking elapsed time (1s clock, `m:ss` after a minute), backend, path (truncated),
+  the session's 12-hex prefix id (muted; `—` when the request is not a chat
+  conversation), a phase chip — `admitted` in valley blue (queued, not yet
+  streaming) and `streaming` in gold (the live signal) — then `ctx N est` and
+  `new N est` (body-based estimates, est-labeled per the rule).
+- **Session rows:** one conversation per row, sorted active-first then
+  most-recent. Identity is the conversation's **prefix hash**: sha1 of the message
+  history up to (excluding) the last turn, first 12 hex chars — a new conversation
+  forked off an old one gets its own id at its second turn. Active sessions (a
+  live request, or a turn in the last 2 minutes) carry a 2px **gold left edge** —
+  the only gold edge at rest, because it *is* the live signal — and a `live` gold
+  chip instead of the age (`m:ss`). Then: `{n} reqs`, `ctx N est`, `cached N est`,
+  average ttft, lifetime `N tok est`, and the last status chip: 2xx gold, **429
+  valley blue** (capacity rejection, the policy working), 5xx red (the only red
+  allowed).
+- **Expansion:** clicking a row opens its per-request table in place (one open at
+  a time): `t (HH:MM:SS) · st · dur · ttft · ctx est · new est · cached est ·
+  out est · tok/s est` at 11px tabular rows under 1px creases, 9px uppercase
+  muted header. Request detail is only carried while the session is fresh —
+  older sessions say so in one muted line, they do not fake history.
+- **Honesty:** every token figure here is a body-based estimate (~4 bytes/token)
+  and wears its gold `est`; durations and statuses are measured. When the feed is
+  absent (router build without the sessions endpoint), the band shows one muted
+  line — `no session feed` — absence is not failure, so it is never red.
 
 ### Stale Banner (feed loss)
 **Character:** the moment the truth stops arriving is the moment the page must be

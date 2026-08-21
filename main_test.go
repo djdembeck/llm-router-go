@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -838,6 +839,390 @@ func TestEngine_EndpointOff(t *testing.T) {
 	}
 }
 
+// ptr helpers for engineView v2 optional-field assertions.
+func ptr64f(v float64) *float64 { return &v }
+func ptr64i(v int64) *int64     { return &v }
+func deref64f(p *float64, field string, t *testing.T) float64 {
+	t.Helper()
+	if p == nil {
+		t.Fatalf("%s is nil, want a value", field)
+	}
+	return *p
+}
+func deref64i(p *int64, field string, t *testing.T) int64 {
+	t.Helper()
+	if p == nil {
+		t.Fatalf("%s is nil, want a value", field)
+	}
+	return *p
+}
+func wantNear(t *testing.T, got, want float64, field string) {
+	t.Helper()
+	if got < want*0.98 || got > want*1.02 {
+		t.Errorf("%s = %v, want ~%v (±2%% wall-clock)", field, got, want)
+	}
+}
+
+// rewindBaselines shifts the counter + histogram baselines back by d, so the
+// next scrape's deltas span a known ~2s interval without a 2s test sleep
+// (same pattern as TestEngine_ScrapeVllm's prime).
+func rewindBaselines(s *engineScrape, d time.Duration) {
+	for k := range s.cTimes {
+		s.cTimes[k] = s.cTimes[k].Add(-d)
+	}
+	for _, h := range s.hists {
+		h.t = h.t.Add(-d)
+	}
+}
+
+// TestEngine_V2Vllm exercises the full vLLM v2 scrape: gauges, by-source
+// prefill split, lifetime counters, finished-reason breakdown, cache hit
+// rates, and every histogram-derived mean (latency in ms, tokens raw).
+func TestEngine_V2Vllm(t *testing.T) {
+	r := newEngineRegistry()
+	r.add("king", "http://127.0.0.1:1/metrics")
+	r.mu.Lock()
+	s := r.backends["king"]
+	r.mu.Unlock()
+
+	// Prime (one scrape ~2s of wall clock ago): baselines for counters +
+	// histograms.
+	prime := `
+vllm:prompt_tokens_total{model_name="m",engine="0"} 1000
+vllm:generation_tokens_total{model_name="m",engine="0"} 100
+vllm:prompt_tokens_by_source_total{model_name="m",engine="0",source="local_compute"} 900
+vllm:prompt_tokens_by_source_total{model_name="m",engine="0",source="local_cache_hit"} 100
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 0.78
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 10
+vllm:inter_token_latency_seconds_sum{model_name="m",engine="0"} 0.78
+vllm:inter_token_latency_seconds_count{model_name="m",engine="0"} 10
+vllm:e2e_request_latency_seconds_sum{model_name="m",engine="0"} 2.36
+vllm:e2e_request_latency_seconds_count{model_name="m",engine="0"} 10
+vllm:request_queue_time_seconds_sum{model_name="m",engine="0"} 0.78
+vllm:request_queue_time_seconds_count{model_name="m",engine="0"} 10
+vllm:request_prefill_time_seconds_sum{model_name="m",engine="0"} 1.46
+vllm:request_prefill_time_seconds_count{model_name="m",engine="0"} 10
+vllm:request_decode_time_seconds_sum{model_name="m",engine="0"} 5.24
+vllm:request_decode_time_seconds_count{model_name="m",engine="0"} 10
+vllm:request_time_per_output_token_seconds_sum{model_name="m",engine="0"} 0.044
+vllm:request_time_per_output_token_seconds_count{model_name="m",engine="0"} 20
+vllm:request_prompt_tokens_sum{model_name="m",engine="0"} 2500
+vllm:request_prompt_tokens_count{model_name="m",engine="0"} 1
+vllm:request_generation_tokens_sum{model_name="m",engine="0"} 110
+vllm:request_generation_tokens_count{model_name="m",engine="0"} 1
+`
+	s.scrapeBody(parsePromText([]byte(prime)))
+	// Rewind baselines ~2s and let the wall clock add ~0.2s more: the
+	// deltas span a known ~2.2s interval (jitter ±few %) with no 2s sleep.
+	rewindBaselines(s, 2*time.Second)
+	time.Sleep(200 * time.Millisecond)
+
+	body := `
+vllm:num_requests_running{model_name="m",engine="0"} 4
+vllm:num_requests_waiting{model_name="m",engine="0"} 2
+vllm:num_requests_waiting_by_reason{model_name="m",engine="0",reason="capacity"} 3
+vllm:num_requests_waiting_by_reason{model_name="m",engine="0",reason="deferred"} 1
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.45
+vllm:prompt_tokens_total{model_name="m",engine="0"} 3000
+vllm:generation_tokens_total{model_name="m",engine="0"} 3500
+vllm:prompt_tokens_by_source_total{model_name="m",engine="0",source="local_compute"} 2900
+vllm:prompt_tokens_by_source_total{model_name="m",engine="0",source="local_cache_hit"} 1500
+vllm:request_success_total{model_name="m",engine="0",finished_reason="stop"} 50
+vllm:request_success_total{model_name="m",engine="0",finished_reason="length"} 7
+vllm:request_success_total{model_name="m",engine="0",finished_reason="abort"} 3
+vllm:num_preemptions_total{model_name="m",engine="0"} 4
+vllm:prefix_cache_queries_total{model_name="m",engine="0"} 1000
+vllm:prefix_cache_hits_total{model_name="m",engine="0"} 791
+vllm:mm_cache_queries_total{model_name="m",engine="0"} 20
+vllm:mm_cache_hits_total{model_name="m",engine="0"} 17
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 1.78
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 20
+vllm:inter_token_latency_seconds_sum{model_name="m",engine="0"} 1.78
+vllm:inter_token_latency_seconds_count{model_name="m",engine="0"} 30
+vllm:e2e_request_latency_seconds_sum{model_name="m",engine="0"} 4.96
+vllm:e2e_request_latency_seconds_count{model_name="m",engine="0"} 20
+vllm:request_queue_time_seconds_sum{model_name="m",engine="0"} 1.78
+vllm:request_queue_time_seconds_count{model_name="m",engine="0"} 30
+vllm:request_prefill_time_seconds_sum{model_name="m",engine="0"} 2.56
+vllm:request_prefill_time_seconds_count{model_name="m",engine="0"} 30
+vllm:request_decode_time_seconds_sum{model_name="m",engine="0"} 6.84
+vllm:request_decode_time_seconds_count{model_name="m",engine="0"} 30
+vllm:request_time_per_output_token_seconds_sum{model_name="m",engine="0"} 0.164
+vllm:request_time_per_output_token_seconds_count{model_name="m",engine="0"} 30
+vllm:request_prompt_tokens_sum{model_name="m",engine="0"} 7500
+vllm:request_prompt_tokens_count{model_name="m",engine="0"} 3
+vllm:request_generation_tokens_sum{model_name="m",engine="0"} 370
+vllm:request_generation_tokens_count{model_name="m",engine="0"} 3
+`
+	s.scrapeBody(parsePromText([]byte(body)))
+	v := s.view
+
+	if v.Status != "ok" || v.Engine != "vllm" {
+		t.Fatalf("status/engine = %q/%q, want ok/vllm", v.Status, v.Engine)
+	}
+	if v.Running != 4 || v.Waiting != 2 || v.KVPct != 45 {
+		t.Errorf("core gauges = %v/%v/%v, want 4/2/45", v.Running, v.Waiting, v.KVPct)
+	}
+	// by-source prefill split over the ~2.2s window: compute 2000 tok,
+	// cache 1400 tok; decode 3400 tok.
+	wantNear(t, v.PrefillTokS, 909, "prefillTokS")
+	wantNear(t, v.PrefillCacheTokS, 636, "prefillCacheTokS")
+	wantNear(t, v.DecodeTokS, 1545, "decodeTokS")
+	// Finished-reason breakdown + lifetime.
+	if v.ReqDoneTotal != 60 {
+		t.Errorf("reqDoneTotal = %d, want 60 (Σ finished reasons)", v.ReqDoneTotal)
+	}
+	if v.FinReasons == nil || v.FinReasons["stop"] != 50 || v.FinReasons["length"] != 7 || v.FinReasons["abort"] != 3 {
+		t.Errorf("finReasons = %v, want stop=50 length=7 abort=3", v.FinReasons)
+	}
+	if got := deref64i(v.PreemptedTotal, "preemptedTotal", t); got != 4 {
+		t.Errorf("preemptedTotal = %d, want 4", got)
+	}
+	if got := deref64f(v.WaitCap, "waitCap", t); got != 3 {
+		t.Errorf("waitCap = %v, want 3", got)
+	}
+	if got := deref64f(v.WaitDefer, "waitDefer", t); got != 1 {
+		t.Errorf("waitDefer = %v, want 1", got)
+	}
+	// Cache hit rates (lifetime hits/queries) + raw totals.
+	if v.HitRate < 0.78 || v.HitRate > 0.80 {
+		t.Errorf("hitRate = %v, want ~0.791", v.HitRate)
+	}
+	if got := deref64i(v.HitQueriesTotal, "hitQueriesTotal", t); got != 1000 {
+		t.Errorf("hitQueriesTotal = %d, want 1000", got)
+	}
+	if got := deref64i(v.HitHitsTotal, "hitHitsTotal", t); got != 791 {
+		t.Errorf("hitHitsTotal = %d, want 791", got)
+	}
+	if got := deref64i(v.MmQueriesTotal, "mmQueriesTotal", t); got != 20 {
+		t.Errorf("mmQueriesTotal = %d, want 20", got)
+	}
+	if got := deref64i(v.MmHitsTotal, "mmHitsTotal", t); got != 17 {
+		t.Errorf("mmHitsTotal = %d, want 17", got)
+	}
+	if got := deref64i(v.PromptTokTotal, "promptTokTotal", t); got != 3000 {
+		t.Errorf("promptTokTotal = %d, want 3000 (latest raw counter)", got)
+	}
+	if got := deref64i(v.GenTokTotal, "genTokTotal", t); got != 3500 {
+		t.Errorf("genTokTotal = %d, want 3500", got)
+	}
+	// Latency means (ms) over the ~2.2s interval.
+	wantNear(t, v.TTFTms, 100, "ttftMs")                                // (1.78-0.78)/(20-10)
+	wantNear(t, v.ITLms, 50, "itlMs")                                   // (1.78-0.78)/(30-10)
+	wantNear(t, v.E2EMs, 260, "e2eMs")                                  // (4.96-2.36)/(20-10)
+	wantNear(t, v.QueueMs, 50, "queueMs")                               // (1.78-0.78)/(30-10)
+	wantNear(t, deref64f(v.PrefillMs, "prefillMs", t), 55, "prefillMs") // (2.56-1.46)/(30-10)
+	wantNear(t, deref64f(v.DecodeMs, "decodeMs", t), 80, "decodeMs")    // (6.84-5.24)/(30-10)
+	wantNear(t, deref64f(v.PerTokMs, "perTokMs", t), 12, "perTokMs")    // (0.164-0.044)/(30-20)
+	// Token histograms are RAW token counts, NOT ×1000.
+	wantNear(t, v.MeanPromptTok, 2500, "meanPromptTok")
+	wantNear(t, v.MeanGenTok, 130, "meanGenTok")
+	if v.MeanPromptTok > 10000 {
+		t.Errorf("meanPromptTok = %v, looks ms-converted (want token values)", v.MeanPromptTok)
+	}
+	// SGLang-only fields must be nil on vLLM.
+	if v.TTFTStreamMs != nil || v.TTFTNonStreamMs != nil {
+		t.Errorf("vllm ttft stream split = %v/%v, want nil", v.TTFTStreamMs, v.TTFTNonStreamMs)
+	}
+	if v.FullPct != nil || v.SwaPct != nil || v.MambaPct != nil {
+		t.Errorf("vllm pool pct = %v/%v/%v, want nil", v.FullPct, v.SwaPct, v.MambaPct)
+	}
+	if v.AbortedTotal != nil || v.StreamDoneTotal != nil || v.NonStreamDoneTotal != nil {
+		t.Errorf("vllm sglang counters non-nil: %v/%v/%v", v.AbortedTotal, v.StreamDoneTotal, v.NonStreamDoneTotal)
+	}
+	if v.Retracted != nil || v.RetractedTokS != nil {
+		t.Errorf("vllm retracted = %v/%v, want nil", v.Retracted, v.RetractedTokS)
+	}
+	if v.KVMemGB != nil || v.SLOCap != nil || v.CTXLen != nil {
+		t.Errorf("vllm mem/slo/ctx non-nil: %v/%v/%v", v.KVMemGB, v.SLOCap, v.CTXLen)
+	}
+}
+
+// TestEngine_V2Sglang exercises the full SGLang v2 scrape: pool gauges (MAX
+// across ranks), token pool stats, retraction, aborted/streaming splits,
+// is_streaming-split TTFT, and raw token histogram means.
+func TestEngine_V2Sglang(t *testing.T) {
+	r := newEngineRegistry()
+	r.add("subject", "http://127.0.0.1:1/metrics")
+	r.mu.Lock()
+	s := r.backends["subject"]
+	r.mu.Unlock()
+
+	// Prime ~2s ago (rank 0 only is enough to baseline the metrics that
+	// appear on both ranks; rank 1 baselines on this scrape's first sight).
+	prime := `
+sglang:num_retracted_input_tokens_total{tp_rank="0"} 100
+sglang:realtime_tokens_total{tp_rank="0",mode="prefill_compute"} 2100
+sglang:realtime_tokens_total{tp_rank="1",mode="prefill_compute"} 2100
+sglang:realtime_tokens_total{tp_rank="0",mode="prefill_cache"} 500
+sglang:realtime_tokens_total{tp_rank="1",mode="prefill_cache"} 500
+sglang:realtime_tokens_total{tp_rank="0",mode="decode"} 1000
+sglang:realtime_tokens_total{tp_rank="1",mode="decode"} 1000
+sglang:time_to_first_token_seconds_sum{is_streaming="true"} 0.78
+sglang:time_to_first_token_seconds_count{is_streaming="true"} 1
+sglang:time_to_first_token_seconds_sum{is_streaming="false"} 0.45
+sglang:time_to_first_token_seconds_count{is_streaming="false"} 1
+sglang:inter_token_latency_seconds_sum 1.44
+sglang:inter_token_latency_seconds_count 20
+sglang:e2e_request_latency_seconds_sum 2.36
+sglang:e2e_request_latency_seconds_count 10
+sglang:queue_time_seconds_sum 0.78
+sglang:queue_time_seconds_count 10
+sglang:prompt_tokens_histogram_sum 1722
+sglang:prompt_tokens_histogram_count 1
+sglang:generation_tokens_histogram_sum 100
+sglang:generation_tokens_histogram_count 1
+`
+	s.scrapeBody(parsePromText([]byte(prime)))
+	// Same ~2.2s window as the vLLM test (rewind 2s + 200ms of wall clock).
+	rewindBaselines(s, 2*time.Second)
+	time.Sleep(200 * time.Millisecond)
+
+	body := `
+sglang:num_running_reqs{tp_rank="0"} 8
+sglang:num_running_reqs{tp_rank="1"} 8
+sglang:num_queue_reqs{tp_rank="0"} 3
+sglang:num_queue_reqs{tp_rank="1"} 3
+sglang:token_usage{tp_rank="0"} 0.7
+sglang:token_usage{tp_rank="1"} 0.7
+sglang:full_token_usage{tp_rank="0"} 0.6
+sglang:swa_token_usage{tp_rank="0"} 0.25
+sglang:mamba_usage{tp_rank="0"} 0.1
+sglang:num_used_tokens{tp_rank="0"} 120000
+sglang:max_total_num_tokens{tp_rank="0"} 160000
+sglang:kv_available_tokens{tp_rank="0"} 20000
+sglang:kv_evictable_tokens{tp_rank="0"} 5000
+sglang:mamba_used_tokens{tp_rank="0"} 1000
+sglang:mamba_available_tokens{tp_rank="0"} 3000
+sglang:mamba_evictable_tokens{tp_rank="0"} 500
+sglang:num_retracted_reqs{tp_rank="0"} 2
+sglang:cache_hit_rate{tp_rank="0"} 0.42
+sglang:max_running_requests_under_SLO{tp_rank="0"} 64
+sglang:context_len{tp_rank="0"} 131072
+sglang:kv_cache_memory_usage_gb{tp_rank="0"} 30.5
+sglang:weight_memory_usage_gb{tp_rank="0"} 20.2
+sglang:hicache_host_used_tokens{tp_rank="0"} 4000
+sglang:hicache_host_total_tokens{tp_rank="0"} 8000
+sglang:num_retracted_input_tokens_total{tp_rank="0"} 500
+sglang:num_aborted_requests_total{tp_rank="0"} 11
+sglang:num_requests_total{is_streaming="true",tp_rank="0"} 300
+sglang:num_requests_total{is_streaming="false",tp_rank="0"} 200
+sglang:prompt_tokens_total{is_streaming="true",tp_rank="0"} 5000
+sglang:prompt_tokens_total{is_streaming="false",tp_rank="0"} 5000
+sglang:generation_tokens_total{is_streaming="true",tp_rank="0"} 3000
+sglang:generation_tokens_total{is_streaming="false",tp_rank="0"} 3000
+sglang:realtime_tokens_total{tp_rank="0",mode="prefill_compute"} 4400
+sglang:realtime_tokens_total{tp_rank="1",mode="prefill_compute"} 4400
+sglang:realtime_tokens_total{tp_rank="0",mode="prefill_cache"} 2100
+sglang:realtime_tokens_total{tp_rank="1",mode="prefill_cache"} 2100
+sglang:realtime_tokens_total{tp_rank="0",mode="decode"} 9000
+sglang:realtime_tokens_total{tp_rank="1",mode="decode"} 9000
+sglang:time_to_first_token_seconds_sum{is_streaming="true"} 1.78
+sglang:time_to_first_token_seconds_count{is_streaming="true"} 2
+sglang:time_to_first_token_seconds_sum{is_streaming="false"} 0.75
+sglang:time_to_first_token_seconds_count{is_streaming="false"} 3
+sglang:inter_token_latency_seconds_sum 6.24
+sglang:inter_token_latency_seconds_count 40
+sglang:e2e_request_latency_seconds_sum 4.96
+sglang:e2e_request_latency_seconds_count 20
+sglang:queue_time_seconds_sum 1.78
+sglang:queue_time_seconds_count 30
+sglang:prompt_tokens_histogram_sum 4667
+sglang:prompt_tokens_histogram_count 4
+sglang:generation_tokens_histogram_sum 280
+sglang:generation_tokens_histogram_count 3
+`
+	s.scrapeBody(parsePromText([]byte(body)))
+	v := s.view
+
+	if v.Status != "ok" || v.Engine != "sglang" {
+		t.Fatalf("status/engine = %q/%q, want ok/sglang", v.Status, v.Engine)
+	}
+	if v.Running != 8 || v.Waiting != 3 || v.KVPct != 70 {
+		t.Errorf("core gauges = %v/%v/%v, want 8/3/70 (max across ranks)", v.Running, v.Waiting, v.KVPct)
+	}
+	// Pool pcts (×100).
+	wantNear(t, deref64f(v.FullPct, "fullPct", t), 60, "fullPct")
+	wantNear(t, deref64f(v.SwaPct, "swaPct", t), 25, "swaPct")
+	wantNear(t, deref64f(v.MambaPct, "mambaPct", t), 10, "mambaPct")
+	// Pool token stats (MAX across ranks).
+	wantNear(t, deref64f(v.KVUsedTok, "kvUsedTok", t), 120000, "kvUsedTok")
+	wantNear(t, deref64f(v.KVCapTok, "kvCapTok", t), 160000, "kvCapTok")
+	wantNear(t, deref64f(v.KVFreeTok, "kvFreeTok", t), 20000, "kvFreeTok")
+	wantNear(t, deref64f(v.KVEvictTok, "kvEvictTok", t), 5000, "kvEvictTok")
+	wantNear(t, deref64f(v.MambaUsedTok, "mambaUsedTok", t), 1000, "mambaUsedTok")
+	wantNear(t, deref64f(v.MambaCapTok, "mambaCapTok", t), 4500, "mambaCapTok") // used+avail+evict
+	wantNear(t, deref64f(v.HiCacheHostUsedTok, "hicacheHostUsedTok", t), 4000, "hicacheHostUsedTok")
+	wantNear(t, deref64f(v.HiCacheHostCapTok, "hicacheHostCapTok", t), 8000, "hicacheHostCapTok")
+	// Retraction.
+	wantNear(t, deref64f(v.Retracted, "retracted", t), 2, "retracted")
+	wantNear(t, deref64f(v.RetractedTokS, "retractedTokS", t), 182, "retractedTokS") // (500-100)/~2.2s
+	if got := deref64i(v.AbortedTotal, "abortedTotal", t); got != 11 {
+		t.Errorf("abortedTotal = %d, want 11", got)
+	}
+	// Streaming splits + lifetime sums (both is_streaming summed).
+	if got := deref64i(v.StreamDoneTotal, "streamDoneTotal", t); got != 300 {
+		t.Errorf("streamDoneTotal = %d, want 300", got)
+	}
+	if got := deref64i(v.NonStreamDoneTotal, "nonStreamDoneTotal", t); got != 200 {
+		t.Errorf("nonStreamDoneTotal = %d, want 200", got)
+	}
+	if v.ReqDoneTotal != 500 {
+		t.Errorf("reqDoneTotal = %d, want 500 (stream+nonStream)", v.ReqDoneTotal)
+	}
+	if got := deref64i(v.PromptTokTotal, "promptTokTotal", t); got != 10000 {
+		t.Errorf("promptTokTotal = %d, want 10000 (Σ is_streaming)", got)
+	}
+	if got := deref64i(v.GenTokTotal, "genTokTotal", t); got != 6000 {
+		t.Errorf("genTokTotal = %d, want 6000", got)
+	}
+	if v.PreemptedTotal != nil {
+		t.Errorf("preemptedTotal = %v, want nil (vLLM-only)", v.PreemptedTotal)
+	}
+	if v.FinReasons != nil {
+		t.Errorf("finReasons = %v, want nil (vLLM-only)", v.FinReasons)
+	}
+	// Hit rate gauge (fraction).
+	if v.HitRate < 0.41 || v.HitRate > 0.43 {
+		t.Errorf("hitRate = %v, want ~0.42", v.HitRate)
+	}
+	// Rates over the ~2.2s interval: prefill = compute+cache summed across
+	// both ranks = (4400-2100)×2 + (2100-500)×2 = 7800 tok;
+	// decode = (9000-1000)×2 = 16000 tok.
+	wantNear(t, v.PrefillTokS, 3545, "prefillTokS") // 7800/2.2
+	wantNear(t, v.DecodeTokS, 7273, "decodeTokS")   // 16000/2.2
+	// is_streaming-split TTFT means must be distinct; blended is a mix.
+	stream := deref64f(v.TTFTStreamMs, "ttftStreamMs", t)
+	nonStream := deref64f(v.TTFTNonStreamMs, "ttftNonStreamMs", t)
+	wantNear(t, stream, 1000, "ttftStreamMs")      // (1.78-0.78)/(2-1) s
+	wantNear(t, nonStream, 150, "ttftNonStreamMs") // (0.75-0.45)/(3-1) s
+	if math.Abs(stream-nonStream) < 1 {
+		t.Errorf("ttft stream/nonstream = %v/%v, want distinct per-label means", stream, nonStream)
+	}
+	wantNear(t, v.TTFTms, 433, "ttftMs (blended)") // (2.53-1.23)/(5-2) s
+	wantNear(t, v.ITLms, 240, "itlMs")             // (6.24-1.44)/(40-20) s
+	wantNear(t, v.E2EMs, 260, "e2eMs")             // (4.96-2.36)/(20-10) s
+	wantNear(t, v.QueueMs, 50, "queueMs")          // (1.78-0.78)/(30-10) s
+	// Raw token histogram means (NOT ms-converted).
+	wantNear(t, v.MeanPromptTok, 981.67, "meanPromptTok") // (4667-1722)/(4-1)
+	wantNear(t, v.MeanGenTok, 90, "meanGenTok")           // (280-100)/(3-1)
+	// Capacity + memory.
+	wantNear(t, deref64f(v.SLOCap, "sloCap", t), 64, "sloCap")
+	wantNear(t, deref64f(v.CTXLen, "ctxLen", t), 131072, "ctxLen")
+	wantNear(t, deref64f(v.KVMemGB, "kvMemGB", t), 30.5, "kvMemGB")
+	wantNear(t, deref64f(v.WeightMemGB, "weightMemGB", t), 20.2, "weightMemGB")
+	// vLLM-only fields must be nil on SGLang.
+	if v.WaitCap != nil || v.WaitDefer != nil {
+		t.Errorf("sglang waitCap/waitDefer = %v/%v, want nil", v.WaitCap, v.WaitDefer)
+	}
+	if v.PrefillMs != nil || v.DecodeMs != nil || v.PerTokMs != nil {
+		t.Errorf("sglang per-stage ms = %v/%v/%v, want nil (vLLM-only)", v.PrefillMs, v.DecodeMs, v.PerTokMs)
+	}
+	if v.HitQueriesTotal != nil || v.MmQueriesTotal != nil {
+		t.Errorf("sglang cache totals non-nil: %v/%v", v.HitQueriesTotal, v.MmQueriesTotal)
+	}
+}
+
 // frame mirrors the live metrics contract frame (field names, not types).
 type frame struct {
 	T        int64                  `json:"t"`
@@ -891,13 +1276,57 @@ type frame_backends_entry struct {
 	BytesOutTotal   int64   `json:"bytesOutTotal"`
 	TokEstTotal     int64   `json:"tokEstTotal"`
 	Engine          struct {
-		Running     float64 `json:"running"`
-		Waiting     float64 `json:"waiting"`
-		KVPct       float64 `json:"kvPct"`
-		PrefillTokS float64 `json:"prefillTokS"`
-		DecodeTokS  float64 `json:"decodeTokS"`
-		TTFTms      float64 `json:"ttftMs"`
-		Status      string  `json:"status"`
+		Status             string           `json:"status"`
+		Engine             string           `json:"engine"`
+		Running            float64          `json:"running"`
+		Waiting            float64          `json:"waiting"`
+		KVPct              float64          `json:"kvPct"`
+		HitRate            float64          `json:"hitRate"`
+		PrefillTokS        float64          `json:"prefillTokS"`
+		PrefillCacheTokS   float64          `json:"prefillCacheTokS"`
+		DecodeTokS         float64          `json:"decodeTokS"`
+		TTFTms             float64          `json:"ttftMs"`
+		ITLms              float64          `json:"itlMs"`
+		E2EMs              float64          `json:"e2eMs"`
+		QueueMs            float64          `json:"queueMs"`
+		PrefillMs          *float64         `json:"prefillMs"`
+		DecodeMs           *float64         `json:"decodeMs"`
+		PerTokMs           *float64         `json:"perTokMs"`
+		MeanPromptTok      float64          `json:"meanPromptTok"`
+		MeanGenTok         float64          `json:"meanGenTok"`
+		WaitCap            *float64         `json:"waitCap"`
+		WaitDefer          *float64         `json:"waitDefer"`
+		Retracted          *float64         `json:"retracted"`
+		RetractedTokS      *float64         `json:"retractedTokS"`
+		FullPct            *float64         `json:"fullPct"`
+		SwaPct             *float64         `json:"swaPct"`
+		MambaPct           *float64         `json:"mambaPct"`
+		KVUsedTok          *float64         `json:"kvUsedTok"`
+		KVCapTok           *float64         `json:"kvCapTok"`
+		KVFreeTok          *float64         `json:"kvFreeTok"`
+		KVEvictTok         *float64         `json:"kvEvictTok"`
+		MambaUsedTok       *float64         `json:"mambaUsedTok"`
+		MambaCapTok        *float64         `json:"mambaCapTok"`
+		HiCacheHostUsedTok *float64         `json:"hicacheHostUsedTok"`
+		HiCacheHostCapTok  *float64         `json:"hicacheHostCapTok"`
+		TTFTStreamMs       *float64         `json:"ttftStreamMs"`
+		TTFTNonStreamMs    *float64         `json:"ttftNonStreamMs"`
+		KVMemGB            *float64         `json:"kvMemGB"`
+		WeightMemGB        *float64         `json:"weightMemGB"`
+		SLOCap             *float64         `json:"sloCap"`
+		CTXLen             *float64         `json:"ctxLen"`
+		PreemptedTotal     *int64           `json:"preemptedTotal"`
+		AbortedTotal       *int64           `json:"abortedTotal"`
+		StreamDoneTotal    *int64           `json:"streamDoneTotal"`
+		NonStreamDoneTotal *int64           `json:"nonStreamDoneTotal"`
+		PromptTokTotal     *int64           `json:"promptTokTotal"`
+		GenTokTotal        *int64           `json:"genTokTotal"`
+		HitQueriesTotal    *int64           `json:"hitQueriesTotal"`
+		HitHitsTotal       *int64           `json:"hitHitsTotal"`
+		MmQueriesTotal     *int64           `json:"mmQueriesTotal"`
+		MmHitsTotal        *int64           `json:"mmHitsTotal"`
+		ReqDoneTotal       int64            `json:"reqDoneTotal"`
+		FinReasons         map[string]int64 `json:"finReasons"`
 	} `json:"engine"`
 }
 
@@ -1416,4 +1845,392 @@ func lastTokInt(b struct {
 	} `json:"requests"`
 }) int {
 	return b.Requests[len(b.Requests)-1].NewTokensEst
+}
+
+// ---------------------------------------------------------------------------
+// Sessions (live stack + conversation view)
+// ---------------------------------------------------------------------------
+
+var hex12 = regexp.MustCompile(`^[0-9a-f]{12}$`)
+
+func sessById(t *testing.T, f sessionsFeed, id string) *sessFrame {
+	t.Helper()
+	for i := range f.Sessions {
+		if f.Sessions[i].ID == id {
+			return &f.Sessions[i]
+		}
+	}
+	t.Fatalf("session %q not in feed: %+v", id, f.Sessions)
+	return nil
+}
+
+func TestSessions_Grouping(t *testing.T) {
+	// Same conversation prefix, different last message → same key.
+	a := &parsedBody{Messages: []rawMessage{
+		{Content: json.RawMessage(`"hi"`)},
+		{Content: json.RawMessage(`"what is up"`)},
+	}}
+	b := &parsedBody{Messages: []rawMessage{
+		{Content: json.RawMessage(`"hi"`)},
+		{Content: json.RawMessage(`"completely different question"`)},
+	}}
+	ka, kb := sessionKeyFor(a), sessionKeyFor(b)
+	if ka == "" || !hex12.MatchString(ka) {
+		t.Fatalf("key = %q, want 12-hex", ka)
+	}
+	if ka != kb {
+		t.Errorf("keys differ for same prefix: %q vs %q", ka, kb)
+	}
+	// Different first message → different key.
+	c := &parsedBody{Messages: []rawMessage{
+		{Content: json.RawMessage(`"hello there"`)},
+		{Content: json.RawMessage(`"what is up"`)},
+	}}
+	if kc := sessionKeyFor(c); kc == ka {
+		t.Errorf("different first message produced same key %q", kc)
+	}
+	// Single message uses itself as the prefix.
+	d := &parsedBody{Messages: []rawMessage{{Content: json.RawMessage(`"hi"`)}}}
+	// Per the identity rule (prefix = all-but-last, single message uses
+	// itself), a one-message chat "hi" and the FIRST turn of a 2-turn chat
+	// "hi" share the same prefix → same key. The fork happens at turn 2.
+	if kd := sessionKeyFor(d); kd != ka {
+		t.Errorf("single-message prefix key = %q, want same as 2-turn first-turn key %q", kd, ka)
+	}
+	// Turn 2 of that chat forks a NEW session: prefix is now both messages.
+	e2 := &parsedBody{Messages: []rawMessage{
+		{Content: json.RawMessage(`"hi"`)},
+		{Content: json.RawMessage(`"second"`)},
+		{Content: json.RawMessage(`"third"`)},
+	}}
+	if k2 := sessionKeyFor(e2); k2 == ka {
+		t.Errorf("3-turn prefix collided with 1-turn key: %q", k2)
+	}
+	// Completions (prompt only, no messages) → no session.
+	e := &parsedBody{Prompt: json.RawMessage(`"write a poem"`)}
+	if ke := sessionKeyFor(e); ke != "" {
+		t.Errorf("completions key = %q, want empty (no session)", ke)
+	}
+}
+
+func TestSessions_LiveFinishFlow(t *testing.T) {
+	r := newSessionRegistry()
+
+	id := r.start("b1", "/v1/chat/completions", true, "abcdef012345", 100, 40)
+	f := r.feed()
+	if len(f.Live) != 1 {
+		t.Fatalf("live = %d, want 1", len(f.Live))
+	}
+	l := f.Live[0]
+	if l.ID != id || l.Sess != "abcdef012345" || l.Backend != "b1" ||
+		l.Path != "/v1/chat/completions" || !l.Stream || l.Phase != "admitted" ||
+		l.CtxTok != 100 || l.NewTok != 40 {
+		t.Errorf("live entry = %+v, want admitted stream req", l)
+	}
+	if s := sessById(t, f, "abcdef012345"); s.LiveN != 1 || !s.Active || s.N != 0 {
+		t.Errorf("session while live = %+v, want liveN=1 active n=0", s)
+	}
+
+	r.firstByte(id)
+	f = r.feed()
+	if len(f.Live) != 1 || f.Live[0].Phase != "streaming" {
+		t.Fatalf("phase after firstByte = %q, want streaming", f.Live[0].Phase)
+	}
+
+	// finish: 200 streaming, dur 2000ms, ttft 150ms, 800 bytes out.
+	r.finish(id, 200, 2000, 150, 800)
+	f = r.feed()
+	if len(f.Live) != 0 {
+		t.Fatalf("live after finish = %d, want 0", len(f.Live))
+	}
+	s := sessById(t, f, "abcdef012345")
+	if s.N != 1 || s.LiveN != 0 || s.LastStatus != 200 {
+		t.Errorf("session after finish = %+v, want n=1 liveN=0 status=200", s)
+	}
+	if s.CtxTok != 100 || s.NewTok != 40 || s.CachedTok != 60 {
+		t.Errorf("tokens = ctx %d new %d cached %d, want 100/40/60", s.CtxTok, s.NewTok, s.CachedTok)
+	}
+	if s.TokOutTotal != 200 { // 800 bytes / 4
+		t.Errorf("tokOutTotal = %d, want 200", s.TokOutTotal)
+	}
+	if math.Abs(s.AvgTTFTMs-150) > 0.001 {
+		t.Errorf("avgTTFTMs = %v, want 150", s.AvgTTFTMs)
+	}
+	if math.Abs(s.TotalDurS-2) > 0.001 {
+		t.Errorf("totalDurS = %v, want 2", s.TotalDurS)
+	}
+	if s.Reqs == nil || len(s.Reqs) != 1 {
+		t.Fatalf("reqs = %+v, want 1 entry (active+recent+top20)", s.Reqs)
+	}
+	q := s.Reqs[0]
+	if q.Status != 200 || !q.Stream || q.CtxTok != 100 || q.NewTok != 40 ||
+		q.CachedTok != 60 || q.TokOut != 200 {
+		t.Errorf("req = %+v, want 200 stream ctx100/new40/cached60/tokOut200", q)
+	}
+	if math.Abs(q.DurMs-2000) > 0.001 || math.Abs(q.TTFTms-150) > 0.001 {
+		t.Errorf("req dur/ttft = %v/%v, want 2000/150", q.DurMs, q.TTFTms)
+	}
+	if math.Abs(q.TokS-100) > 0.001 {
+		t.Errorf("req tokS = %v, want 100 (200 tok / 2s)", q.TokS)
+	}
+
+	// A rejection for the same conversation: n=2, 429 in reqs (oldest first).
+	r.finishRejection("b1", "/v1/chat/completions", "abcdef012345", 100, 40, 429, 12.5)
+	f = r.feed()
+	s = sessById(t, f, "abcdef012345")
+	if s.N != 2 {
+		t.Fatalf("n after rejection = %d, want 2", s.N)
+	}
+	if len(s.Reqs) != 2 || s.Reqs[0].Status != 200 || s.Reqs[1].Status != 429 {
+		t.Errorf("reqs order = %+v, want [200, 429] oldest first", s.Reqs)
+	}
+	if s.LastStatus != 429 {
+		t.Errorf("lastStatus = %d, want 429 (rejection is latest)", s.LastStatus)
+	}
+	// The streaming-only TTFT avg must not be polluted by the rejection.
+	if math.Abs(s.AvgTTFTMs-150) > 0.001 {
+		t.Errorf("avgTTFTMs = %v, want 150 (rejection has no ttft)", s.AvgTTFTMs)
+	}
+
+	// A second request under the SAME key → same session id, n=3.
+	id2 := r.start("b1", "/v1/chat/completions", true, "abcdef012345", 130, 20)
+	f = r.feed()
+	s = sessById(t, f, "abcdef012345")
+	if s.LiveN != 1 {
+		t.Errorf("liveN after 2nd start = %d, want 1", s.LiveN)
+	}
+	// ctx/newTok track the LATEST request.
+	if s.CtxTok != 130 || s.NewTok != 20 {
+		t.Errorf("ctx/new = %d/%d, want 130/20 (latest request)", s.CtxTok, s.NewTok)
+	}
+	r.finish(id2, 200, 1000, 0, 400) // non-stream ttft 0 → avg unchanged
+
+	// A different key → a NEW session.
+	other := "999999999999"
+	r.finishRejection("b1", "/v1/chat/completions", other, 50, 10, 429, 1)
+	f = r.feed()
+	if len(f.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want 2 (distinct keys)", len(f.Sessions))
+	}
+	o := sessById(t, f, other)
+	if o.N != 1 || o.Backend != "b1" {
+		t.Errorf("other session = %+v, want n=1 b1", o)
+	}
+
+	// Non-chat requests: sess "" — never in the session list.
+	nc := r.start("b1", "/v1/completions", false, "", 7, 3)
+	r.finish(nc, 200, 500, 0, 100)
+	f = r.feed()
+	if len(f.Sessions) != 2 {
+		t.Errorf("sessions after non-chat = %d, want 2 (non-chat excluded)", len(f.Sessions))
+	}
+}
+
+func TestSessions_Caps(t *testing.T) {
+	r := newSessionRegistry()
+	// 105 starts: live ordering must be startMs ascending (oldest on top)
+	// and the feed must respect the 256 cap (all 105 fit here).
+	ids := make([]uint64, 0, 105)
+	for range 105 {
+		ids = append(ids, r.start("b1", "/v1/chat/completions", false, "", 1, 1))
+	}
+	f := r.feed()
+	if len(f.Live) != 105 {
+		t.Fatalf("live = %d, want 105 (under the 256 feed cap)", len(f.Live))
+	}
+	for i := 1; i < len(f.Live); i++ {
+		if f.Live[i].StartMs < f.Live[i-1].StartMs {
+			t.Fatalf("live not startMs ASC at %d: %d < %d", i, f.Live[i].StartMs, f.Live[i-1].StartMs)
+		}
+	}
+	if f.Live[0].ID != ids[0] {
+		t.Errorf("oldest on top: live[0].ID = %d, want %d", f.Live[0].ID, ids[0])
+	}
+
+	// reqs-inclusion rule: 3 sessions, only the active/recent one carries
+	// non-nil reqs. S3 completed long ago (its lastMs is old, no live).
+	k3 := "c33c33c33c33"
+	id3 := r.start("b1", "/v1/chat/completions", true, k3, 10, 5)
+	r.finish(id3, 200, 100, 50, 200)
+	// Backdate S3 well past the 60s reqs window.
+	r.mu.Lock()
+	r.sessions[k3].LastMs = time.Now().Add(-10 * time.Minute).UnixMilli()
+	r.mu.Unlock()
+
+	k1 := "c11c11c11c11"
+	id1 := r.start("b1", "/v1/chat/completions", true, k1, 10, 5)
+	r.finish(id1, 200, 100, 50, 200) // recent → reqs included
+	time.Sleep(10 * time.Millisecond)
+	k2 := "c22c22c22c22"
+	id2 := r.start("b1", "/v1/chat/completions", true, k2, 10, 5) // stays live
+	_ = id2
+	id2b := r.start("b1", "/v1/chat/completions", true, k2, 10, 5)
+	// S2 has a completed req (recent lastMs, newer than S1) AND a live
+	// request → active and most recent → sorts first.
+	r.finish(id2b, 200, 100, 50, 200)
+
+	f = r.feed()
+	s1 := sessById(t, f, k1)
+	s2 := sessById(t, f, k2)
+	s3 := sessById(t, f, k3)
+	if s1.Reqs == nil {
+		t.Errorf("s1 reqs = nil, want non-nil (recent, within 60s)")
+	}
+	if s2.Reqs == nil {
+		t.Errorf("s2 reqs = nil, want non-nil (live request present)")
+	}
+	if s3.Reqs != nil {
+		t.Errorf("s3 reqs = %+v, want nil (lastMs older than 60s window)", s3.Reqs)
+	}
+	// Sort: active (s2, liveN>0) first, then by lastMs desc.
+	if f.Sessions[0].ID != k2 {
+		t.Errorf("sessions[0] = %s, want %s (active first)", f.Sessions[0].ID, k2)
+	}
+	if f.Sessions[1].ID != k1 {
+		t.Errorf("sessions[1] = %s, want %s (most recent lastMs)", f.Sessions[1].ID, k1)
+	}
+	if f.Sessions[2].ID != k3 {
+		t.Errorf("sessions[2] = %s, want %s (least recent)", f.Sessions[2].ID, k3)
+	}
+	if !s2.Active || !s1.Active || s3.Active {
+		t.Errorf("active flags: s2=%v s1=%v s3=%v, want true/true/false", s2.Active, s1.Active, s3.Active)
+	}
+	if s2.LiveN != 1 {
+		t.Errorf("s2 liveN = %d, want 1 (id2 still in-flight)", s2.LiveN)
+	}
+	// Live stack: 105 + id2 (id3/id1/id2b all finished). Ordering ASC.
+	if len(f.Live) != 106 {
+		t.Fatalf("live = %d, want 106", len(f.Live))
+	}
+	for i := 1; i < len(f.Live); i++ {
+		if f.Live[i].StartMs < f.Live[i-1].StartMs {
+			t.Fatalf("live not startMs ASC at %d", i)
+		}
+	}
+}
+
+func TestSessions_FeedJSON(t *testing.T) {
+	r := newSessionRegistry()
+	saveSessions := sessions
+	sessions = r
+	t.Cleanup(func() { sessions = saveSessions })
+
+	srv := httptest.NewServer(buildMux())
+	defer srv.Close()
+
+	// A chat request (12-hex session) and a non-chat request (sess "").
+	a := &parsedBody{Messages: []rawMessage{{Content: json.RawMessage(`"ping"`)}}}
+	ka := sessionKeyFor(a)
+	idA := sessions.start("b1", "/v1/chat/completions", true, ka, 200, 50)
+	idB := sessions.start("b1", "/v1/completions", false, "", 10, 5)
+	_ = idB
+	time.Sleep(10 * time.Millisecond)
+	sessions.firstByte(idA)
+
+	resp, err := http.Get(srv.URL + "/metrics/sessions")
+	if err != nil {
+		t.Fatalf("sessions request: %v", err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var out struct {
+		T    int64 `json:"t"`
+		Live []struct {
+			ID      uint64 `json:"id"`
+			Sess    string `json:"sess"`
+			Backend string `json:"backend"`
+			Path    string `json:"path"`
+			Stream  bool   `json:"stream"`
+			Phase   string `json:"phase"`
+			StartMs int64  `json:"startMs"`
+			CtxTok  int    `json:"ctxTok"`
+			NewTok  int    `json:"newTok"`
+		} `json:"live"`
+		Sessions []struct {
+			ID          string  `json:"id"`
+			Backend     string  `json:"backend"`
+			N           int     `json:"n"`
+			FirstMs     int64   `json:"firstMs"`
+			LastMs      int64   `json:"lastMs"`
+			Active      bool    `json:"active"`
+			LiveN       int     `json:"liveN"`
+			CtxTok      int     `json:"ctxTok"`
+			NewTok      int     `json:"newTok"`
+			CachedTok   int     `json:"cachedTok"`
+			AvgTTFTMs   float64 `json:"avgTTFTMs"`
+			TotalDurS   float64 `json:"totalDurS"`
+			TokOutTotal int64   `json:"tokOutTotal"`
+			LastStatus  int     `json:"lastStatus"`
+			Reqs        []struct {
+				TMs       int64   `json:"tMs"`
+				Status    int     `json:"status"`
+				Stream    bool    `json:"stream"`
+				DurMs     float64 `json:"durMs"`
+				TTFTms    float64 `json:"ttftMs"`
+				CtxTok    int     `json:"ctxTok"`
+				NewTok    int     `json:"newTok"`
+				CachedTok int     `json:"cachedTok"`
+				TokOut    int     `json:"tokOut"`
+				TokS      float64 `json:"tokS"`
+			} `json:"reqs"`
+		} `json:"sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("sessions decode: %v", err)
+	}
+	if d := time.Now().UnixMilli() - out.T; d < 0 || d > 5000 {
+		t.Errorf("t = %d, want near now (%d)", out.T, time.Now().UnixMilli())
+	}
+	if len(out.Live) != 2 {
+		t.Fatalf("live = %d, want 2", len(out.Live))
+	}
+	// live sorted startMs ASC.
+	if out.Live[0].StartMs > out.Live[1].StartMs {
+		t.Errorf("live order = %d then %d, want ASC", out.Live[0].StartMs, out.Live[1].StartMs)
+	}
+	// Chat session: 12-hex id, streaming phase after firstByte, est tokens.
+	chatIdx, nonChatIdx := -1, -1
+	for i := range out.Live {
+		switch out.Live[i].Sess {
+		case ka:
+			chatIdx = i
+		case "":
+			nonChatIdx = i
+		}
+	}
+	if chatIdx < 0 || nonChatIdx < 0 {
+		t.Fatalf("live entries missing chat/non-chat; got %+v", out.Live)
+	}
+	chat, nonChat := out.Live[chatIdx], out.Live[nonChatIdx]
+	if !hex12.MatchString(chat.Sess) {
+		t.Errorf("chat sess = %q, want 12-hex", chat.Sess)
+	}
+	if chat.Phase != "streaming" {
+		t.Errorf("chat phase = %q, want streaming (firstByte fired)", chat.Phase)
+	}
+	if chat.CtxTok != 200 {
+		t.Errorf("chat ctxTok = %d, want 200", chat.CtxTok)
+	}
+	if nonChat.Sess != "" {
+		t.Errorf("non-chat sess = %q, want empty", nonChat.Sess)
+	}
+	// sessions: only the chat one (non-chat never creates a session).
+	if len(out.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1 (non-chat excluded)", len(out.Sessions))
+	}
+	sj := out.Sessions[0]
+	if sj.ID != ka || !sj.Active || sj.LiveN != 1 {
+		t.Errorf("session = %+v, want id=%s active liveN=1", sj, ka)
+	}
+	if sj.CtxTok != 200 || sj.NewTok != 50 || sj.CachedTok != 150 {
+		t.Errorf("session tokens = %d/%d/%d, want 200/50/150", sj.CtxTok, sj.NewTok, sj.CachedTok)
+	}
+	// A live session has no completed reqs yet: reqs is an empty slice (the
+	// session is active+recent+top20) — but N=0 means nothing was appended,
+	// so the ring is empty and the JSON is [] not null.
+	if sj.Reqs == nil {
+		t.Errorf("session reqs = null, want [] (active+recent, no completions yet)")
+	}
 }
