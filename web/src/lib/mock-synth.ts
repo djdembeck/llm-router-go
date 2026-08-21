@@ -471,6 +471,12 @@ function engineV2(i: number): EngineMetrics {
     kvCapTok: sg ? e.kvCapTok : null,
     kvFreeTok: sg ? e.kvCapTok - e.kvUsedTok : null,
     kvEvictTok: sg ? Math.round(e.kvUsedTok * 0.06) : null,
+    kvHeldPct: sg
+      ? Math.round(
+          (100 * (e.kvUsedTok * 0.06)) /
+            Math.max(1, e.kvCapTok - e.kvUsedTok + e.kvUsedTok * 0.06),
+        )
+      : null,
     mambaUsedTok: sg ? e.mambaUsedTok : null,
     mambaCapTok: sg ? e.mambaCapTok : null,
     hicacheHostUsedTok: null,
@@ -608,6 +614,15 @@ const LONE_LIVE = [
   newTok: Math.round(100 + Math.random() * 900),
 }));
 
+// A deterministic large-cold-prefill cycle that exercises the prefill
+// progress card: one live request with newTok ≥ 8192 every ~20s. Admitted
+// for the first 6s (bar fills against the est prefill duration), then
+// flipped to streaming (streamMs set) for one cycle before looping.
+const PREFILL_PERIOD_MS = 20000;
+const PREFILL_ADMIT_MS = 6000;
+const PREFILL_TOKENS = 32000;
+let prefillCycleId = 9000;
+
 const convReqs = (c: MockConv): SessionReq[] =>
   c.turns.map((t) => ({
     tMs: Math.round(t.tMs),
@@ -621,6 +636,25 @@ const convReqs = (c: MockConv): SessionReq[] =>
     tokOut: t.tokOut,
     tokS: t.durMs > 0 ? +(t.tokOut / (t.durMs / 1000)).toFixed(1) : 0,
   }));
+
+// est prefill duration for a live entry (mirrors the router: 0 for
+// non-streaming, else newTok at the mock's 10k tok/s); streamMs: 0 while
+// admitted, first-byte wall time once streaming.
+const liveFields = (l: {
+  stream: boolean;
+  streamMs: number;
+  startMs: number;
+  newTok: number;
+}): Pick<LiveReq, "estPrefillMs" | "streamMs"> => {
+  const streaming = l.streamMs > 0;
+  return {
+    estPrefillMs:
+      l.stream && l.newTok > 0
+        ? Math.round((l.newTok / 10000) * 1000)
+        : 0,
+    streamMs: streaming ? l.streamMs : 0,
+  };
+};
 
 /** Build the simulated session feed (same walk state as the frame feed). */
 export function synthSessions(nowMs: number): SessionsFeed {
@@ -654,34 +688,69 @@ export function synthSessions(nowMs: number): SessionsFeed {
   const live: LiveReq[] = [];
   for (const c of CONVS) {
     if (c.liveStart !== null) {
+      const streaming = nowMs - c.liveStart > 3500;
       live.push({
         id: ++liveReqId,
         sess: c.id,
         backend: c.backend,
         path: "/v1/chat/completions",
         stream: true,
-        phase: nowMs - c.liveStart > 3500 ? "streaming" : "admitted",
+        phase: streaming ? "streaming" : "admitted",
         startMs: c.liveStart,
         ctxTok: c.ctxTok,
         newTok: c.liveNewTok,
+        ...liveFields({
+          stream: true,
+          streamMs: streaming ? c.liveStart + 3500 : 0,
+          startMs: c.liveStart,
+          newTok: c.liveNewTok,
+        }),
       });
     }
   }
   for (const l of LONE_LIVE) {
     // lone requests loop: when they finish, restart a few seconds out
     if (nowMs - l.start > 18000) l.start = nowMs - 1000;
+    const streaming = nowMs - l.start > 3500;
     live.push({
       id: ++liveReqId,
       sess: "",
       backend: l.backend,
       path: l.path,
       stream: l.stream,
-      phase: nowMs - l.start > 3500 ? "streaming" : "admitted",
+      phase: streaming ? "streaming" : "admitted",
       startMs: l.start,
       ctxTok: l.ctxTok,
       newTok: l.newTok,
+      ...liveFields({
+        stream: l.stream,
+        streamMs: streaming ? l.start + 3500 : 0,
+        startMs: l.start,
+        newTok: l.newTok,
+      }),
     });
   }
+  // the large-cold-prefill cycle (deterministic period from T0)
+  const cycle = Math.floor((nowMs - T0) / PREFILL_PERIOD_MS);
+  const cycleStart = T0 + cycle * PREFILL_PERIOD_MS;
+  const prefillStreaming = nowMs - cycleStart >= PREFILL_ADMIT_MS;
+  live.push({
+    id: prefillCycleId + cycle,
+    sess: "",
+    backend: BACKENDS[cycle % BACKENDS.length].name,
+    path: "/v1/chat/completions",
+    stream: true,
+    phase: prefillStreaming ? "streaming" : "admitted",
+    startMs: cycleStart,
+    ctxTok: Math.round(PREFILL_TOKENS * 0.4),
+    newTok: PREFILL_TOKENS,
+    ...liveFields({
+      stream: true,
+      streamMs: prefillStreaming ? cycleStart + PREFILL_ADMIT_MS : 0,
+      startMs: cycleStart,
+      newTok: PREFILL_TOKENS,
+    }),
+  });
   live.sort((a, b) => a.startMs - b.startMs);
 
   const sessions = CONVS.map((c) => {

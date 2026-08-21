@@ -237,7 +237,11 @@ shows:
   query/hit totals.
 - **Memory pools** — full / SWA / Mamba pool usage % and pool token stats
   (used / capacity / free / evictable, Mamba used / capacity), host-tier
-  (HiCache) token usage, KV and weight memory (GB).
+  (HiCache) token usage, KV and weight memory (GB). The per-backend KV bar
+  shows total pool pressure: on SGLang it stacks live use (`kvPct`) plus the
+  prefix-cached **held** share (`kvHeldPct`, derived from the engine's
+  evictable/available gauges — cached KV stays held after a request ends);
+  vLLM's `kvPct` already counts cached blocks, so no held split is shown.
 - **Per-stage latency** — prefill / decode / queue / inter-token / end-to-end
   means (ms), plus the streaming vs non-streaming TTFT split and per-request
   mean prompt / generation token length.
@@ -272,6 +276,15 @@ mean streaming TTFT, total duration, total output tokens, and last status;
 recent sessions expand to their last 32 requests. All token figures here are
 **estimates** (body-based, ~4 bytes/token) — see the measurement boundary
 below — never measured decode tokens.
+
+The live stack additionally carries two prefill-progress fields per
+in-flight request: `estPrefillMs` (estimated prefill duration — `newTok`
+at `PREFILL_TOKENS_PER_SEC`, a router estimate, `0` for non-streaming
+requests) and `streamMs` (UnixMilli of the first response body byte, `0`
+while still admitted). The dashboard renders a prefill progress card for
+large cold prefills (estimated `newTok` ≥ 8192): a gold `est` progress bar
+that fills against `estPrefillMs` while the request is still admitted,
+flipping to a muted "streaming" line on first byte.
 
 ### Measurement boundary
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import PreFillCard from "./PreFillCard.svelte";
   import { clock, fmtCompact } from "./fmt.js";
   import type { SessionsFeed } from "./metrics.js";
 
@@ -7,22 +7,15 @@
   // and the conversation sessions, expandable to per-request rows. Every
   // token figure is a body-based estimate — the gold "est" label rides on
   // all of them. 429 = valley blue (capacity policy working), 5xx = red.
+  // The 1s wall clock (the elapsed/age columns and the prefill bars tick)
+  // is owned by the page and passed in — one timer per sheet.
 
   interface Props {
     feed: SessionsFeed | null;
+    now: number;
   }
 
-  let { feed }: Props = $props();
-
-  // 1s wall clock — the elapsed/age columns tick
-  let now = $state(Date.now());
-  let timer: ReturnType<typeof setInterval> | null = null;
-  onMount(() => {
-    timer = setInterval(() => (now = Date.now()), 1000);
-    return () => {
-      if (timer) clearInterval(timer);
-    };
-  });
+  let { feed, now }: Props = $props();
 
   let openId: string | null = $state(null);
 
@@ -64,6 +57,7 @@
       <div class="sess-hollow">no session feed</div>
     {:else}
       {#if feed.live.length > 0}
+        <PreFillCard live={feed.live} now={now} />
         <div class="sess-subhead">in flight — live</div>
         {#each feed.live as r (r.id)}
           <div class="sess-live sess-row">

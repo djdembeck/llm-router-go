@@ -728,6 +728,9 @@ vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 2
 	if first.KVPct != 60 {
 		t.Errorf("kvPct = %v, want 60 (max across engines)", first.KVPct)
 	}
+	if first.KVHeldPct != nil {
+		t.Errorf("kvHeldPct = %v, want nil (vLLM's kv_cache_usage_perc already includes cached blocks)", *first.KVHeldPct)
+	}
 	// ~2000 tokens over ~2s of real wall clock (wall-clock jitter ±1%).
 	if first.PrefillTokS < 980 || first.PrefillTokS > 1020 {
 		t.Errorf("prefillTokS = %v, want ~1000 (2000 tokens / ~2s)", first.PrefillTokS)
@@ -1150,6 +1153,8 @@ sglang:generation_tokens_histogram_count 3
 	wantNear(t, deref64f(v.KVCapTok, "kvCapTok", t), 160000, "kvCapTok")
 	wantNear(t, deref64f(v.KVFreeTok, "kvFreeTok", t), 20000, "kvFreeTok")
 	wantNear(t, deref64f(v.KVEvictTok, "kvEvictTok", t), 5000, "kvEvictTok")
+	// Held (prefix-cached) share of the hand-out pool: 100·5000/(20000+5000).
+	wantNear(t, deref64f(v.KVHeldPct, "kvHeldPct", t), 20, "kvHeldPct")
 	wantNear(t, deref64f(v.MambaUsedTok, "mambaUsedTok", t), 1000, "mambaUsedTok")
 	wantNear(t, deref64f(v.MambaCapTok, "mambaCapTok", t), 4500, "mambaCapTok") // used+avail+evict
 	wantNear(t, deref64f(v.HiCacheHostUsedTok, "hicacheHostUsedTok", t), 4000, "hicacheHostUsedTok")
@@ -2023,6 +2028,52 @@ func TestSessions_LiveFinishFlow(t *testing.T) {
 	f = r.feed()
 	if len(f.Sessions) != 2 {
 		t.Errorf("sessions after non-chat = %d, want 2 (non-chat excluded)", len(f.Sessions))
+	}
+}
+
+func TestSessions_PrefillProgress(t *testing.T) {
+	r := newSessionRegistry()
+
+	// newTok=20000 at the default 10000 tok/s → estPrefillMs = 2000.
+	id := r.start("b1", "/v1/chat/completions", true, "abcdef012345", 500, 20000)
+	f := r.feed()
+	if len(f.Live) != 1 {
+		t.Fatalf("live = %d, want 1", len(f.Live))
+	}
+	l := f.Live[0]
+	if l.Phase != "admitted" || l.StreamMs != 0 {
+		t.Errorf("admitted = phase %q streamMs %d, want admitted/0", l.Phase, l.StreamMs)
+	}
+	if l.EstPrefillMs < 1999 || l.EstPrefillMs > 2001 {
+		t.Errorf("estPrefillMs = %d, want 2000±1", l.EstPrefillMs)
+	}
+
+	// first byte: phase flips and streamMs becomes the wall timestamp.
+	r.firstByte(id)
+	f = r.feed()
+	l = f.Live[0]
+	if l.Phase != "streaming" {
+		t.Fatalf("phase after firstByte = %q, want streaming", l.Phase)
+	}
+	if l.StreamMs < l.StartMs || l.StreamMs > time.Now().UnixMilli() {
+		t.Errorf("streamMs = %d, want within [startMs %d, now]", l.StreamMs, l.StartMs)
+	}
+
+	// Non-streaming requests get no estimate (their first byte marks
+	// generation end, not prefill end).
+	ns := r.start("b1", "/v1/chat/completions", false, "", 100, 20000)
+	f = r.feed()
+	var nsFrame *sessLiveFrame
+	for i := range f.Live {
+		if f.Live[i].ID == ns {
+			nsFrame = &f.Live[i]
+		}
+	}
+	if nsFrame == nil {
+		t.Fatalf("non-streaming live entry missing")
+	}
+	if nsFrame.EstPrefillMs != 0 {
+		t.Errorf("non-streaming estPrefillMs = %d, want 0", nsFrame.EstPrefillMs)
 	}
 }
 

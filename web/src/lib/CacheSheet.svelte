@@ -40,6 +40,11 @@
         {@const eng = b.engine}
         {@const engOk = eng.status === "ok"}
         {@const kv = engOk && eng.kvPct > 0 ? eng.kvPct : null}
+        {@const held =
+          engOk && eng.kvHeldPct !== null
+            ? (eng.kvHeldPct / 100) * (100 - (kv ?? 0))
+            : null}
+        {@const kvTotal = kv !== null || held !== null ? (kv ?? 0) + (held ?? 0) : null}
         {@const mamba = engOk && eng.mambaPct !== null ? eng.mambaPct : null}
         {@const samples = hist[b.name] ?? []}
         <div class="cache-cell unskew">
@@ -54,13 +59,25 @@
                 <span
                   class="pool-bar"
                   role="img"
-                  aria-label="kv cache {kv !== null ? Math.round(kv) + '% used' : 'no data'}">
+                  aria-label={
+                    kvTotal === null
+                      ? "kv cache no data"
+                      : held !== null
+                        ? `kv cache ${Math.round(kv ?? 0)}% used, ${Math.round(held)}% held (cached)`
+                        : `kv cache ${Math.round(kv ?? 0)}% used (incl. cached)`
+                  }>
                   <i
-                    class="seg {kv !== null && kv >= 90 ? 'hot' : ''}"
+                    class="seg {kvTotal !== null && kvTotal >= 90 ? 'hot' : ''}"
                     style:transform={kv !== null ? `scaleX(${kv / 100})` : "scaleX(0)"}></i
-                ></span>
-                <span class="pool-val {kv !== null && kv >= 90 ? 'hot' : ''}"
-                  >{kv !== null ? Math.round(kv) + "%" : "—"}</span
+                  >
+                  {#if held !== null}
+                    <i class="seg held {kvTotal !== null && kvTotal >= 90 ? 'hot' : ''}" style:left={`${kv ?? 0}%`} style:transform={`scaleX(${held / 100})`}></i>
+                  {/if}
+                </span>
+                <span class="pool-val {kvTotal !== null && kvTotal >= 90 ? 'hot' : ''}"
+                  >{kvTotal !== null
+                    ? Math.round(kvTotal) + "%" + (held !== null && held > 0 ? ` <span class="held-sfx">· held ${Math.round(held)}%</span>` : "")
+                    : "—"}</span
                 >
               </div>
               {#if eng.swaPct !== null}
@@ -105,7 +122,10 @@
                   >pool <b>{fmtCompact(eng.kvUsedTok)}/{fmtCompact(eng.kvCapTok)}</b></span
                 >
               {/if}
-              {#if eng.kvEvictTok !== null && eng.kvEvictTok > 0}
+              {#if held !== null && eng.kvEvictTok !== null && eng.kvEvictTok > 0}
+                <span>held <b>{fmtCompact(eng.kvEvictTok)}</b></span>
+              {/if}
+              {#if held === null && eng.kvEvictTok !== null && eng.kvEvictTok > 0}
                 <span>evict <b>{fmtCompact(eng.kvEvictTok)}</b></span>
               {/if}
             </div>

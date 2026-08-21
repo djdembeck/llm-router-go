@@ -59,6 +59,13 @@ export interface EngineMetrics {
   waiting: number;
   /** KV/token-pool pressure, 0..100; 0 = unknown */
   kvPct: number;
+  /**
+   * sglang-only: the prefix-cached (held) portion of the KV pool's pressure,
+   * 0..100 — the share of the tokens the engine can still hand out that are
+   * already warmed by the radix cache. null = not reported (every vLLM: its
+   * kvPct already includes cached blocks; SGLang without the evictable gauge).
+   */
+  kvHeldPct: number | null;
   /** prefix-cache hit rate, 0..1 */
   hitRate: number;
   /** compute-only prefill tok/s (cache misses) */
@@ -129,6 +136,7 @@ export const emptyEngine: EngineMetrics = {
   running: 0,
   waiting: 0,
   kvPct: 0,
+  kvHeldPct: null,
   hitRate: 0,
   prefillTokS: 0,
   prefillCacheTokS: 0,
@@ -236,6 +244,14 @@ export interface LiveReq {
   startMs: number;
   ctxTok: number;
   newTok: number;
+  /**
+   * Estimated prefill duration in ms: newTok at ~PREFILL_TOKENS_PER_SEC
+   * (router body-estimate, rendered gold + `est`). 0 for non-streaming
+   * requests and zero newTok.
+   */
+  estPrefillMs: number;
+  /** UnixMilli of the first response body byte (measured); 0 until first byte. */
+  streamMs: number;
 }
 
 /** One completed request inside a session. Token figures are est. */
@@ -340,6 +356,8 @@ export interface Sample {
   engDecode: number | null;
   /** engine KV/token-pool pressure, 0..100 (null = no engine feed / not reported) */
   kvPct: number | null;
+  /** sglang prefix-cached (held) share of pool pressure, 0..100 (null = not reported / vllm) */
+  kvHeldPct: number | null;
   /** sglang mamba pool pressure, 0..100 (null = not reported) */
   mambaPct: number | null;
   /** engine prefix-cache hit rate, 0..100 (null = no engine feed / not reported) */
@@ -377,6 +395,7 @@ export function emptySample(t: number): Sample {
     engPrefill: null,
     engDecode: null,
     kvPct: null,
+    kvHeldPct: null,
     mambaPct: null,
     hitRate: null,
   };
@@ -488,6 +507,7 @@ export function createMetricsStore(on: (s: StoreState) => void) {
         engPrefill: engOk ? b.engine.prefillTokS : null,
         engDecode: engOk ? b.engine.decodeTokS : null,
         kvPct: engOk && b.engine.kvPct > 0 ? b.engine.kvPct : null,
+        kvHeldPct: engOk ? b.engine.kvHeldPct ?? null : null,
         mambaPct: engOk ? b.engine.mambaPct ?? null : null,
         hitRate: engOk && b.engine.hitRate > 0 ? b.engine.hitRate * 100 : null,
       });

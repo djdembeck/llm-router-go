@@ -1116,6 +1116,7 @@ textarea {
 }
 .pool-bar {
   display: block;
+  position: relative;
   height: 8px;
   background: rgba(143, 169, 192, 0.1);
   border: 1px solid rgba(143, 169, 192, 0.3);
@@ -1134,14 +1135,35 @@ textarea {
   background: var(--red);
   box-shadow: inset 0 1px 0 rgba(232, 230, 224, 0.25);
 }
+/* held (prefix-cached) share of the kv bar — a lighter valley variant
+   over the live-use segment; same seam logic, never a second color */
+.pool-bar .seg.held {
+  position: absolute;
+  left: 0;
+  transform-origin: left center;
+  background: var(--vl-lit);
+}
+.pool-bar .seg.held.hot {
+  background: var(--red);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 224, 0.25);
+}
 .pool-val {
   font-size: 11px;
   color: var(--tx-2);
   font-variant-numeric: tabular-nums;
   text-align: right;
+  white-space: nowrap;
 }
 .pool-val.hot {
   color: var(--red);
+}
+.pool-val .held-sfx {
+  color: var(--tx-3);
+  font-size: 10px;
+}
+.pool-val.hot .held-sfx {
+  color: var(--red);
+  opacity: 0.7;
 }
 .cc-foot {
   display: flex;

@@ -18,7 +18,8 @@
     | "bytesRate"
     | "engRunning"
     | "engPrefill"
-    | "engDecode";
+    | "engDecode"
+    | "kvHeldPct";
 
   interface Props {
     backend: BackendMetrics;
@@ -60,7 +61,8 @@
       k === "tokEst" ? s.tokEstRate :
       k === "engRunning" ? s.engRunning :
       k === "engPrefill" ? s.engPrefill :
-      k === "engDecode" ? s.engDecode : s[k],
+      k === "engDecode" ? s.engDecode :
+      k === "kvHeldPct" ? s.kvHeldPct : s[k],
     );
   }
 
@@ -77,6 +79,7 @@
     ["engRunning", "engine run"],
     ["engPrefill", "eng prefill"],
     ["engDecode", "eng decode"],
+    ["kvHeldPct", "kv held"],
   ];
   const engOk = $derived(b.engine?.status === "ok");
 
@@ -130,7 +133,8 @@
     signal === "bytesRate" ? "bytes/s (measured)" :
     signal === "engRunning" ? "engine running (from /metrics)" :
     signal === "engPrefill" ? "engine prefill tok/s (real)" :
-    "engine decode tok/s (real)",
+    signal === "engDecode" ? "engine decode tok/s (real)" :
+    "kv held % (cached, real)",
   );
 
   function onKeydown(e: KeyboardEvent) {
@@ -360,6 +364,11 @@
           <div class="row"><span class="k">kv cache</span>
             <span class="v">{eng.kvPct > 0 ? eng.kvPct.toFixed(0) + '%' : '—'}{engPoolsSfx ? ` · ${engPoolsSfx}` : ''}</span>
           </div>
+          {#if eng.kvHeldPct !== null}
+            <div class="row"><span class="k">kv held</span>
+              <span class="v">{eng.kvHeldPct.toFixed(0)}% (cached)</span>
+            </div>
+          {/if}
           {#if eng.kvUsedTok !== null && eng.kvCapTok !== null}
             <div class="row"><span class="k">pool tok</span>
               <span class="v">{fmtCompact(eng.kvUsedTok)} / {fmtCompact(eng.kvCapTok)}{eng.kvFreeTok !== null ? ` · free ${fmtCompact(eng.kvFreeTok)}` : ''}{eng.kvEvictTok !== null ? ` · evict ${fmtCompact(eng.kvEvictTok)}` : ''}</span>

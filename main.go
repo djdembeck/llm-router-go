@@ -495,8 +495,8 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 // Zero + status != "ok" means "no data" — the client renders "—".
 //
 // Field classes:
-//   - gauges — live right now (running, waiting, kvPct, hitRate, pool *Pct,
-//     *Tok pool stats, retracted, sloCap, ctxLen, *MemGB, hicache)
+//   - gauges — live right now (running, waiting, kvPct, kvHeldPct, hitRate,
+//     pool *Pct, *Tok pool stats, retracted, sloCap, ctxLen, *MemGB, hicache)
 //   - interval means — histogram means over the last scrape interval
 //     (ttftMs, itlMs, e2eMs, queueMs, prefillMs, decodeMs, perTokMs,
 //     meanPromptTok, meanGenTok, ttftStreamMs, ttftNonStreamMs)
@@ -517,14 +517,15 @@ type engineView struct {
 	Engine string `json:"engine"` // "vllm" | "sglang" | ""
 
 	// Core gauges + rates (frozen field names).
-	Running          float64 `json:"running"`
-	Waiting          float64 `json:"waiting"`
-	KVPct            float64 `json:"kvPct"` // 0..100
-	HitRate          float64 `json:"hitRate"`
-	PrefillTokS      float64 `json:"prefillTokS"`
-	PrefillCacheTokS float64 `json:"prefillCacheTokS"`
-	DecodeTokS       float64 `json:"decodeTokS"`
-	TTFTms           float64 `json:"ttftMs"`
+	Running          float64  `json:"running"`
+	Waiting          float64  `json:"waiting"`
+	KVPct            float64  `json:"kvPct"`     // 0..100 (live use only)
+	KVHeldPct        *float64 `json:"kvHeldPct"` // 0..100; sglang: prefix-cached (held) share of pool pressure
+	HitRate          float64  `json:"hitRate"`
+	PrefillTokS      float64  `json:"prefillTokS"`
+	PrefillCacheTokS float64  `json:"prefillCacheTokS"`
+	DecodeTokS       float64  `json:"decodeTokS"`
+	TTFTms           float64  `json:"ttftMs"`
 
 	// Interval means (ms).
 	ITLms   float64 `json:"itlMs"`
@@ -714,6 +715,7 @@ func (e *engineRegistry) scrape(name string) {
 func (s *engineScrape) zeroIntervalFields() {
 	v := s.view
 	v.Status = s.status
+	v.KVHeldPct = nil // derived from this scrape's gauges — not a lifetime fact
 	v.PrefillTokS = 0
 	v.PrefillCacheTokS = 0
 	v.DecodeTokS = 0
@@ -1055,6 +1057,29 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 		if haveKVEvict {
 			v := kvEvict
 			view.KVEvictTok = &v
+		}
+		// Total KV pressure = live use (kvPct) + the prefix-cached (held)
+		// portion. Held share = the cached part of the tokens the engine can
+		// still hand out: 100·evictable/(available+evictable) — it reaches
+		// 100 only when the hand-out pool is entirely warmed cache. Fallback
+		// (evictable absent): the pool's residual, cap−free−used. vLLM never
+		// sets this: its kv_cache_usage_perc already counts cached blocks.
+		var held float64
+		haveHeld := false
+		if haveKVEvict && haveKVFree && haveKVUsed {
+			if kvFree+kvEvict > 0 {
+				held = 100 * kvEvict / (kvFree + kvEvict)
+				haveHeld = true
+			}
+		} else if haveKVUsed && haveKVCap && haveKVFree {
+			if kvCap > 0 {
+				held = 100 * (kvCap - kvFree - kvUsed) / kvCap
+				haveHeld = true
+			}
+		}
+		if haveHeld {
+			v := held
+			view.KVHeldPct = &v
 		}
 		if haveMambaUsed || haveMambaAvail || haveMambaEvict {
 			u := mambaUsed
@@ -1532,6 +1557,7 @@ type liveReq struct {
 	Stream    bool
 	Streaming bool
 	Start     time.Time
+	StreamAt  time.Time // zero while admitted; set when Streaming flips
 	CtxTok    int
 	NewTok    int
 }
@@ -1565,6 +1591,14 @@ type sessLiveFrame struct {
 	StartMs int64  `json:"startMs"`
 	CtxTok  int    `json:"ctxTok"`
 	NewTok  int    `json:"newTok"`
+	// EstPrefillMs: estimated prefill duration (newTok /
+	// PREFILL_TOKENS_PER_SEC · 1000) — a router estimate, not a
+	// measurement. 0 for non-streaming requests (their first byte marks
+	// generation end, not prefill end) and for zero newTok.
+	EstPrefillMs int `json:"estPrefillMs"`
+	// StreamMs: UnixMilli of the first response body byte (first-byte
+	// truth, measured); 0 while still admitted.
+	StreamMs int64 `json:"streamMs"`
 }
 
 type sessFrame struct {
@@ -1667,6 +1701,7 @@ func (r *sessionRegistry) firstByte(id uint64) {
 	defer r.mu.Unlock()
 	if l, ok := r.live[id]; ok {
 		l.Streaming = true
+		l.StreamAt = time.Now()
 	}
 }
 
@@ -1770,13 +1805,25 @@ func (r *sessionRegistry) feed() sessionsFeed {
 	live := make([]sessLiveFrame, 0, len(r.live))
 	for _, l := range r.live {
 		phase := "admitted"
+		var streamMs int64
+		var estPrefillMs int
 		if l.Streaming {
 			phase = "streaming"
+			if !l.StreamAt.IsZero() {
+				streamMs = l.StreamAt.UnixMilli()
+			}
+		}
+		// Non-streaming requests keep phase "admitted" until the WHOLE
+		// response is written, so their first byte marks generation end,
+		// not prefill end — the estimate only makes sense for streaming.
+		if l.Stream && l.NewTok > 0 {
+			estPrefillMs = int(float64(l.NewTok) / float64(prefillTokensPerSec) * 1000)
 		}
 		live = append(live, sessLiveFrame{
 			ID: l.ID, Sess: l.Sess, Backend: l.Backend, Path: l.Path,
 			Stream: l.Stream, Phase: phase, StartMs: l.Start.UnixMilli(),
 			CtxTok: l.CtxTok, NewTok: l.NewTok,
+			EstPrefillMs: estPrefillMs, StreamMs: streamMs,
 		})
 	}
 	sort.Slice(live, func(i, j int) bool {

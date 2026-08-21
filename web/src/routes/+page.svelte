@@ -256,7 +256,7 @@
       stale={mstate.stale}
     />
 
-    <SessionSheet feed={sessFeed} />
+    <SessionSheet feed={sessFeed} now={now} />
   {:else}
     <div class="hollow" role="status">
       <span>{hollowMsg}</span>

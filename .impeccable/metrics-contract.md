@@ -58,6 +58,7 @@ Frame schema (all numbers are `int`/`float64` as Go serializes them):
         "running": 3,
         "waiting": 1,
         "kvPct": 42.5,
+        "kvHeldPct": null,
         "hitRate": 0.81,
         "prefillTokS": 3800,
         "prefillCacheTokS": 450,
@@ -143,7 +144,7 @@ Field semantics (A implements, B displays):
 
 ### Engine v2 field table
 
-Aggregation: vLLM request gauges/counter sums are SUMmed across data-parallel engines; vLLM `kv_cache_usage_perc` is MAX (per-pool). SGLang scheduler gauges are replicated per tp/pp rank → MAX; SGLang counters & histograms are unioned across ranks → SUM (per-rank counter deltas sum; histograms sum per label set then mean).
+Aggregation: vLLM request gauges/counter sums are SUMmed across data-parallel engines; vLLM `kv_cache_usage_perc` is MAX (per-pool). SGLang scheduler gauges are replicated per tp/pp rank → MAX; SGLang counters & histograms are unioned across ranks → SUM (per-rank counter deltas sum; histograms sum per label set then mean). `kvHeldPct` is **derived after** the per-metric MAX aggregation (from the already-MAXed `kv_evictable`/`kv_available`/`num_used_tokens`/`max_total_num_tokens`), not MAXed itself — it is a ratio of pool tokens, not a per-rank gauge. It is the prefix-cached (held) share of the pool's hand-out tokens, so the dashboard's "total" KV pressure bar is `kvPct` (live use) + `kvHeldPct·(100−kvPct)/100` (held); vLLM's `kvPct` already includes cached blocks, so it stays nil there.
 
 | json | type | class | vllm | sglang | source metric | aggregation |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -152,6 +153,7 @@ Aggregation: vLLM request gauges/counter sums are SUMmed across data-parallel en
 | `running` | number | gauge | both | both | `num_requests_running` / `num_running_reqs` | vllm SUM, sglang MAX |
 | `waiting` | number | gauge | both | both | `num_requests_waiting` / `num_queue_reqs` | vllm SUM, sglang MAX |
 | `kvPct` | number | gauge | both | both | `kv_cache_usage_perc` / `token_usage` | MAX × 100, 0..100 |
+| `kvHeldPct` | number? | gauge | — | sglang | derived: `100·kv_evictable/(kv_available+kv_evictable)`, fallback `100·(cap−free−used)/cap` | derived after per-metric MAX; nil when evictable+available+used absent (or vllm — its `kv_cache_usage_perc` already includes cached blocks) |
 | `hitRate` | number | gauge | both | both | `prefix_cache_hits_total/queries` (lifetime) / `cache_hit_rate` | vllm = hits/queries (0 if q=0); sglang gauge (value>1 ⇒ ÷100) |
 | `prefillTokS` | number | rate | both | both | vllm `prompt_tokens_by_source_total{local_compute}` (fallback `prompt_tokens_total`) / sglang `realtime_tokens_total{prefill_compute}` | SUM Δ/Δt, compute-only |
 | `prefillCacheTokS` | number | rate | both | both | vllm `{local_cache_hit}` / sglang `{prefill_cache}` | SUM Δ/Δt; 0 when no by-source |
@@ -237,7 +239,9 @@ No query params. The client polls it (it is not an SSE feed).
       "phase": "admitted",
       "startMs": 1721000000000,
       "ctxTok": 123,
-      "newTok": 45
+      "newTok": 45,
+      "estPrefillMs": 5,
+      "streamMs": 0
     }
   ],
   "sessions": [
@@ -292,6 +296,17 @@ removed on finish. `id` is a process-wide unique counter. Sorted `startMs`
 **ascending** (oldest on top — the stack). Feed cap **256** (oldest evicted
 beyond that); internal live map cap **1024** (evict oldest on insert).
 `ctxTok`/`newTok` are router estimates (see honest boundary).
+- `estPrefillMs` — estimated prefill duration in ms: `newTok` at
+  `PREFILL_TOKENS_PER_SEC` (default 10000, env-overridable). Class:
+  **router-estimate** — render gold + `est`, never blue/real. `0` for
+  non-streaming requests (their first byte marks generation end, not
+  prefill end) and for zero `newTok`. The dashboard's prefill progress
+  card bars against this: fraction = `min(1, ageMs / estPrefillMs)`.
+- `streamMs` — UnixMilli of the first response body byte (source:
+  respTracker first-byte hook → `sessionRegistry.firstByte`). Class:
+  **measured timestamp**. `0` while still admitted; the first-byte age
+  `streamMs − startMs` is the measured prefill duration (rendered `est`
+  only because the request's token count is an estimate).
 
 **`sessions[]`** — per conversation:
 - `n` — completed requests in the session (incl. rejections); `firstMs`/`lastMs` — first/last request ms.
