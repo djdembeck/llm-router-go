@@ -476,8 +476,10 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 // In-engine running/waiting, KV-cache pressure, and REAL token throughput
 // (prompt + completion — not the ~4 bytes/token body estimate) only exist
 // inside the engine, so we scrape each backend's Prometheus /metrics with a
-// stdlib text-exposition parser at 1s. vLLM always serves /metrics; SGLang
-// requires --enable-metrics. When the endpoint is absent or down the view
+// stdlib text-exposition parser at 1s — except a 404 endpoint, which backs
+// off to 30s re-probes (engineOffBackoff) since the route only reappears on
+// an engine restart. vLLM always serves /metrics; SGLang requires
+// --enable-metrics. When the endpoint is absent or down the view
 // degrades to status "off"/"err" and the sheet renders "—" — never a guess.
 //
 // Aggregation rules (from the engines' source, verified 2026-08-20):
@@ -602,7 +604,11 @@ type histState struct {
 type engineScrape struct {
 	url    string
 	status string
-	view   engineView
+	// offNext: the next allowed probe while status is "off" (404/405).
+	// The endpoint is structurally absent until the engine restarts, so
+	// probes back off to engineOffBackoff instead of once per second.
+	offNext time.Time
+	view    engineView
 	// counters: rate-differenced between scrapes, keyed by name+labels.
 	counters map[string]float64
 	cTimes   map[string]time.Time
@@ -617,6 +623,13 @@ type engineRegistry struct {
 	backends map[string]*engineScrape
 	client   *http.Client
 }
+
+// engineOffBackoff is the re-probe interval for a 404/405 /metrics endpoint
+// ("off"): the route is absent until the engine restarts (e.g. SGLang gains
+// --enable-metrics), so probing once per second only spams the engine's
+// access log. "err" (unreachable) is never backed off — the engine may come
+// back any moment and the sheet wants fast recovery detection.
+const engineOffBackoff = 30 * time.Second
 
 func newEngineRegistry() *engineRegistry {
 	return &engineRegistry{
@@ -670,6 +683,13 @@ func (e *engineRegistry) scrape(name string) {
 		e.mu.Unlock()
 		return
 	}
+	// A 404 endpoint is structurally absent (SGLang without
+	// --enable-metrics): it only reappears on an engine restart, so hold
+	// the probe at engineOffBackoff instead of hammering once per second.
+	if s.status == "off" && time.Now().Before(s.offNext) {
+		e.mu.Unlock()
+		return
+	}
 	url := s.url
 	e.mu.Unlock()
 
@@ -697,8 +717,10 @@ func (e *engineRegistry) scrape(name string) {
 	if !ok {
 		if gone {
 			s.status = "off"
+			s.offNext = time.Now().Add(engineOffBackoff)
 		} else {
 			s.status = "err"
+			s.offNext = time.Time{}
 		}
 		// Rates and interval means are deltas over a scrape interval; a stale
 		// delta would mislead, so zero them. Gauges and lifetime counters keep
@@ -706,6 +728,7 @@ func (e *engineRegistry) scrape(name string) {
 		s.zeroIntervalFields()
 		return
 	}
+	s.offNext = time.Time{}
 	s.scrapeBody(parsePromText(body))
 }
 
@@ -2065,7 +2088,8 @@ func main() {
 	}
 	// The engine's own /metrics: real in-engine running/waiting, KV pressure,
 	// and prompt+completion token rates. vLLM serves it always; SGLang only
-	// with --enable-metrics (the scrape degrades to "off" when absent).
+	// with --enable-metrics (the scrape degrades to "off" when absent, and a
+	// 404 endpoint is re-probed at engineOffBackoff, not once per second).
 	for _, b := range backends {
 		engineMetrics.add(b.Name, b.URL+"/metrics")
 	}

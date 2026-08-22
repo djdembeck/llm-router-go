@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -839,6 +840,102 @@ func TestEngine_EndpointOff(t *testing.T) {
 	r2.mu.Unlock()
 	if status2 != "err" {
 		t.Errorf("status = %q, want err (unreachable)", status2)
+	}
+}
+
+// TestEngine_EndpointOffBackoff verifies a 404 endpoint is re-probed at
+// engineOffBackoff (not once per second) and re-arms promptly: "err"
+// (unreachable) never backs off, and the first 200 after an off window
+// clears the backoff immediately.
+func TestEngine_EndpointOffBackoff(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) <= 2 { // first two probes 404, then 200
+			http.NotFound(w, r)
+		} else {
+			fmt.Fprintln(w, `sglang:num_running_reqs 3`)
+		}
+	}))
+	defer srv.Close()
+
+	r := newEngineRegistry()
+	r.add("king", srv.URL+"/metrics")
+
+	r.scrape("king") // probe 1 → 404 → status off
+	r.mu.Lock()
+	status := r.backends["king"].status
+	offNext := r.backends["king"].offNext
+	r.mu.Unlock()
+	if status != "off" {
+		t.Fatalf("status = %q, want off", status)
+	}
+	if time.Until(offNext) <= 0 || time.Until(offNext) > engineOffBackoff {
+		t.Fatalf("offNext = %v, want ~engineOffBackoff in the future", offNext)
+	}
+
+	// Immediately: inside the backoff window → probe suppressed (no 2nd hit).
+	r.scrape("king")
+	if h := atomic.LoadInt32(&hits); h != 1 {
+		t.Fatalf("hits = %d, want 1 (probe suppressed during off backoff)", h)
+	}
+
+	// Past the window → probe again → still 404 (2nd hit), off re-armed.
+	r.mu.Lock()
+	r.backends["king"].offNext = time.Now().Add(-time.Second)
+	r.mu.Unlock()
+	r.scrape("king")
+	if h := atomic.LoadInt32(&hits); h != 2 {
+		t.Fatalf("hits = %d, want 2 (probe resumed after backoff)", h)
+	}
+	r.mu.Lock()
+	status = r.backends["king"].status
+	offNext = r.backends["king"].offNext
+	r.mu.Unlock()
+	if status != "off" {
+		t.Fatalf("status = %q, want off (still 404)", status)
+	}
+	if time.Until(offNext) <= 0 {
+		t.Fatalf("offNext = %v, want re-armed after repeated 404", offNext)
+	}
+
+	// err (unreachable) is never backed off: an endpoint that was 404 but
+	// then goes down must be probed again next tick for fast recovery.
+	r.mu.Lock()
+	r.backends["king"].offNext = time.Now().Add(time.Minute)
+	r.mu.Unlock()
+	dead := newEngineRegistry()
+	dead.add("dead", "http://127.0.0.1:1/metrics")
+	dead.scrape("dead")
+	dead.scrape("dead") // must not be suppressed
+	dead.mu.Lock()
+	dstatus := dead.backends["dead"].status
+	dead.mu.Unlock()
+	if dstatus != "err" {
+		t.Errorf("dead status = %q, want err (unreachable)", dstatus)
+	}
+
+	// Probe 3 (window expired) → 200 → backoff cleared; the next scrape
+	// hits immediately.
+	r.mu.Lock()
+	r.backends["king"].offNext = time.Now().Add(-time.Second)
+	r.mu.Unlock()
+	r.scrape("king")
+	if h := atomic.LoadInt32(&hits); h != 3 {
+		t.Fatalf("hits = %d, want 3 (probe fired after backoff expiry)", h)
+	}
+	r.mu.Lock()
+	status = r.backends["king"].status
+	offNext = r.backends["king"].offNext
+	r.mu.Unlock()
+	if status != "ok" {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	if !offNext.IsZero() {
+		t.Fatalf("offNext = %v, want zero after ok scrape", offNext)
+	}
+	r.scrape("king")
+	if h := atomic.LoadInt32(&hits); h != 4 {
+		t.Fatalf("hits = %d, want 4 (no backoff after recovery)", h)
 	}
 }
 
