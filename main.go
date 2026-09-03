@@ -411,10 +411,6 @@ func main() {
 
 // ─── /stats ───────────────────────────────────────────────────────────────
 
-// ciSelectiveProbe: temporary marker for the selective-CI merge-gate
-// experiment; delete after the full-chain canary is verified.
-const ciSelectiveProbe = true
-
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	type stat struct {
 		Name            string  `json:"name"`
