@@ -1,12 +1,31 @@
 name: CI
 
+# Selective CI: this workflow ALWAYS runs; the `changes` job classifies the
+# diff into concerns (workflow / lint / build / test / docker).
+#
+# The three REQUIRED-context jobs (lint-format, build, test) must never be
+# job-level-skipped: a job skipped by a job-level `if` is recorded with
+# check-run conclusion "skipped", and the main-branch protection gate does NOT
+# credit "skipped" as passing (verified live — a PR whose required contexts
+# were all "skipped" stayed BLOCKED). So those jobs always RUN and open with an
+# inline Gate step that passes when their concern is absent; the job's
+# check-run conclusion is therefore always "success" (concern off / no-op) or
+# "failure" (a real check failed) — never "skipped". A real failure still
+# blocks merge, and a required job whose upstream required job failed is
+# job-level-skipped by its circuit-breaker `if` (harmless: that failed
+# required predecessor already blocks the merge).
+#
+# Non-required jobs (workflow-lint, docker-build) may still be
+# job-level-skipped freely — their contexts are not required on main.
+#
+# Never add event-level paths/paths-ignore here: filtering the whole workflow
+# leaves the required check contexts pending forever.
+
 on:
   push:
     branches: [main, develop]
     tags: ['v*']
-    paths-ignore: ['*.md', 'docs/**']
   pull_request:
-    paths-ignore: ['*.md', 'docs/**']
   workflow_dispatch:
 
 concurrency:
@@ -19,8 +38,128 @@ env:
   PR_IS_SAME_REPO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
-  lint-format:
-    name: Lint & Format
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      workflow: ${{ steps.classify.outputs.workflow }}
+      lint: ${{ steps.classify.outputs.lint }}
+      build: ${{ steps.classify.outputs.build }}
+      test: ${{ steps.classify.outputs.test }}
+      docker: ${{ steps.classify.outputs.docker }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: classify
+        if: always()
+        run: |
+          set -uo pipefail
+
+          WORKFLOW=false
+          LINT=false
+          BUILD=false
+          TEST=false
+          DOCKER=false
+
+          ALL_TRUE() {
+            WORKFLOW=true
+            LINT=true
+            BUILD=true
+            TEST=true
+            DOCKER=true
+          }
+
+          EVENT="${{ github.event_name }}"
+          case "$EVENT" in
+            pull_request)
+              BASE="${{ github.event.pull_request.base.sha }}"
+              HEAD="${{ github.event.pull_request.head.sha }}"
+              ;;
+            push)
+              case "${{ github.ref }}" in
+                refs/tags/*)
+                  # Tag pushes have no diff base — full run.
+                  BASE=""
+                  ;;
+                *)
+                  BASE="${{ github.event.before }}"
+                  # First push of a new branch: github.event.before is
+                  # unresolvable — no diff base, classify conservatively.
+                  if [ -n "$BASE" ] && ! git rev-parse --verify -q "${BASE}^{commit}" >/dev/null; then
+                    echo "Unresolvable base ${BASE} — classifying all concerns as changed"
+                    BASE=""
+                  fi
+                  ;;
+              esac
+              HEAD="${{ github.sha }}"
+              ;;
+            *)
+              # workflow_dispatch: no diff, full run.
+              BASE=""
+              ;;
+          esac
+
+          DIFF_FILE="$(mktemp)"
+          if [ -n "$BASE" ] && git diff --name-only -z --no-renames "$BASE" "$HEAD" > "$DIFF_FILE" 2>/dev/null; then
+            if [ ! -s "$DIFF_FILE" ]; then
+              echo "Empty diff — classifying all concerns as changed"
+              ALL_TRUE
+            else
+              while IFS= read -r -d '' path; do
+                case "$path" in
+                  .github/workflows/*.yml|.github/workflows/*.yaml) WORKFLOW=true ;;
+                  web/embed.go|web/embed_stub.go) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
+                  *_test.go) LINT=true; TEST=true ;;
+                  web/src/*|web/package.json|web/bun.lock|web/vite.config.ts|web/svelte.config.js|web/tsconfig.json) BUILD=true; DOCKER=true ;;
+                  *.go) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
+                  go.mod|go.sum) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
+                  Dockerfile|.dockerignore) DOCKER=true ;;
+                  # *.md covers all markdown anywhere (CHANGELOG.md,
+                  # PRODUCT.md, DESIGN.md, .github/**/*.md, docs/*.md);
+                  # docs/* adds non-markdown doc assets.
+                  *.md|docs/*|renovate.json5|.pre-commit-config.yaml|.gitignore|.editorconfig|LICENSE|.env.example|.impeccable/*) : ;;
+                  *) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
+                esac
+              done < "$DIFF_FILE"
+            fi
+          else
+            echo "No usable diff (tag/dispatch, unresolvable base, or git error) — classifying all concerns as changed"
+            ALL_TRUE
+          fi
+          rm -f "$DIFF_FILE"
+
+          {
+            echo "workflow=${WORKFLOW}"
+            echo "lint=${LINT}"
+            echo "build=${BUILD}"
+            echo "test=${TEST}"
+            echo "docker=${DOCKER}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Changes"
+            echo ""
+            echo "| Concern | Triggered |"
+            echo "|---|---|"
+            echo "| workflow | ${{ steps.classify.outputs.workflow }} |"
+            echo "| lint | ${{ steps.classify.outputs.lint }} |"
+            echo "| build | ${{ steps.classify.outputs.build }} |"
+            echo "| test | ${{ steps.classify.outputs.test }} |"
+            echo "| docker | ${{ steps.classify.outputs.docker }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  workflow-lint:
+    name: Workflow Lint
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.workflow == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -29,59 +168,119 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: Lint workflows with actionlint
+        # -ignore: SC2046 (ci.yml mod-tidy line) and SC2209 (release.yml LATEST_TAG
+        # assignment) are pre-existing shellcheck findings in legacy steps this PR
+        # must not rewrite; new workflow files are linted at default severity.
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -ignore 'shellcheck.*SC2046' -ignore 'shellcheck.*SC2209'
+
+  lint-format:
+    name: Lint & Format
+    needs: [changes]
+    # Required context: never job-level-skipped. Runs always; the Gate step
+    # no-ops (conclusion success) when the lint concern is absent.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate
+        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'false' }}
+        run: echo "Skipped - no lint-relevant changes"
+
+      - name: Checkout repository
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Check formatting
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         run: test -z "$(gofmt -l .)"
 
       - name: Vet
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         run: go vet ./...
 
       - name: Mod tidy
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         run: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
 
   build:
     name: Build
-    needs: [lint-format]
+    needs: [changes, workflow-lint, lint-format]
+    # Circuit breaker only: skip this required context when an upstream
+    # required job FAILED (its red run already blocks the merge, so this
+    # "skipped" context is inert). An absent build concern is handled by the
+    # inline Gate below so the context stays "success", never "skipped".
+    if: ${{ !cancelled() && needs['lint-format'].result != 'failure' && needs['workflow-lint'].result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Gate
+        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.build == 'false' }}
+        run: echo "Skipped - no build-relevant changes"
+
       - name: Checkout repository
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Build
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
         run: go build ./...
 
   test:
     name: Test
-    needs: [build]
+    needs: [changes, workflow-lint, lint-format, build]
+    # Circuit breaker only: skip when an upstream required job FAILED (that red
+    # run already blocks the merge). An absent test concern is handled by the
+    # inline Gate so the context stays "success", never "skipped".
+    if: ${{ !cancelled() && needs['lint-format'].result != 'failure' && needs['workflow-lint'].result != 'failure' && needs['build'].result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Gate
+        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.test == 'false' }}
+        run: echo "Skipped - no test-relevant changes"
+
       - name: Checkout repository
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Run tests
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
         run: go test ./...
 
   docker-build:
     name: Build and Push Docker Image
-    needs: [test]
-    if: success()
+    needs: [changes, workflow-lint, lint-format, build, test]
+    # workflow-lint is non-required and job-level-skipped when no workflow file
+    # changed, so accept success|skipped for it. The three required jobs always
+    # RUN (concern-off = no-op success), so a required job being "skipped" here
+    # means its circuit-breaker tripped on an upstream failure -> docker must
+    # stay skipped; require plain success for those.
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.docker == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && needs['lint-format'].result == 'success' && needs['build'].result == 'success' && needs['test'].result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
