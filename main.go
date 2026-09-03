@@ -834,3 +834,6 @@ func (t *respTracker) Flush() {
 		f.Flush()
 	}
 }
+
+// ciFullChainProbe: temporary no-op to exercise the full lint->build->test->docker chain.
+const ciFullChainProbe = true
