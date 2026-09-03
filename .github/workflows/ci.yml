@@ -1,12 +1,19 @@
 name: CI
 
+# Selective CI: this workflow ALWAYS runs; the `changes` job classifies the
+# diff into concerns (workflow / lint / build / test / docker) and each concern
+# job self-gates on its flag via job-level `if`. A job skipped by its job-level
+# `if` reports its check run as "skipped", which GitHub treats as passing for
+# required status checks — merge stays unblocked for inert diffs, while any
+# concern that actually runs and fails still blocks. Never add event-level
+# paths/paths-ignore here: filtering the whole workflow leaves the required
+# check contexts pending forever.
+
 on:
   push:
     branches: [main, develop]
     tags: ['v*']
-    paths-ignore: ['*.md', 'docs/**']
   pull_request:
-    paths-ignore: ['*.md', 'docs/**']
   workflow_dispatch:
 
 concurrency:
@@ -19,8 +26,147 @@ env:
   PR_IS_SAME_REPO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      workflow: ${{ steps.classify.outputs.workflow }}
+      lint: ${{ steps.classify.outputs.lint }}
+      build: ${{ steps.classify.outputs.build }}
+      test: ${{ steps.classify.outputs.test }}
+      docker: ${{ steps.classify.outputs.docker }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: classify
+        if: always()
+        run: |
+          set -uo pipefail
+
+          WORKFLOW=false
+          LINT=false
+          BUILD=false
+          TEST=false
+          DOCKER=false
+
+          ALL_TRUE() {
+            WORKFLOW=true
+            LINT=true
+            BUILD=true
+            TEST=true
+            DOCKER=true
+          }
+
+          EVENT="${{ github.event_name }}"
+          case "$EVENT" in
+            pull_request)
+              BASE="${{ github.event.pull_request.base.sha }}"
+              HEAD="${{ github.event.pull_request.head.sha }}"
+              ;;
+            push)
+              case "${{ github.ref }}" in
+                refs/tags/*)
+                  # Tag pushes have no diff base — full run.
+                  BASE=""
+                  ;;
+                *)
+                  BASE="${{ github.event.before }}"
+                  # First push of a new branch: github.event.before is
+                  # unresolvable — no diff base, classify conservatively.
+                  if [ -n "$BASE" ] && ! git rev-parse --verify -q "${BASE}^{commit}" >/dev/null; then
+                    echo "Unresolvable base ${BASE} — classifying all concerns as changed"
+                    BASE=""
+                  fi
+                  ;;
+              esac
+              HEAD="${{ github.sha }}"
+              ;;
+            *)
+              # workflow_dispatch: no diff, full run.
+              BASE=""
+              ;;
+          esac
+
+          DIFF_FILE="$(mktemp)"
+          if [ -n "$BASE" ] && git diff --name-only -z --no-renames "$BASE" "$HEAD" > "$DIFF_FILE" 2>/dev/null; then
+            if [ ! -s "$DIFF_FILE" ]; then
+              echo "Empty diff — classifying all concerns as changed"
+              ALL_TRUE
+            else
+              while IFS= read -r -d '' path; do
+                case "$path" in
+                  .github/workflows/*.yml|.github/workflows/*.yaml) WORKFLOW=true ;;
+                  web/embed.go|web/embed_stub.go) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
+                  *_test.go) LINT=true; TEST=true ;;
+                  web/src/*|web/package.json|web/bun.lock|web/vite.config.ts|web/svelte.config.js|web/tsconfig.json) BUILD=true; DOCKER=true ;;
+                  *.go) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
+                  go.mod|go.sum) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
+                  Dockerfile|.dockerignore) DOCKER=true ;;
+                  # *.md covers all markdown anywhere (CHANGELOG.md,
+                  # PRODUCT.md, DESIGN.md, .github/**/*.md, docs/*.md);
+                  # docs/* adds non-markdown doc assets.
+                  *.md|docs/*|renovate.json5|.pre-commit-config.yaml|.gitignore|.editorconfig|LICENSE|.env.example|.impeccable/*) : ;;
+                  *) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
+                esac
+              done < "$DIFF_FILE"
+            fi
+          else
+            echo "No usable diff (tag/dispatch, unresolvable base, or git error) — classifying all concerns as changed"
+            ALL_TRUE
+          fi
+          rm -f "$DIFF_FILE"
+
+          {
+            echo "workflow=${WORKFLOW}"
+            echo "lint=${LINT}"
+            echo "build=${BUILD}"
+            echo "test=${TEST}"
+            echo "docker=${DOCKER}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Changes"
+            echo ""
+            echo "| Concern | Triggered |"
+            echo "|---|---|"
+            echo "| workflow | ${{ steps.classify.outputs.workflow }} |"
+            echo "| lint | ${{ steps.classify.outputs.lint }} |"
+            echo "| build | ${{ steps.classify.outputs.build }} |"
+            echo "| test | ${{ steps.classify.outputs.test }} |"
+            echo "| docker | ${{ steps.classify.outputs.docker }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  workflow-lint:
+    name: Workflow Lint
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.workflow == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: Lint workflows with actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
   lint-format:
     name: Lint & Format
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -44,7 +190,8 @@ jobs:
 
   build:
     name: Build
-    needs: [lint-format]
+    needs: [changes, workflow-lint, lint-format]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -62,7 +209,8 @@ jobs:
 
   test:
     name: Test
-    needs: [build]
+    needs: [changes, workflow-lint, lint-format, build]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') && (needs['build'].result == 'success' || needs['build'].result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -80,8 +228,8 @@ jobs:
 
   docker-build:
     name: Build and Push Docker Image
-    needs: [test]
-    if: success()
+    needs: [changes, workflow-lint, lint-format, build, test]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.docker == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') && (needs['build'].result == 'success' || needs['build'].result == 'skipped') && (needs['test'].result == 'success' || needs['test'].result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
