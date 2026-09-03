@@ -834,3 +834,6 @@ func (t *respTracker) Flush() {
 		f.Flush()
 	}
 }
+
+// ciBaselineProbe: temporary marker for the merge-gate baseline experiment.
+const ciBaselineProbe = true
