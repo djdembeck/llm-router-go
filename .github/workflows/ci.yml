@@ -1,13 +1,25 @@
 name: CI
 
 # Selective CI: this workflow ALWAYS runs; the `changes` job classifies the
-# diff into concerns (workflow / lint / build / test / docker) and each concern
-# job self-gates on its flag via job-level `if`. A job skipped by its job-level
-# `if` reports its check run as "skipped", which GitHub treats as passing for
-# required status checks — merge stays unblocked for inert diffs, while any
-# concern that actually runs and fails still blocks. Never add event-level
-# paths/paths-ignore here: filtering the whole workflow leaves the required
-# check contexts pending forever.
+# diff into concerns (workflow / lint / build / test / docker).
+#
+# The three REQUIRED-context jobs (lint-format, build, test) must never be
+# job-level-skipped: a job skipped by a job-level `if` is recorded with
+# check-run conclusion "skipped", and the main-branch protection gate does NOT
+# credit "skipped" as passing (verified live — a PR whose required contexts
+# were all "skipped" stayed BLOCKED). So those jobs always RUN and open with an
+# inline Gate step that passes when their concern is absent; the job's
+# check-run conclusion is therefore always "success" (concern off / no-op) or
+# "failure" (a real check failed) — never "skipped". A real failure still
+# blocks merge, and a required job whose upstream required job failed is
+# job-level-skipped by its circuit-breaker `if` (harmless: that failed
+# required predecessor already blocks the merge).
+#
+# Non-required jobs (workflow-lint, docker-build) may still be
+# job-level-skipped freely — their contexts are not required on main.
+#
+# Never add event-level paths/paths-ignore here: filtering the whole workflow
+# leaves the required check contexts pending forever.
 
 on:
   push:
@@ -169,70 +181,101 @@ jobs:
   lint-format:
     name: Lint & Format
     needs: [changes]
-    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
+    # Required context: never job-level-skipped. Runs always; the Gate step
+    # no-ops (conclusion success) when the lint concern is absent.
     runs-on: ubuntu-latest
     steps:
+      - name: Gate
+        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'false' }}
+        run: echo "Skipped - no lint-relevant changes"
+
       - name: Checkout repository
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Check formatting
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         run: test -z "$(gofmt -l .)"
 
       - name: Vet
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         run: go vet ./...
 
       - name: Mod tidy
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
         run: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
 
   build:
     name: Build
     needs: [changes, workflow-lint, lint-format]
-    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') }}
+    # Circuit breaker only: skip this required context when an upstream
+    # required job FAILED (its red run already blocks the merge, so this
+    # "skipped" context is inert). An absent build concern is handled by the
+    # inline Gate below so the context stays "success", never "skipped".
+    if: ${{ !cancelled() && needs['lint-format'].result != 'failure' && needs['workflow-lint'].result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Gate
+        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.build == 'false' }}
+        run: echo "Skipped - no build-relevant changes"
+
       - name: Checkout repository
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Build
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
         run: go build ./...
 
   test:
     name: Test
     needs: [changes, workflow-lint, lint-format, build]
-    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') && (needs['build'].result == 'success' || needs['build'].result == 'skipped') }}
+    # Circuit breaker only: skip when an upstream required job FAILED (that red
+    # run already blocks the merge). An absent test concern is handled by the
+    # inline Gate so the context stays "success", never "skipped".
+    if: ${{ !cancelled() && needs['lint-format'].result != 'failure' && needs['workflow-lint'].result != 'failure' && needs['build'].result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Gate
+        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.test == 'false' }}
+        run: echo "Skipped - no test-relevant changes"
+
       - name: Checkout repository
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Run tests
+        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
         run: go test ./...
 
   docker-build:
     name: Build and Push Docker Image
     needs: [changes, workflow-lint, lint-format, build, test]
-    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.docker == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') && (needs['build'].result == 'success' || needs['build'].result == 'skipped') && (needs['test'].result == 'success' || needs['test'].result == 'skipped') }}
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.docker == 'true' && needs['workflow-lint'].result == 'success' && needs['lint-format'].result == 'success' && needs['build'].result == 'success' && needs['test'].result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
