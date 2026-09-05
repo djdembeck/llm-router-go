@@ -76,8 +76,10 @@
                 </span>
                 <span class="pool-val {kvTotal !== null && kvTotal >= 90 ? 'hot' : ''}"
                   >{kvTotal !== null
-                    ? Math.round(kvTotal) + "%" + (held !== null && held > 0 ? ` <span class="held-sfx">· held ${Math.round(held)}%</span>` : "")
-                    : "—"}</span
+                    ? Math.round(kvTotal) + "%"
+                    : "—"}{#if held !== null && held > 0 && kvTotal !== null}<span
+                      class="held-sfx"> · held {Math.round(held)}%</span
+                    >{/if}</span
                 >
               </div>
               {#if eng.swaPct !== null}

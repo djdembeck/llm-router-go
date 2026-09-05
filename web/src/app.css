@@ -49,6 +49,11 @@
 
 html {
   background: var(--ground);
+  /* The skewed bands (skewX on .sheet/.cache/etc.) bleed ink past the
+     viewport edges. body clips paint, but the document scroll box is html —
+     without this, the bleed makes the page horizontally scrollable on
+     narrow viewports. clip (not hidden) so no scroll container is created. */
+  overflow-x: clip;
 }
 
 body {
