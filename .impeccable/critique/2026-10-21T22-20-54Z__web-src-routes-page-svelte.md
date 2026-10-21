@@ -11,6 +11,7 @@ target_fingerprint: "sha256:9e7736141881c195230ed6aebd025e8d3f823aaa1fcb8b99a4fb
 target_path: /home/djdembeck/projects/github/llm-router-go/web/src/routes/+page.svelte
 timestamp: 2026-10-21T22-20-54Z
 slug: web-src-routes-page-svelte
+closed: true
 ---
 ## Design Health Score
 

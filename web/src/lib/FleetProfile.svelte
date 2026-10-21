@@ -840,7 +840,8 @@
   }
   .profile-plot {
     position: relative;
-    height: 320px;
+    flex: 1 1 auto;
+    min-height: 320px;
     min-width: 0;
   }
   canvas {
@@ -941,7 +942,7 @@
   }
   @media (max-width: 959px) {
     .profile-plot {
-      height: 280px;
+      min-height: 280px;
     }
     .profile-head {
       align-items: flex-start;
@@ -952,7 +953,7 @@
   }
   @media (max-width: 639px) {
     .profile-plot {
-      height: 240px;
+      min-height: 240px;
     }
     .profile-foot {
       align-items: flex-start;

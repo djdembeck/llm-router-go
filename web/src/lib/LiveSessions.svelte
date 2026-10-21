@@ -335,9 +335,6 @@
     .sessions.tall .list {
       height: 360px;
     }
-    .path {
-      display: none;
-    }
     .foot {
       flex-direction: column;
       align-items: flex-start;

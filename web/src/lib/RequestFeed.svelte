@@ -220,7 +220,7 @@
     flex-wrap: wrap;
     padding: 5px var(--s3);
     border-top: 1px solid var(--rule);
-    font-size: 9px;
+    font-size: 10px;
   }
   @media (max-width: 639px) {
     .path {

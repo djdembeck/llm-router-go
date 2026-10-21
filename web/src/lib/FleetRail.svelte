@@ -175,7 +175,7 @@
     border-bottom: 1px solid var(--rule);
   }
   .fleet-line .label {
-    font-size: 9px;
+    font-size: 10px;
     letter-spacing: 0.08em;
   }
   .num-value {
@@ -311,13 +311,13 @@
     display: flex;
     justify-content: space-between;
     gap: var(--s2);
-    font-size: 9px;
+    font-size: 10px;
     line-height: 14px;
     color: var(--ink-3);
     white-space: nowrap;
   }
   .foot-row .label {
-    font-size: 9px;
+    font-size: 10px;
     letter-spacing: 0.08em;
   }
   .empty {

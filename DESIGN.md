@@ -245,9 +245,11 @@ cell row only when device telemetry is present. Each cell is a button when
 it corresponds to a profile layer; the pressed state is a 2px inset sand edge
 along the bottom.
 
-The profile is a canvas 320px tall (280px at 640–959, 240px below 640). Its
-left gutter is 150px (122px below 520px): a 46px lane-label column, a 38px
-scale column, then the plot. The time axis carries 3–6 labels; the lane
+The profile is a canvas at least 320px tall (280px at 640–959, 240px below
+640); it grows to fill the live-band row when the 560px session stack makes
+the sheet taller, so the signature chart never leaves dead paper inside its
+frame. Its left gutter is 150px (122px below 520px): a 46px lane-label
+column, a 38px scale column, then the plot. The time axis carries 3–6 labels; the lane
 baselines are 1px rules; the scale labels are 10px mono.
 
 The live sessions panel is 400px wide beside the profile at ≥1280px; below
