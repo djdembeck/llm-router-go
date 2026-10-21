@@ -229,6 +229,7 @@
           <tr
             class:selected={selected === r.name}
             tabindex="0"
+            aria-current={selected === r.name ? "true" : undefined}
             onclick={() => onSelect(selected === r.name ? null : r.name)}
             onkeydown={(e) => {
               if (e.key !== "Enter" && e.key !== " ") return;
@@ -406,7 +407,12 @@
     }
     .sort {
       min-height: 44px;
+      min-width: 44px;
       padding: 8px;
+    }
+    .backend-table .data-table tbody td {
+      padding-top: 14px;
+      padding-bottom: 14px;
     }
     .backend-table .data-table th:nth-child(1) { width: 28%; }
     .backend-table .data-table th:nth-child(2) { width: 12%; }

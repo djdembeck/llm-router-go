@@ -191,12 +191,13 @@
     }
     .controls {
       width: 100%;
-      overflow-x: auto;
-      padding-bottom: 2px;
+      flex-wrap: wrap;
+      padding-bottom: 0;
     }
     .seg .btn {
-      min-height: 30px;
-      padding: 4px 9px;
+      min-height: 44px;
+      min-width: 44px;
+      padding: 8px 9px;
     }
     .feed {
       white-space: normal;
