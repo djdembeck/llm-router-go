@@ -67,7 +67,10 @@
         <span class="line1">
           <span class="dot {ok ? 'ok' : b.engine.status === 'off' ? 'muted' : 'err'}"></span>
           <span class="name">{b.name}</span>
-          <span class="tier mono">T{b.tier}</span>
+          <span
+            class="tier mono"
+            title={`Tier ${b.tier} — ${b.tier === 0 ? "King" : "Subject"}`}
+          >{b.tier === 0 ? "KING" : "SUBJECT"}</span>
           <span class="slots mono">{b.inFlight}/{b.maxConcurrent || "∞"}</span>
         </span>
         <span class="line2 mono">
@@ -239,10 +242,10 @@
     white-space: nowrap;
   }
   .tier {
-    font-size: 9px;
+    font-size: 10px;
     color: var(--sand);
     border: 1px solid var(--rule-2);
-    padding: 0 3px;
+    padding: 0 4px;
     line-height: 12px;
   }
   .slots {

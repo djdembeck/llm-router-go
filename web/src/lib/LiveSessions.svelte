@@ -207,9 +207,9 @@
     align-items: center;
     gap: 5px;
     font-family: var(--font-ui);
-    font-size: 8px;
-    line-height: 9px;
-    font-weight: 400;
+    font-size: 10px;
+    line-height: 12px;
+    font-weight: 500;
     color: var(--ink-3);
     text-transform: uppercase;
     letter-spacing: 0.08em;
@@ -238,8 +238,8 @@
   }
   .metric .k {
     font-family: var(--font-ui);
-    font-size: 8px;
-    line-height: 9px;
+    font-size: 10px;
+    line-height: 12px;
     font-weight: 500;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -298,12 +298,12 @@
   }
   .age {
     margin-left: auto;
-    font-size: 9px;
+    font-size: 10px;
     color: var(--ink-3);
     white-space: nowrap;
   }
   .req .tag.est {
-    font-size: 9px;
+    font-size: 10px;
     font-weight: 500;
     letter-spacing: 0.04em;
     text-transform: none;

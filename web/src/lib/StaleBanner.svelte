@@ -17,9 +17,9 @@
 <div class="stale" role="alert">
   <span class="mark" aria-hidden="true"></span>
   <span class="text">
-    <strong>STALE</strong> — last data
+    <strong>STALE</strong> — feed interrupted; last data
     <span class="mono">{lastFrameAt ? fmtClock(lastFrameAt) : "—"}</span>
-    <span class="mono">· {fmtSince(age)} ago</span>
+    <span class="mono">· {fmtSince(age)} ago; holding the last frame</span>
   </span>
   <span class="right mono muted">re-arming {feedName}</span>
 </div>

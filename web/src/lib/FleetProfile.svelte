@@ -18,7 +18,7 @@
     type LayerDef,
     type LayerId,
   } from "./profile";
-  import { untrack } from "svelte";
+  import { onMount, untrack } from "svelte";
   import TweenNumber from "./TweenNumber.svelte";
   import { clamp, fmtClock, fmtHHMM, fmtPct, nearestIndex } from "./format";
 
@@ -119,6 +119,17 @@
     const kv = lanes.find((l) => l.key === "__fleet");
     if (!kv) return null;
     return valueAt(kv, readoutT);
+  });
+
+  const backendRows = $derived.by(() => {
+    void framesVersion;
+    if (layer.device) return [];
+    const from = domain.from;
+    const to = Math.max(domain.to, edge);
+    return lanes.map((lane) => ({
+      lane,
+      stats: summaryAt(lane, from, to),
+    }));
   });
 
   const deviceRows = $derived.by(() => {
@@ -595,6 +606,25 @@
     cursor = null;
     hoverT = null;
   }
+
+  onMount(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (cursor == null) return;
+      if (e.key !== "Escape" && e.key !== "l" && e.key !== "L") return;
+      const target = e.target;
+      if (
+        typeof HTMLElement !== "undefined" &&
+        target instanceof HTMLElement &&
+        target.closest("input, textarea, select, [contenteditable='true']")
+      ) {
+        return;
+      }
+      e.preventDefault();
+      toLive();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 </script>
 
 <div class="profile">
@@ -619,7 +649,7 @@
         {/if}
       </span>
       {#if cursor != null}
-        <button class="btn" onclick={toLive}>RETURN TO LIVE</button>
+        <button class="btn" onclick={toLive} title="Return to live (L or Esc)">RETURN TO LIVE</button>
       {/if}
     </div>
   </div>
@@ -688,35 +718,79 @@
     </div>
   </div>
 
-  <table class="sr-only" aria-label="device history">
-    <caption>
-      Device history at {cursor != null ? fmtClock(cursor) : "live"} — {layer.label}
-    </caption>
-    <thead>
-      <tr>
-        <th>Device</th>
-        <th>Utilization</th>
-        <th>VRAM used (MiB)</th>
-        <th>VRAM total (MiB)</th>
-        <th>Temperature (°C)</th>
-        <th>Power (W)</th>
-      </tr>
-    </thead>
-    <tbody>
-      {#each deviceRows as d (d.key)}
+  {#if !layer.device && backendRows.length}
+    <div class="sr-only">
+      <table aria-label={`${layer.label} history by backend`}>
+        <caption>
+          {layer.label} over the visible {range} window; {cursor != null
+            ? `cursor at ${fmtClock(cursor)}`
+            : "live"}.
+        </caption>
+        <thead>
+          <tr>
+            <th>Lane</th>
+            <th>Last</th>
+            <th>Average</th>
+            <th>Minimum</th>
+            <th>Maximum</th>
+            {#if cursor != null}<th>At cursor</th>{/if}
+          </tr>
+        </thead>
+        <tbody>
+          {#each backendRows as row (row.lane.key)}
+            <tr>
+              <th scope="row">
+                {row.lane.isFleet
+                  ? "Fleet"
+                  : `${row.lane.label}${row.lane.tier != null
+                      ? ` — ${row.lane.tier === 0 ? "King" : "Subject"} (T${row.lane.tier})`
+                      : ""}`}
+              </th>
+              <td>{fmtLayerValue(layer, row.stats.last)}</td>
+              <td>{fmtLayerValue(layer, row.stats.avg)}</td>
+              <td>{fmtLayerValue(layer, row.stats.min)}</td>
+              <td>{fmtLayerValue(layer, row.stats.max)}</td>
+              {#if cursor != null}
+                <td>{fmtLayerValue(layer, valueAt(row.lane, readoutT))}</td>
+              {/if}
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  {/if}
+
+  <div class="sr-only">
+    <table aria-label="device history">
+      <caption>
+        Device history at {cursor != null ? fmtClock(cursor) : "live"} — {layer.label}
+      </caption>
+      <thead>
         <tr>
-          <td>{d.name}</td>
-          <td>{d.util == null ? "—" : `${d.util.toFixed(1)}%`}</td>
-          <td>{d.used == null ? "—" : Math.round(d.used)}</td>
-          <td>{d.total == null ? "—" : Math.round(d.total)}</td>
-          <td>{d.temp == null ? "—" : `${d.temp.toFixed(0)}°C`}</td>
-          <td>{d.power == null ? "—" : `${d.power.toFixed(0)}W`}</td>
+          <th>Device</th>
+          <th>Utilization</th>
+          <th>VRAM used (MiB)</th>
+          <th>VRAM total (MiB)</th>
+          <th>Temperature (°C)</th>
+          <th>Power (W)</th>
         </tr>
-      {:else}
-        <tr><td colspan="6">no device telemetry</td></tr>
-      {/each}
-    </tbody>
-  </table>
+      </thead>
+      <tbody>
+        {#each deviceRows as d (d.key)}
+          <tr>
+            <td>{d.name}</td>
+            <td>{d.util == null ? "—" : `${d.util.toFixed(1)}%`}</td>
+            <td>{d.used == null ? "—" : Math.round(d.used)}</td>
+            <td>{d.total == null ? "—" : Math.round(d.total)}</td>
+            <td>{d.temp == null ? "—" : `${d.temp.toFixed(0)}°C`}</td>
+            <td>{d.power == null ? "—" : `${d.power.toFixed(0)}W`}</td>
+          </tr>
+        {:else}
+          <tr><td colspan="6">no device telemetry</td></tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
 
   <div class="profile-ruler">
     <label class="label" for="survey-time">SURVEY TIME</label>

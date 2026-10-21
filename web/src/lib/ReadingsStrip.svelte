@@ -207,7 +207,7 @@
       class:on={layerId === "kv"}
       aria-pressed={layerId === "kv"}
       onclick={() => onLayer("kv")}
-      title="Hottest KV cache pool across the engines. Click for the history profile."
+      title="Hottest KV cache pool across the engines; 90%+ is hot, 75–89% warm. Click for the history profile."
     >
       <div class="top">
         <span class="label">KV CACHE</span>

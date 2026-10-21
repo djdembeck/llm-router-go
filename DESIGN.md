@@ -352,8 +352,14 @@ backend.
 - **Live edge:** a 1px vertical rule, a 4px sand square, and a spot height in
   10px mono at every lane. The header readout mirrors `T HH:MM:SS / KV 78%`.
 - **Cursor:** click or pointer sets a survey cursor; the keyboard uses a
-  labelled range slider; arrow keys walk it; `Return to live` clears it.
-  The cursor is a 1px chalk rule with a 3px ring at the selected lane.
+  labelled range slider; arrow keys walk it; `Return to live`, `L`, or `Esc`
+  clears it. The cursor is a 1px chalk rule with a 3px ring at the selected
+  lane.
+- **Accessible series:** the canvas is `aria-hidden`; a clipped table
+  summarises every backend lane over the visible window (last, average,
+  minimum, maximum, and the cursor value when pinned). A separate clipped
+  table carries device history. Both are wrapped so their table layout cannot
+  create page overflow.
 - **No data:** a 45° hatch at 16% with a 9px `NO DATA` label; never
   interpolated.
 - **Live tail:** the fetched history is merged with one frame per second;
@@ -370,7 +376,7 @@ backend.
 
 A 400px panel (full width when stacked) headed `LIVE SESSIONS`, a count chip,
 and `oldest first`. Each row leads with what can slow a pool, not metadata:
-backend plus a 9px phase dot (`queued` amber, `stream` moss), then a metric
+backend plus a 10px phase dot (`queued` amber, `stream` moss), then a metric
 line `CTX`, `KV HIT`, `NEW`, a single gold `est` tag, a rule, and measured
 `TTFT`. The estimates are 10px and prefixed `~`; `TTFT` is the row's one
 12px measured value. `KV HIT` is the router's estimated cache reuse `(ctx - new) / ctx`
@@ -378,7 +384,7 @@ from body-byte token estimates, amber below 40%; the engine's measured
 cache-hit rate remains in Backend Detail. A 3px amber track shows queued
 prefill progress or a complete prefill; its note gives the estimated prefill
 time (gold boundary) and flags a queue over 1.5× that estimate. The ticking
-age is a 9px footnote at the right; path and session prefix are only in the
+age is a 10px footnote at the right; path and session prefix are only in the
 row title. The list has a fixed height, never a content max: 560px while the request
 log is collapsed (420px under 1200, 360px on phones) and 320px when it is
 open (280px under 1200). Request arrival/completion never resizes the sheet;
@@ -389,7 +395,7 @@ stale — no new requests are arriving`.
 
 ### Backend Detail Table
 
-A full-width ruled table: backend + tier, router slots, engine run/wait, KV%,
+A full-width ruled table: backend + `KING`/`SUBJECT` role, router slots, engine run/wait, KV%,
 KV pool, engine memory (KV + weights in GiB), router TTFT, engine prefill,
 engine decode, cache hit. Column heads carry a source dot (moss router, water
 engine). Engine cells are `—` when the engine is not `ok`; the row title

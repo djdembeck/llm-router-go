@@ -228,11 +228,20 @@
         {#each rows as r (r.name)}
           <tr
             class:selected={selected === r.name}
+            tabindex="0"
             onclick={() => onSelect(selected === r.name ? null : r.name)}
+            onkeydown={(e) => {
+              if (e.key !== "Enter" && e.key !== " ") return;
+              e.preventDefault();
+              onSelect(selected === r.name ? null : r.name);
+            }}
           >
             <td class="first">
               <span class="name mono">{r.name}</span>
-              <span class="tier mono">T{r.tier}</span>
+              <span
+                class="tier mono"
+                title={`Tier ${r.tier} — ${r.tier === 0 ? "King" : "Subject"}`}
+              >{r.tier === 0 ? "KING" : "SUBJECT"}</span>
               {#if !r.ok}<span class="engine-off" title={r.lastError || "engine /metrics unavailable"}>off</span>{/if}
             </td>
             <td class="num">{r.slots}</td>
@@ -331,6 +340,10 @@
     z-index: 2;
     background: var(--panel);
   }
+  tbody tr:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: -2px;
+  }
   tbody tr:hover .first {
     background: var(--panel-2);
   }
@@ -342,19 +355,19 @@
   }
   .tier {
     color: var(--sand);
-    font-size: 9px;
+    font-size: 10px;
     margin-left: 6px;
   }
   .engine-off {
     margin-left: 6px;
-    font-size: 9px;
+    font-size: 10px;
     color: var(--verm);
     text-transform: uppercase;
     letter-spacing: 0.08em;
   }
   .unit {
     color: var(--ink-3);
-    font-size: 9px;
+    font-size: 10px;
   }
   .hdot {
     display: inline-block;
