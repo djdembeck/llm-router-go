@@ -551,50 +551,47 @@ func TestMetrics_TTFT_FirstByteEWMA(t *testing.T) {
 func TestMetrics_ComputeRates_LiveArrivalWindow(t *testing.T) {
 	m := newTestMetrics()
 
-	// 10 requests admitted this tick: 100 bytesIn + 200 bytesOut each,
-	// 80 tokEst each. The live rate divides the pending window by the tick
-	// interval — a full 30s-window rate, not a 500ms spike.
+	// 10 requests admitted in one 100ms bucket. The live rate is the
+	// trailing 30s ARRIVAL average, not a per-tick spike: 10/30 req/s.
 	for range 10 {
 		m.recordAccept("b", 100, 80)
 	}
-	m.computeRates(500 * time.Millisecond)
+	m.computeRates(time.Now())
 
 	s := m.snapshot("b")
-	// rate = pending / dt: (10*100 + 10*200)/0.5s in? No — the window
-	// carries only the ADMITTED demand (bytesIn + tokEst), not the future
-	// response bytes. reqRate = 10/0.5 = 20/s over the tick; that is the
-	// true arrival rate this tick.
-	if math.Abs(s.ReqRate-20.0) > 1e-9 {
-		t.Errorf("reqRate = %v, want 20 (10 arrivals / 0.5s tick)", s.ReqRate)
+	if math.Abs(s.ReqRate-10.0/30.0) > 1e-9 {
+		t.Errorf("reqRate = %v, want 0.3333 (10 arrivals / 30s window)", s.ReqRate)
 	}
-	// tokEstRate = 800/0.5 = 1600/s over the tick interval.
-	if math.Abs(s.TokEstRate-1600.0) > 1e-9 {
-		t.Errorf("tokEstRate = %v, want 1600 (800 est tokens / 0.5s)", s.TokEstRate)
+	if math.Abs(s.TokEstRate-800.0/30.0) > 1e-9 {
+		t.Errorf("tokEstRate = %v, want 26.6667 (800 est tokens / 30s)", s.TokEstRate)
 	}
-	// bytesRate = 1000/0.5 = 2000 B/s (admitted request bytes only;
-	// response bytes are not demand — they are produced over the decode).
-	if math.Abs(s.BytesRate-2000.0) > 1e-9 {
-		t.Errorf("bytesRate = %v, want 2000", s.BytesRate)
+	if math.Abs(s.BytesRate-1000.0/30.0) > 1e-9 {
+		t.Errorf("bytesRate = %v, want 33.3333 (1000 admitted bytes / 30s)", s.BytesRate)
 	}
 
-	// Nothing new this tick: the window decays by (dt/window)=0.5/30=1/60.
-	// pending after tick 1: 10*(59/60)=9.8333; rate = pending/dt.
-	m.computeRates(500 * time.Millisecond)
+	// A second evaluation inside the window does not decay the value.
+	m.computeRates(time.Now())
 	s = m.snapshot("b")
-	if math.Abs(s.ReqRate-19.6666666667) > 1e-6 { // 9.8333/0.5
-		t.Errorf("reqRate after decay tick = %v, want 19.6667 (window decays, not resets)", s.ReqRate)
+	if math.Abs(s.ReqRate-10.0/30.0) > 1e-9 {
+		t.Errorf("reqRate inside the window = %v, want unchanged 0.3333", s.ReqRate)
 	}
-	// pending is now 9.8333*(59/60) = 9.6667.
 
-	// Completion does NOT reset the rate — it retires pending demand.
+	// Completion does NOT retire demand: the window is an arrival record,
+	// so the rate stays for the full 30s.
 	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 200, BytesIn: 100, BytesOut: 200, NewTokensEst: 80, accepted: true})
 	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 200, BytesIn: 100, BytesOut: 200, NewTokensEst: 80, accepted: true})
-	m.computeRates(500 * time.Millisecond)
+	m.computeRates(time.Now())
 	s = m.snapshot("b")
-	// pending after tick2 = 10*(59/60)^2 = 9.5056; minus 2 completions,
-	// divided by 0.5s: 15.3389
-	if math.Abs(s.ReqRate-15.338888888888885) > 1e-9 {
-		t.Errorf("reqRate after 2 completions = %v, want 15.3389 (completions retire demand, decay keeps the tail)", s.ReqRate)
+	if math.Abs(s.ReqRate-10.0/30.0) > 1e-9 {
+		t.Errorf("reqRate after completions = %v, want unchanged 0.3333 (completion never subtracts)", s.ReqRate)
+	}
+
+	// Hard cutoff: once the admission bucket is older than 30s it leaves the
+	// window in one step (no decay tail).
+	m.computeRates(time.Now().Add(31 * time.Second))
+	s = m.snapshot("b")
+	if s.ReqRate != 0 || s.TokEstRate != 0 || s.BytesRate != 0 {
+		t.Errorf("rates after the 30s cutoff = %+v, want all zero", s)
 	}
 
 	// Lifetime totals count completions only.
@@ -606,15 +603,15 @@ func TestMetrics_ComputeRates_LiveArrivalWindow(t *testing.T) {
 func TestMetrics_Rates_RejectionsDoNotInflate(t *testing.T) {
 	m := newTestMetrics()
 	// A 429 that never entered a backend has no accepted flag — it must not
-	// add to (or retire) the pending window.
+	// add to the arrival window.
 	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 429, BytesIn: 50, NewTokensEst: 8})
-	m.computeRates(500 * time.Millisecond)
+	m.computeRates(time.Now())
 	s := m.snapshot("b")
 	if s.ReqRate != 0 || s.TokEstRate != 0 || s.BytesRate != 0 {
 		t.Errorf("rates after pure rejection = %+v, want all zero", s)
 	}
-	if s.ReqTotal != 1 {
-		t.Errorf("reqTotal = %d, want 1 (rejection is a completed sample)", s.ReqTotal)
+	if s.ReqTotal != 1 || s.RejectedTotal != 1 {
+		t.Errorf("reqTotal/rejected = %d/%d, want 1/1", s.ReqTotal, s.RejectedTotal)
 	}
 }
 
@@ -790,11 +787,12 @@ sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank=
 		t.Errorf("kvPct = %v, want 75", s.view.KVPct)
 	}
 	// First sight of a counter has no prior value: rates start at 0.
-	if s.view.PrefillTokS != 0 || s.view.DecodeTokS != 0 {
-		t.Errorf("first-sight rates = %v/%v, want 0/0 (no baseline yet)", s.view.PrefillTokS, s.view.DecodeTokS)
+	if s.view.PrefillTokS != 0 || s.view.PrefillCacheTokS != 0 || s.view.DecodeTokS != 0 {
+		t.Errorf("first-sight rates = %v/%v/%v, want 0/0/0 (no baseline yet)", s.view.PrefillTokS, s.view.PrefillCacheTokS, s.view.DecodeTokS)
 	}
 
-	// realtime_tokens_total by mode: prefill = compute+cache, decode separate.
+	// realtime_tokens_total by mode: prefill_compute and prefill_cache are
+	// separate fields (compute-only is the contract); decode separate.
 	body2 := `
 sglang:num_running_reqs{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 4
 sglang:token_usage{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 0.75
@@ -804,9 +802,15 @@ sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank=
 `
 	time.Sleep(300 * time.Millisecond)
 	s.scrapeBody(parsePromText([]byte(body2)))
-	// Δprefill = (12000-4000)+(6000-2000) = 12000 over ~0.3s wall clock.
-	if s.view.PrefillTokS < 30000 || s.view.PrefillTokS > 60000 {
-		t.Errorf("prefillTokS = %v, want ~40000/s (12000 tokens / ~0.3s)", s.view.PrefillTokS)
+	// Δcompute = 8000, Δcache = 4000, Δdecode = 12000 over ~0.3s.
+	if s.view.PrefillTokS < 20000 || s.view.PrefillTokS > 35000 {
+		t.Errorf("prefillTokS = %v, want ~26666/s compute-only (8000 tokens / ~0.3s)", s.view.PrefillTokS)
+	}
+	if s.view.PrefillCacheTokS < 10000 || s.view.PrefillCacheTokS > 18000 {
+		t.Errorf("prefillCacheTokS = %v, want ~13333/s (4000 cache tokens / ~0.3s)", s.view.PrefillCacheTokS)
+	}
+	if s.view.PrefillTotalTokS < 30000 || s.view.PrefillTotalTokS > 50000 {
+		t.Errorf("prefillTotalTokS = %v, want ~40000/s (compute+cache)", s.view.PrefillTotalTokS)
 	}
 	if s.view.DecodeTokS < 30000 {
 		t.Errorf("decodeTokS = %v, want ~40000/s (12000 tokens / ~0.3s)", s.view.DecodeTokS)
@@ -1288,11 +1292,12 @@ sglang:generation_tokens_histogram_count 3
 	if v.HitRate < 0.41 || v.HitRate > 0.43 {
 		t.Errorf("hitRate = %v, want ~0.42", v.HitRate)
 	}
-	// Rates over the ~2.2s interval: prefill = compute+cache summed across
-	// both ranks = (4400-2100)×2 + (2100-500)×2 = 7800 tok;
-	// decode = (9000-1000)×2 = 16000 tok.
-	wantNear(t, v.PrefillTokS, 3545, "prefillTokS") // 7800/2.2
-	wantNear(t, v.DecodeTokS, 7273, "decodeTokS")   // 16000/2.2
+	// Rates over the ~2.2s interval: compute = (4400-2100)×2 = 4600 tok;
+	// cache = (2100-500)×2 = 3200 tok; decode = (9000-1000)×2 = 16000 tok.
+	wantNear(t, v.PrefillTokS, 2091, "prefillTokS")           // 4600/2.2
+	wantNear(t, v.PrefillCacheTokS, 1455, "prefillCacheTokS") // 3200/2.2
+	wantNear(t, v.PrefillTotalTokS, 3545, "prefillTotalTokS") // 7800/2.2
+	wantNear(t, v.DecodeTokS, 7273, "decodeTokS")             // 16000/2.2
 	// is_streaming-split TTFT means must be distinct; blended is a mix.
 	stream := deref64f(v.TTFTStreamMs, "ttftStreamMs", t)
 	nonStream := deref64f(v.TTFTNonStreamMs, "ttftNonStreamMs", t)
@@ -1652,7 +1657,10 @@ func TestMetricsStream_LiveSnapshot(t *testing.T) {
 	}
 	fDone := fr.waitFor(deadline, func(f *frame) bool {
 		s := frameBackend(t, f, "subject")
-		return s.TTFTSampleCount >= 1
+		// Wait for completion, not just the first byte: TTFT lands at first
+		// byte while reqTotal/tokEst land at finish. Waiting only on TTFT
+		// can observe the pre-finish frame and race the counters.
+		return s.ReqTotal >= 1 && s.TTFTSampleCount >= 1
 	})
 	subj = frameBackend(t, fDone, "subject")
 	if subj.ReqTotal < 1 {
@@ -2380,5 +2388,360 @@ func TestSessions_FeedJSON(t *testing.T) {
 	// so the ring is empty and the JSON is [] not null.
 	if sj.Reqs == nil {
 		t.Errorf("session reqs = null, want [] (active+recent, no completions yet)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// history store, device telemetry, fleet aggregation
+// ---------------------------------------------------------------------------
+
+func TestHistory_RangeTable(t *testing.T) {
+	want := map[string]struct {
+		dur  time.Duration
+		step time.Duration
+	}{
+		"5m":  {5 * time.Minute, time.Second},
+		"1h":  {time.Hour, 5 * time.Second},
+		"6h":  {6 * time.Hour, time.Minute},
+		"24h": {24 * time.Hour, 2 * time.Minute},
+		"7d":  {7 * 24 * time.Hour, 15 * time.Minute},
+		"30d": {30 * 24 * time.Hour, time.Hour},
+	}
+	for name, w := range want {
+		r, ok := historyRanges[name]
+		if !ok {
+			t.Fatalf("missing range %q", name)
+		}
+		if r.Dur != w.dur || r.Step != w.step {
+			t.Errorf("%s = %v/%v, want %v/%v", name, r.Dur, r.Step, w.dur, w.step)
+		}
+		if n := int(r.Dur / r.Step); n > 720 {
+			t.Errorf("%s has %d points, want ≤720", name, n)
+		}
+	}
+}
+
+func TestHistory_BuildSeriesBuckets(t *testing.T) {
+	from := int64(1_000_000)
+	const step = int64(5000)
+	pts := []historyPoint{}
+	mk := func(t int64, inFlight, kv float64) historyPoint {
+		var p historyPoint
+		p.T = t
+		hpSet(&p, hiInFlight, inFlight)
+		hpSet(&p, hiKVPct, kv)
+		hpSet(&p, hiKVMax, kv)
+		return p
+	}
+	pts = append(pts, mk(from, 1, 10))
+	pts = append(pts, mk(from+1000, 3, 90))
+	pts = append(pts, mk(from+5000, 5, 50))
+	pts = append(pts, mk(from+20000, 9, 99)) // outside the 3 buckets
+
+	out := buildHistSeries("b", pts, from, step, 3)
+	if len(out.T) != 3 || out.T[0] != from || out.T[1] != from+step || out.T[2] != from+2*step {
+		t.Fatalf("grid = %v, want from+i*step", out.T)
+	}
+	in := out.Series["inFlight"]
+	if in[0] == nil || math.Abs(*in[0]-2) > 1e-9 {
+		t.Errorf("bucket0 inFlight = %v, want avg 2", in[0])
+	}
+	if in[1] == nil || *in[1] != 5 {
+		t.Errorf("bucket1 inFlight = %v, want 5", in[1])
+	}
+	if in[2] != nil {
+		t.Errorf("empty bucket = %v, want null", *in[2])
+	}
+	kv := out.Series["kvMax"]
+	if kv[0] == nil || *kv[0] != 90 {
+		t.Errorf("bucket0 kvMax = %v, want max 90 (not avg 50)", kv[0])
+	}
+	kvp := out.Series["kvPct"]
+	if kvp[0] == nil || math.Abs(*kvp[0]-50) > 1e-9 {
+		t.Errorf("bucket0 kvPct = %v, want avg 50", kvp[0])
+	}
+}
+
+func TestHistory_SnapshotRoundTrip(t *testing.T) {
+	path := t.TempDir() + "/history.gob"
+	h := newHistoryStore()
+	h.configure(path)
+	now := time.Now().UnixMilli()
+	var p historyPoint
+	p.T = now - 2000
+	hpSet(&p, hiInFlight, 7)
+	hpSet(&p, hiKVPct, 42)
+	s := newSeriesHistory()
+	s.add(p, now-2000)
+	h.backends["b"] = s
+	fp := p
+	h.fleet.add(fp, now-2000)
+	var gp gpuPoint
+	gp.T = now - 2000
+	gp.V[guUtil] = 88
+	gp.Flags = 1 << guUtil
+	gs := newGPUSeries()
+	gs.add(gp, now-2000)
+	h.gpus["GPU-1"] = gs
+	h.save()
+
+	h2 := newHistoryStore()
+	h2.configure(path)
+	if got := len(h2.backends["b"].raw.ordered()); got != 1 {
+		t.Fatalf("loaded backend raw points = %d, want 1", got)
+	}
+	if got := len(h2.fleet.raw.ordered()); got != 1 {
+		t.Fatalf("loaded fleet raw points = %d, want 1", got)
+	}
+	if got := len(h2.gpus["GPU-1"].raw.ordered()); got != 1 {
+		t.Fatalf("loaded gpu raw points = %d, want 1", got)
+	}
+}
+
+func TestHistory_QueryDenseArrays(t *testing.T) {
+	h := newHistoryStore()
+	now := time.Now().UnixMilli()
+	for i := 0; i < 5; i++ {
+		var p historyPoint
+		p.T = now - int64(i)*1000
+		hpSet(&p, hiInFlight, float64(i))
+		s, ok := h.backends["b"]
+		if !ok {
+			s = newSeriesHistory()
+			h.backends["b"] = s
+		}
+		s.add(p, p.T)
+	}
+	resp := h.query("5m", []string{"b"})
+	if resp.StepMs != 1000 || len(resp.Backends) != 1 {
+		t.Fatalf("response = step %d backends %d, want 1000/1", resp.StepMs, len(resp.Backends))
+	}
+	if len(resp.Backends[0].T) != 300 {
+		t.Fatalf("points = %d, want 300 (5m/1s)", len(resp.Backends[0].T))
+	}
+	arr := resp.Backends[0].Series["inFlight"]
+	if len(arr) != 300 {
+		t.Fatalf("inFlight array = %d, want 300", len(arr))
+	}
+	last := arr[len(arr)-1]
+	if last == nil {
+		t.Fatalf("last bucket is null, want a sampled value")
+	}
+	if resp.TTFT.N != 0 || resp.TTFT.P50 != 0 {
+		t.Errorf("ttft summary = %+v, want empty (no router samples)", resp.TTFT)
+	}
+}
+
+func TestHistory_ConcurrentQueryAndSample(t *testing.T) {
+	h := newHistoryStore()
+	now := time.Now().UnixMilli()
+	s := newSeriesHistory()
+	h.backends["b"] = s
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var p historyPoint
+			p.T = now - int64(i)*1000
+			hpSet(&p, hiInFlight, float64(i))
+			h.mu.Lock()
+			s.add(p, p.T)
+			h.mu.Unlock()
+		}(i)
+	}
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = h.query("5m", []string{"b"})
+		}()
+	}
+	wg.Wait()
+}
+
+func TestGPU_ParseDevices(t *testing.T) {
+	body := `
+DCGM_FI_DEV_GPU_UTIL{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 87
+DCGM_FI_DEV_FB_USED{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 61000
+DCGM_FI_DEV_FB_FREE{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 20000
+DCGM_FI_DEV_GPU_TEMP{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 71
+DCGM_FI_DEV_POWER_USAGE{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 402.5
+nvidia_smi_utilization_gpu_ratio{gpu="1",name="A100",uuid="GPU-bbb"} 0.5
+nvidia_smi_memory_used_bytes{gpu="1",name="A100",uuid="GPU-bbb"} 1073741824
+nvidia_smi_memory_total_bytes{gpu="1",name="A100",uuid="GPU-bbb"} 2147483648
+`
+	out := parseGPUDevices(parsePromText([]byte(body)))
+	if len(out) != 2 {
+		t.Fatalf("devices = %d, want 2", len(out))
+	}
+	byKey := map[string]gpuDeviceFrame{}
+	for _, d := range out {
+		byKey[d.Key] = d
+	}
+	d := byKey["GPU-aaa"]
+	if d.UtilPct != 87 || d.MemUsedMB != 61000 || d.MemTotalMB != 81000 || d.TempC == nil || *d.TempC != 71 || d.PowerW == nil || *d.PowerW != 402.5 {
+		t.Errorf("dcgm device = %+v, want util 87, mem 61000/81000 (used+free), temp 71, power 402.5", d)
+	}
+	n := byKey["GPU-bbb"]
+	if n.UtilPct != 50 || n.MemUsedMB != 1024 || n.MemTotalMB != 2048 {
+		t.Errorf("nvidia device = %+v, want util 50, mem 1024/2048 MiB", n)
+	}
+}
+
+func TestFleetAggregates_GatesNonOKEngines(t *testing.T) {
+	f := metricsFrame{Backends: []backendFrame{
+		{TTFTms: 100, TTFTSampleCount: 10, Engine: engineView{
+			Status: "ok", Running: 2, Waiting: 1, PrefillTokS: 10, PrefillCacheTokS: 4,
+			DecodeTokS: 20, KVPct: 80, HitRate: 0.5,
+		}},
+		{TTFTms: 900, TTFTSampleCount: 30, Engine: engineView{
+			Status: "err", Running: 99, Waiting: 99, PrefillTokS: 99,
+			DecodeTokS: 99, KVPct: 99, HitRate: 0.9,
+		}},
+	}}
+	applyFleetAggregates(&f)
+	tt := f.Totals
+	if tt.EngineOK != 1 || tt.EngineRunning != 2 || tt.EngineWaiting != 1 {
+		t.Errorf("engine sums = ok %d running %v waiting %v, want 1/2/1 (err excluded)", tt.EngineOK, tt.EngineRunning, tt.EngineWaiting)
+	}
+	if tt.PrefillTokS != 10 || tt.PrefillCacheTokS != 4 || tt.DecodeTokS != 20 {
+		t.Errorf("token sums = %+v, want 10/4/20", tt)
+	}
+	if tt.KVPeak != 80 {
+		t.Errorf("kvPeak = %v, want 80 (err excluded)", tt.KVPeak)
+	}
+	if math.Abs(tt.TTFTMs-700) > 1e-9 || tt.TTFTSampleCount != 40 {
+		t.Errorf("ttft = %v n=%d, want 700/40 (sample-weighted)", tt.TTFTMs, tt.TTFTSampleCount)
+	}
+	if math.Abs(tt.HitRate-0.5) > 1e-9 {
+		t.Errorf("hitRate = %v, want 0.5", tt.HitRate)
+	}
+}
+
+func TestEngine_HistogramDisappears(t *testing.T) {
+	s := &engineScrape{counters: map[string]float64{}, cTimes: map[string]time.Time{}, hists: map[string]*histState{}}
+	base := `
+vllm:num_requests_running{model_name="m",engine="0"} 1
+vllm:time_to_first_token_seconds_sum{model_name="m"} 1.0
+vllm:time_to_first_token_seconds_count{model_name="m"} 2
+`
+	s.scrapeBody(parsePromText([]byte(base)))
+	next := `
+vllm:num_requests_running{model_name="m",engine="0"} 1
+vllm:time_to_first_token_seconds_sum{model_name="m"} 1.6
+vllm:time_to_first_token_seconds_count{model_name="m"} 4
+`
+	rewindBaselines(s, 2*time.Second)
+	s.scrapeBody(parsePromText([]byte(next)))
+	if s.view.TTFTSamples == 0 || s.view.TTFTms == 0 {
+		t.Fatalf("after delta: ttft=%v samples=%d, want a mean and count", s.view.TTFTms, s.view.TTFTSamples)
+	}
+	gone := `
+vllm:num_requests_running{model_name="m",engine="0"} 1
+`
+	s.scrapeBody(parsePromText([]byte(gone)))
+	if s.view.TTFTSamples != 0 || s.view.TTFTms != 0 {
+		t.Errorf("after histogram disappearance: ttft=%v samples=%d, want 0/0 (not a stale mean)", s.view.TTFTms, s.view.TTFTSamples)
+	}
+}
+
+func TestEngine_RecoveryBaselineOnly(t *testing.T) {
+	s := &engineScrape{counters: map[string]float64{}, cTimes: map[string]time.Time{}, hists: map[string]*histState{}}
+	body := func(v float64) []byte {
+		return []byte(fmt.Sprintf("vllm:prompt_tokens_total{model_name=\"m\"} %v\n", v))
+	}
+	s.scrapeBody(parsePromText(body(100)))
+	rewindBaselines(s, 2*time.Second)
+	s.scrapeBody(parsePromText(body(140)))
+	if s.view.DecodeTokS != 0 || s.view.PrefillTokS <= 0 {
+		// prompt tokens feed prefill when no by_source exists.
+		t.Fatalf("after delta prefill=%v, want >0", s.view.PrefillTokS)
+	}
+	s.resetBaselines()
+	s.scrapeBody(parsePromText(body(180)))
+	if s.view.PrefillTokS != 0 {
+		t.Errorf("first scrape after reset = %v, want 0 (baseline-only)", s.view.PrefillTokS)
+	}
+	rewindBaselines(s, 2*time.Second)
+	s.scrapeBody(parsePromText(body(220)))
+	if s.view.PrefillTokS <= 0 {
+		t.Errorf("post-recovery delta = %v, want >0", s.view.PrefillTokS)
+	}
+}
+
+func TestSessions_EvictionKeepsLiveAggregate(t *testing.T) {
+	r := newSessionRegistry()
+	id := r.start("b", "/v1/chat/completions", true, "live-session", 10, 5)
+	for i := 0; i < sessStoreCap+5; i++ {
+		key := fmt.Sprintf("s%04d", i)
+		r.mu.Lock()
+		r.put(key, &sessionAgg{ID: key, Backend: "b", FirstMs: 1, LastMs: int64(i)})
+		r.mu.Unlock()
+	}
+	f := r.feed()
+	s := sessById(t, f, "live-session")
+	if s.LiveN != 1 || !s.Active {
+		t.Fatalf("live session after store pressure = %+v, want liveN=1 active (never evicted while live)", s)
+	}
+	r.finish(id, 200, 100, 40, 400)
+	f = r.feed()
+	s = sessById(t, f, "live-session")
+	if s.LiveN != 0 || s.N != 1 {
+		t.Errorf("after finish = liveN %d n %d, want 0/1", s.LiveN, s.N)
+	}
+}
+
+func TestSessionKey_RoleFraming(t *testing.T) {
+	a := &parsedBody{Messages: []rawMessage{
+		{Role: "user", Content: json.RawMessage(`"hi"`)},
+		{Role: "assistant", Content: json.RawMessage(`"hello"`)},
+	}}
+	b := &parsedBody{Messages: []rawMessage{
+		{Role: "assistant", Content: json.RawMessage(`"hi"`)},
+		{Role: "assistant", Content: json.RawMessage(`"hello"`)},
+	}}
+	if sessionKeyFor(a) == sessionKeyFor(b) {
+		t.Errorf("role difference produced the same session key")
+	}
+}
+
+func TestGPU_ParseFakeBody(t *testing.T) {
+	body := []byte(`DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 75.4205088076072
+DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 61000
+DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 81920
+DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52.018398644374244
+DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52000
+DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 81920
+`)
+	out := parseGPUDevices(parsePromText(body))
+	if len(out) != 2 {
+		t.Fatalf("devices = %d (%+v), want 2", len(out), out)
+	}
+}
+
+func TestRespTracker_ProxiedRequestIsNotARejection(t *testing.T) {
+	old := metrics
+	metrics = newMetricsRegistry()
+	defer func() { metrics = old }()
+
+	tr := &respTracker{
+		ResponseWriter: httptest.NewRecorder(),
+		backend:        "b",
+		reqStart:       time.Now().Add(-time.Second),
+		stream:         true,
+		bytesIn:        128,
+	}
+	tr.finish("b", "/v1/chat/completions", 200, 250, 400)
+	s := metrics.snapshot("b")
+	if s.ReqTotal != 1 || s.RejectedTotal != 0 {
+		t.Fatalf("proxied completion: reqTotal=%d rejectTotal=%d, want 1/0", s.ReqTotal, s.RejectedTotal)
+	}
+
+	// A router-originated rejection still counts as a rejected sample.
+	metrics.recordRequest("b", requestSample{Backend: "b", Status: 429, BytesIn: 10})
+	s = metrics.snapshot("b")
+	if s.ReqTotal != 2 || s.RejectedTotal != 1 {
+		t.Fatalf("after rejection: reqTotal=%d rejectTotal=%d, want 2/1", s.ReqTotal, s.RejectedTotal)
 	}
 }

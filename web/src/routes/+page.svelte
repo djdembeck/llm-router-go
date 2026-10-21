@@ -1,354 +1,318 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import Masthead from "$lib/Masthead.svelte";
-  import Sheet from "$lib/Sheet.svelte";
-  import FleetStrip from "$lib/FleetStrip.svelte";
-  import CacheSheet from "$lib/CacheSheet.svelte";
-  import RequestTape from "$lib/RequestTape.svelte";
-  import SessionSheet from "$lib/SessionSheet.svelte";
-  import { clock } from "$lib/fmt.js";
-  import {
-    createMetricsStore,
-    fetchSessions,
-    type StoreState,
-    type SessionsFeed,
-  } from "$lib/metrics.js";
+  import TopBar from "$lib/TopBar.svelte";
+  import FleetRail from "$lib/FleetRail.svelte";
+  import ReadingsStrip from "$lib/ReadingsStrip.svelte";
+  import FleetProfile from "$lib/FleetProfile.svelte";
+  import LiveSessions from "$lib/LiveSessions.svelte";
+  import BackendTable from "$lib/BackendTable.svelte";
+  import RequestFeed from "$lib/RequestFeed.svelte";
+  import StaleBanner from "$lib/StaleBanner.svelte";
+  import { LiveStore } from "$lib/live.svelte";
+  import { HistoryStore } from "$lib/history.svelte";
+  import type { Frame, MetricAverages, RangeName } from "$lib/api";
+  import type { LayerId } from "$lib/profile";
 
-  // The sheet: masthead → tessellated fold-cells → fleet strip → request
-  // tape. Deploy state drives every cell's fold angle (one pull, whole
-  // field). At narrow width the sheet auto-folds to the packet row.
+  const live = new LiveStore();
+  const history = new HistoryStore();
 
-  const initialState: StoreState = {
-    live: false,
-    health: "offline",
-    feed: null,
-    frame: null,
-    hist: {},
-    fleetHist: [],
-    requests: [],
-    spikeCount: 0,
-    lastFrameAt: null,
-    stale: false,
-    spikePeak: 0,
-  };
-
-  let mstate: StoreState = $state(initialState);
-  let deployed = $state(true);
-  // cascade on/off replay without remounting the sheet — remounting reset
-  // every trace's scroll window and lost the operator's continuity.
-  let cascadeOn = $state(true);
-  let open: string | null = $state(null);
-  let narrow = $state(false);
   let now = $state(Date.now());
-  let sessFeed: SessionsFeed | null = $state(null);
+  let selected = $state<string | null>(null);
+  let layerId = $state<LayerId>("kv");
+  let requestLogOpen = $state(false);
+  let cursor = $state<number | null>(null);
+  let theme = $state<"night" | "day">(
+    typeof document !== "undefined" && document.documentElement.dataset.theme === "day"
+      ? "day"
+      : "night",
+  );
+  let clockTimer: number | null = null;
 
-  let mq: MediaQueryList | null = null;
-  let store: { destroy: () => void } | null = null;
-  let cascadeTimer: ReturnType<typeof setTimeout> | null = null;
-  let nowTimer: ReturnType<typeof setInterval> | null = null;
-  let sessTimer: ReturnType<typeof setInterval> | null = null;
-  // one-time affordance hint: the page's best features (open a fold, hover
-  // detail, esc) are discoverable only by accident — say it once, then stop
-  let hint = $state(false);
-
-  // per-cell element registry: closing a fold returns focus to its cell
-  // (otherwise a keyboard user is stranded at <body>)
-  const cellEls = new Map<string, HTMLElement>();
-  function registerEl(name: string, el: HTMLElement | null) {
-    if (el) cellEls.set(name, el);
-    else cellEls.delete(name);
-  }
-
-  function dismissHint() {
-    if (!hint) return;
-    hint = false;
-    try {
-      sessionStorage.setItem("lr-go-hint-seen", "1");
-    } catch {
-      /* private mode: the hint simply returns next visit */
-    }
-  }
-
-  // narrow viewport: the sheet folds to the packet row (mobile/compact)
-  const effectiveDeployed = $derived(deployed && !narrow);
-  // in narrow mode the sheet is forced folded, so the packet control
-  // would be a dead button — hide it rather than lie.
-  const showPacketControl = $derived(!narrow);
-
-  // stale: the last truth is still on screen but old — the banner keeps
-  // it there with a red time anchor instead of an empty hollow sheet.
-  const showStale = $derived(mstate.stale && !!mstate.frame);
-  const staleAgo = $derived.by(() => {
-    void now; // recompute once a second
-    if (!mstate.lastFrameAt) return "";
-    const s = Math.max(1, Math.floor((now - mstate.lastFrameAt) / 1000));
-    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
-  });
-
-  const frame = $derived(mstate.frame);
-  const feed = $derived(mstate.feed);
-  const feedIsMock = $derived(!!feed && feed.kind === "sse-mock");
-  const hollowMsg = $derived.by(() => {
-    if (mstate.live) return "no backends configured — set BACKENDS in the router";
-    if (mstate.feed) return `sheet offline — re-arming ${mstate.feed.url}…`;
-    return "sheet offline — waiting for /metrics/stream";
-  });
-
-  // tier0 limit = sum of the King backends' concurrency caps (null when
-  // no King is capped, or none configured) — the masthead's denominator
-  const tier0Limit = $derived.by(() => {
-    const backends = frame?.backends;
-    if (!backends) return null;
-    const kings = backends.filter((b) => b.tier === 0);
-    const capped = kings.filter((b) => b.maxConcurrent > 0);
-    return capped.length ? capped.reduce((a, b) => a + b.maxConcurrent, 0) : null;
+  // Samples arrive every second. A one-second sample is not a meaningful
+  // display window for TTFT or engine throughput, so the summary reads a 15s
+  // rolling mean and refreshes every 5s. Counts stay live; the profile and
+  // sessions remain 1s. The longer hold is also what lets the 1.2s number
+  // tween settle instead of chasing each scrape.
+  const METRIC_WINDOW = 15;
+  const METRIC_HOLD_MS = 5000;
+  let metricFrame = $state<Frame | null>(null);
+  let metricAverages = $state<MetricAverages | null>(null);
+  let metricTimer: ReturnType<typeof setTimeout> | null = null;
+  let metricLast = 0;
+  $effect(() => {
+    const f = live.frame;
+    if (!f) return;
+    const wait = Math.max(0, metricLast + METRIC_HOLD_MS - Date.now());
+    if (metricTimer) clearTimeout(metricTimer);
+    metricTimer = setTimeout(() => {
+      const tail = live.liveFrames.slice(-METRIC_WINDOW);
+      const avg = (pick: (fr: Frame) => number | null): number | null => {
+        let sum = 0;
+        let n = 0;
+        for (const fr of tail) {
+          const v = pick(fr);
+          if (v == null || !Number.isFinite(v)) continue;
+          sum += v;
+          n++;
+        }
+        return n ? sum / n : null;
+      };
+      metricAverages = {
+        ttftMs: avg((fr) => (fr.totals.ttftSampleCount > 0 ? fr.totals.ttftMs : null)),
+        prefillTokS: avg((fr) => fr.totals.prefillTokS),
+        decodeTokS: avg((fr) => fr.totals.decodeTokS),
+      };
+      metricFrame = f;
+      metricLast = Date.now();
+    }, wait);
+    return () => {
+      if (metricTimer) clearTimeout(metricTimer);
+    };
   });
 
   onMount(() => {
-    store = createMetricsStore((s) => {
-      mstate = s;
-    });
-    mq = window.matchMedia("(max-width: 720px)");
-    narrow = mq.matches;
-    if (narrow) deployed = false; // narrow is folded — keep the state honest
-    try {
-      hint = !sessionStorage.getItem("lr-go-hint-seen");
-    } catch {
-      /* private mode */
-    }
-    const onMq = (e: MediaQueryListEvent) => {
-      const wasNarrow = narrow;
-      narrow = e.matches;
-      if (e.matches && !wasNarrow) {
-        // folding into narrow: close any open fold, sync deploy state
-        open = null;
-        deployed = false;
-      } else if (!e.matches && wasNarrow) {
-        // going wide: re-deploy with the cascade
-        deployed = true;
-        replayCascade();
-      }
-    };
-    mq.addEventListener("change", onMq);
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && open) closeFold();
-    };
-    window.addEventListener("keydown", onKey);
-    nowTimer = setInterval(() => (now = Date.now()), 1000);
-    // the session feed (live stack + conversations) is a separate poll —
-    // the SSE frame stream does not carry it
-    const pollSessions = async () => {
-      const f = await fetchSessions();
-      if (f) sessFeed = f;
-    };
-    void pollSessions();
-    sessTimer = setInterval(() => void pollSessions(), 1000);
+    const el = document.documentElement;
+    theme = el.dataset.theme === "day" ? "day" : "night";
+    live.start();
+    history.start();
+    clockTimer = window.setInterval(() => (now = Date.now()), 1000);
     return () => {
-      mq?.removeEventListener("change", onMq);
-      window.removeEventListener("keydown", onKey);
-      if (nowTimer) clearInterval(nowTimer);
-      if (sessTimer) clearInterval(sessTimer);
-      if (cascadeTimer) clearTimeout(cascadeTimer);
-      store?.destroy();
+      live.destroy();
+      history.destroy();
+      clearInterval(clockTimer ?? 0);
     };
   });
 
-  function replayCascade() {
-    cascadeOn = false;
-    if (cascadeTimer) clearTimeout(cascadeTimer);
-    cascadeTimer = setTimeout(() => (cascadeOn = true), 30);
+  let lastFeedKind = "";
+  $effect(() => {
+    const kind = live.feed?.kind ?? "";
+    if (kind && lastFeedKind && (kind === "sse-mock") !== (lastFeedKind === "sse-mock")) {
+      // Switching between the real fleet and the dev mock means a different
+      // fleet; clear history. A real→stats transport fallback is the SAME
+      // fleet and keeps the last fetched series (frozen truth).
+      history.clear();
+      cursor = null;
+      metricFrame = null;
+      metricAverages = null;
+      metricLast = 0;
+    }
+    if (kind) lastFeedKind = kind;
+  });
+
+  const showStale = $derived(live.stale && !!live.frame);
+  const feedName = $derived(
+    live.feed
+      ? live.feed.kind === "sse"
+        ? "/metrics/stream"
+        : live.feed.kind === "sse-mock"
+          ? "dev mock · /dev-metrics/stream"
+          : "/stats · polling"
+      : "no feed",
+  );
+  const historyError = $derived(
+    history.error && !history.data ? "history feed unavailable — showing live frames only" : null,
+  );
+
+  function toggleTheme(): void {
+    theme = theme === "night" ? "day" : "night";
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("lrg-theme", theme);
+    } catch {
+      /* private mode: the choice lasts this session */
+    }
   }
 
-  function toggleDeploy() {
-    deployed = !deployed;
-    if (!deployed) open = null;
-    replayCascade();
-  }
-
-  function toggleCell(name: string) {
-    dismissHint();
-    if (open === name) closeFold();
-    else open = name;
-  }
-
-  function closeFold() {
-    const prev = open;
-    open = null;
-    if (prev) cellEls.get(prev)?.focus();
+  function onRange(r: RangeName): void {
+    cursor = null;
+    history.setRange(r);
   }
 </script>
 
 <svelte:head>
-  <title>llm-router-go — fleet sheet</title>
+  <title>llm-router-go — fleet survey</title>
+  <meta
+    name="description"
+    content="Live GPU-aware inference routing: sessions, GPU and KV pressure, prefill and decode throughput, TTFT, and history."
+  />
 </svelte:head>
 
-<div class="page">
-  <Masthead
-    totalInFlight={frame?.totals?.inFlight ?? 0}
-    totalWaiting={frame?.totals?.waiting ?? 0}
-    gpu={frame ? frame.gpu : null}
-    tier0Inflight={frame?.tier0Inflight ?? 0}
-    tier0Limit={tier0Limit}
-    deployed={effectiveDeployed}
-    showPacketControl={showPacketControl}
-    onToggle={toggleDeploy}
+<h1 class="sr-only">llm-router-go fleet survey</h1>
+
+<div class="app">
+  <TopBar
+    health={live.health}
+    feedName={feedName}
+    mock={live.feed?.kind === "sse-mock"}
+    lastFrameAt={live.lastFrameAt}
+    paused={live.paused}
+    range={history.range}
+    {now}
+    {theme}
+    onRange={onRange}
+    onPause={() => live.togglePause()}
+    onTheme={toggleTheme}
   />
 
-  <div class="feed-row">
-    <span class="health" data-h={mstate.health}>
-      <i></i>{mstate.health}
-    </span>
-    <span class="feed-note">
-      {#if feed}
-        feed: {feed.url}{feedIsMock ? ' (dev mock)' : ''}
-      {:else}
-        feed: —
-      {/if}
-    </span>
-    {#if mstate.lastFrameAt}
-      <span class="feed-last">last data {clock(mstate.lastFrameAt)}</span>
-    {/if}
-    <span class="feed-est">token figures are <em>est</em> — prefill, not decode</span>
-  </div>
-
   {#if showStale}
-    <div class="stale-banner" role="alert">
-      <span>
-        stale — last data {clock(mstate.lastFrameAt ?? 0)} · {staleAgo} ago
-      </span>
-      <span class="stale-why">
-        {#if feed}
-          re-arming <b>{feed.url}</b>
-        {:else}
-          no feed
-        {/if}
-      </span>
-    </div>
+    <StaleBanner lastFrameAt={live.lastFrameAt} {now} feedName={feedName} />
+  {/if}
+  {#if historyError}
+    <div class="notice" role="status">{historyError}</div>
   {/if}
 
-  {#if frame && frame.backends.length > 0}
-    <Sheet
-      frame={frame}
-      hist={mstate.hist}
-      deployed={effectiveDeployed}
-      cascadeOn={cascadeOn}
-      open={open}
-      onToggle={toggleCell}
-      registerEl={registerEl}
+  <div class="body">
+    <FleetRail
+      frame={live.frame}
+      metricFrame={metricFrame}
+      history={history.data}
+      {selected}
+      onSelect={(name) => (selected = name)}
+      feed={live.feed}
+      lastFrameAt={live.lastFrameAt}
+      {now}
     />
 
-    {#if hint}
-      <div class="sheet-hint">
-        <span>click a fold to open · hover for detail · esc refolds</span>
-        <button class="hint-x" aria-label="dismiss hint" onclick={dismissHint}>✕</button>
+    <main class="main">
+      <ReadingsStrip
+        frame={live.frame}
+        metricFrame={metricFrame}
+        averages={metricAverages}
+        history={history.data}
+        {layerId}
+        onLayer={(id) => (layerId = id)}
+      />
+
+      <div class="live-band">
+        <section class="profile-sheet sheet" aria-label="fleet profile">
+          <FleetProfile
+            history={history.data}
+            frames={live.liveFrames}
+            framesVersion={live.framesVersion}
+            {layerId}
+            range={history.range}
+            {selected}
+            bind:cursor
+            requests={live.requests}
+            sessions={live.sessions}
+            paused={live.paused}
+            stale={live.stale}
+            {theme}
+          />
+        </section>
+
+        <LiveSessions
+          feed={live.sessions}
+          now={live.paused || live.stale ? (live.lastFrameAt ?? now) : now}
+          paused={live.paused}
+          stale={live.stale}
+          tall={!requestLogOpen}
+        />
       </div>
-    {/if}
 
-    <FleetStrip frame={frame} hist={mstate.fleetHist} />
-
-    <CacheSheet frame={frame} hist={mstate.hist} />
-
-    <RequestTape
-      requests={mstate.requests}
-      spikeCount={mstate.spikeCount}
-      spikePeak={mstate.spikePeak}
-      live={mstate.live}
-      stale={mstate.stale}
-    />
-
-    <SessionSheet feed={sessFeed} now={now} />
-  {:else}
-    <div class="hollow" role="status">
-      <span>{hollowMsg}</span>
-    </div>
-  {/if}
-
-  <!-- the flat, non-skewed, accessible diagram of the same numbers -->
-  {#if frame && frame.backends.length > 0}
-    <table class="sr-only" aria-label="fleet fold-cells (flat table)">
-      <caption>
-        Fleet fold-cells — flat table of the same numbers{mstate.stale ? " (stale data; feed re-arming)" : ""}
-      </caption>
-      <thead>
-        <tr>
-          <th scope="col">backend</th>
-          <th scope="col">tier</th>
-          <th scope="col">in-flight</th>
-          <th scope="col">limit</th>
-          <th scope="col">waiting</th>
-          <th scope="col">prefill</th>
-          <th scope="col">ewma duration</th>
-          <th scope="col">ttft (streaming)</th>
-          <th scope="col">req/s</th>
-          <th scope="col">tok/s (est)</th>
-          <th scope="col">engine running</th>
-          <th scope="col">engine queue</th>
-          <th scope="col">kv cache %</th>
-          <th scope="col">mamba pool %</th>
-          <th scope="col">cache hit %</th>
-          <th scope="col">engine prefill tok/s (real)</th>
-          <th scope="col">engine decode tok/s (real)</th>
-          <th scope="col">engine ttft</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each frame.backends as b (b.name)}
-          <tr>
-            <th scope="row">{b.name}</th>
-            <td>{b.tier === 0 ? "0 (king)" : "1 (subject)"}</td>
-            <td>{b.inFlight}</td>
-            <td>{b.maxConcurrent > 0 ? b.maxConcurrent : "unlimited"}</td>
-            <td>{b.waiting}</td>
-            <td>
-              {b.prefillInFlight}
-              {b.prefillMax > 0 ? ` of ${b.prefillMax}` : ""}
-            </td>
-            <td>{(b.ewmaMs / 1000).toFixed(1)}s</td>
-            <td>{b.ttftSampleCount === 0 ? "no samples" : `${b.ttftMs}ms`}</td>
-            <td>{b.reqRate}/s</td>
-            <td>{b.tokEstRate}/s (estimated prefill)</td>
-            {#if b.engine?.status === "ok"}
-              <td>{Math.round(b.engine.running)}</td>
-              <td>{Math.round(b.engine.waiting)}</td>
-              <td>{b.engine.kvPct > 0 ? `${b.engine.kvPct.toFixed(0)}%` : "—"}</td>
-              <td>{b.engine.mambaPct !== null ? `${b.engine.mambaPct.toFixed(0)}%` : "—"}</td>
-              <td>{b.engine.hitRate > 0 ? `${(b.engine.hitRate * 100).toFixed(0)}%` : "—"}</td>
-              <td>{Math.round(b.engine.prefillTokS)}/s</td>
-              <td>{Math.round(b.engine.decodeTokS)}/s</td>
-              <td>{b.engine.ttftMs > 0 ? `${Math.round(b.engine.ttftMs)}ms` : "—"}</td>
-            {:else}
-              <td colspan="8">no engine feed ({b.engine?.status === "err" ? "unreachable" : "endpoint off"})</td>
-            {/if}
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-  {/if}
+      <div class="lower">
+        <BackendTable
+          frame={metricFrame ?? live.frame}
+          history={history.data}
+          {cursor}
+          {selected}
+          onSelect={(name) => (selected = name)}
+          stale={live.stale}
+          lastFrameAt={live.lastFrameAt}
+        />
+        <RequestFeed
+          bind:open={requestLogOpen}
+          requests={live.requests}
+          spikeCount={live.spikeCount}
+          spikePeak={live.spikePeak}
+        />
+      </div>
+    </main>
+  </div>
 </div>
 
 <style>
-  .feed-row {
+  .app {
+    max-width: 1760px;
+    margin: 0 auto;
+    min-height: 100vh;
+    background: var(--ground);
+    transition: background-color var(--dur) var(--ease-soft);
+  }
+  .body {
+    display: grid;
+    grid-template-columns: 232px minmax(0, 1fr);
+    align-items: stretch;
+  }
+  .main {
     display: flex;
-    align-items: center;
-    gap: 14px;
-    margin-top: 10px;
-    font-size: 10px;
-    letter-spacing: 0.08em;
-    flex-wrap: wrap;
+    flex-direction: column;
+    min-width: 0;
+    padding: 0 0 32px;
   }
-  .feed-note {
-    color: var(--tx-3);
+  .live-band {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 400px;
+    gap: var(--s3);
+    padding: var(--s3) var(--s3) 0;
+    align-items: stretch;
   }
-  .feed-last {
-    color: var(--tx-3);
-    font-variant-numeric: tabular-nums;
+  .profile-sheet {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
   }
-  .feed-est {
-    margin-left: auto;
-    color: var(--tx-3);
+  .profile-sheet :global(.profile) {
+    flex: 1 1 auto;
   }
-  .feed-est em {
-    color: var(--gold);
-    font-style: normal;
+  .lower {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--s3);
+    padding: var(--s3) var(--s3) 0;
+    align-items: start;
+  }
+  .notice {
+    padding: 5px var(--s5);
+    border-bottom: 1px solid var(--rule);
+    background: var(--panel);
+    color: var(--ink-3);
+    font-size: var(--fs-detail);
+  }
+  @media (min-width: 1600px) {
+    .lower {
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    }
+  }
+  @media (max-width: 1279px) {
+    .live-band {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  @media (max-width: 959px) {
+    .body {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .main {
+      padding-bottom: var(--s6);
+    }
+    .live-band,
+    .lower {
+      padding: var(--s3) var(--s3) 0;
+    }
+  }
+  @media (max-width: 639px) {
+    .main {
+      padding-bottom: var(--s5);
+    }
+    .live-band,
+    .lower {
+      padding: var(--s2) var(--s2) 0;
+      gap: var(--s2);
+    }
+    .notice {
+      padding: 5px var(--s3);
+      font-size: var(--fs-label);
+    }
   }
 </style>

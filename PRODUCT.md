@@ -26,9 +26,9 @@ A scheduler for shared-GPU inference: tiered admission (King/Subject), weighted 
 
 - Deployed as a Docker container (listens on `:80`) or a Go binary, always behind a TLS/authenticating reverse proxy (Caddy, Nginx, Traefik) — the router itself has **no authentication**; it is never exposed to untrusted networks directly.
 - Configured entirely through environment variables: a required `BACKENDS` JSON array plus scalar knobs (`MAX_QUEUE_TIMEOUT`, `MAX_GPU_BUDGET`, `MAX_BODY_BYTES`, `PREFILL_TOKENS_PER_SEC`). `.env.example` documents every variable.
-- Management endpoints: `GET /health` (plain text), `GET /stats` (per-backend JSON: in-flight, queue depth, prefill queue state, EWMA duration; top-level `gpuUsed`/`gpuBudget`/`gpuWaiting`/`tier0Inflight`), `GET /v1/models` (aggregated model catalog). All other paths are proxied to a selected backend.
+- Management endpoints: `GET /health` (plain text), `GET /stats` (per-backend JSON: in-flight, queue depth, prefill queue state, EWMA duration; top-level `gpuUsed`/`gpuBudget`/`gpuWaiting`/`tier0Inflight`), `GET /v1/models` (aggregated model catalog), and the dashboard feeds: `/metrics/stream` (SSE live snapshots), `/metrics/history` (server-side 5m–30d series), `/metrics/burst` (recent completed requests), `/metrics/sessions` (in-flight stack + conversation aggregates). All other paths are proxied to a selected backend.
 - Rejections are explicit: `429` with `Retry-After`, `X-Router-Reason`, `X-Router-Backend`; oversized bodies get `413` with `X-Router-Reason: body-too-large`.
-- The planned web dashboard is a new surface; no UI exists yet. It will visualize the `/stats` data (backends, queues, GPU budget, latency) for live operation.
+- The embedded web dashboard is the live operator surface: a ruled readings strip, a per-backend fleet profile (KV level, live request bars, failures, survey cursor), the live session stack, backend detail, a request feed, and server-side history ranges (5m–30d). Engine `/metrics` data and optional device telemetry (`GPU_METRICS_URL`) are labelled by source; token estimates carry `est`.
 
 ## Capabilities and Constraints
 
@@ -36,7 +36,7 @@ A scheduler for shared-GPU inference: tiered admission (King/Subject), weighted 
 - Per-backend slot manager: `maxConcurrent` (0 = unlimited) plus `maxQueueDepth` (default 2); saturated queues wait a bounded time then return `429`.
 - Large-prefill protection: request bodies are inspected to estimate new prefill tokens (multi-turn: only the last message counts, assuming prefix caching; ~4 bytes/token); `maxConcurrentLargePrefill` caps concurrent large prefills; slots bound by `PREFILL_TOKENS_PER_SEC` for non-streaming requests and release on the first response byte for streaming.
 - EWMA per-backend duration tracking guides routing and avoids herd behavior.
-- Architecture constraint (stated in README, binding): single-file Go (`main.go`), **standard library only**, no external runtime dependencies. The dashboard is served/embedded from this binary, not a separate service.
+- Architecture constraint (stated in README, binding): single-file Go (`main.go`), **standard library only**, no external runtime dependencies. The dashboard is served/embedded from this binary, not a separate service. History is an in-memory ring store with optional atomic persistence (`HISTORY_PATH`); device telemetry is an optional stdlib Prometheus scrape (`GPU_METRICS_URL`).
 - Terminology is load-bearing: King (Tier 0) / Subject (Tier 1), GPU budget, large prefill, bounded queue.
 
 ## Brand Commitments
@@ -49,9 +49,9 @@ A scheduler for shared-GPU inference: tiered admission (King/Subject), weighted 
 ## Evidence on Hand
 
 - README.md documenting install, configuration, API, and architecture — the authoritative source of product claims.
-- Working single-file Go implementation (`main.go`, ~900 lines) with test coverage (`main_test.go`).
+- Working single-file Go implementation (`main.go`) with test coverage (`main_test.go`), including the live metrics/history/session layer and the embedded SvelteKit dashboard (`web/`).
 - `.env.example` documenting all environment variables; multi-stage Alpine `Dockerfile`; CI/release workflows in `.github/workflows`.
-- No dashboard, no testimonials, no customers, no benchmarks, no press — future work must not fabricate any of them.
+- No testimonials, customers, benchmarks, or press — future work must not fabricate any of them.
 
 ## Product Principles
 

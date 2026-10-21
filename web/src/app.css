@@ -1,94 +1,468 @@
 @import "tailwindcss";
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   Vast Miura-Fold Sheet — dark mode
-   The fleet is a sheet: one tessellated Miura grid of live fold-cells.
-   Dark-ink ground, warm-gray mountain creases, steel-blue valley creases,
-   gold-foil live signal. Sharp fold corners, 1px crease scores with lit
-   edges, a ~3% diagonal sheen, an isometric skew on the grid container
-   (text is counter-skewed so it stays crisp and selectable). The deploy
-   cascade runs along the diagonal and is disabled under
-   prefers-reduced-motion. Token rates are ESTIMATED new-prefill tokens and
-   always carry an "est" label.
-   ═══════════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+   CAPACITY SURVEY — the fleet as a topographic sheet
+   Night sheet by default, day sheet on demand. The world enters through
+   type, palette, density, and the Fleet Profile; the shell is a standard
+   operator surface. Type sizes sit on an integer 2px scale; every figure is
+   mono and tabular. Sharp corners, 1px rules, no ambient shadow.
+   ═══════════════════════════════════════════════════════════════════════ */
 
 :root {
-  /* ground */
-  --ground: #0a0a0b;
-  --recess: #161513;
-  --face: #0e0e10;
-  --face-hi: #141416;
+  /* night survey sheet */
+  --ground: #10130e;
+  --panel: #151a13;
+  --panel-2: #1a2018;
+  --panel-3: #20261d;
+  --ink: #e9e5d8;
+  --ink-2: #b9b5a7;
+  --ink-3: #8f8c80;
+  --rule: rgba(233, 229, 216, 0.1);
+  --rule-2: rgba(233, 229, 216, 0.18);
+  --rule-strong: rgba(233, 229, 216, 0.3);
+  --sand: #b9a684;
+  --sand-lit: #d3c2a2;
+  --water: #7fa3c4;
+  --water-lit: #a7c6e2;
+  --moss: #8fae74;
+  --moss-lit: #b0cc96;
+  --amber: #d6a445;
+  --amber-lit: #e8c071;
+  --verm: #e07a66;
+  --focus: #e9e5d8;
+  --selection: rgba(185, 166, 132, 0.3);
 
-  /* mountain crease (warm gray) */
-  --mt-dim: #a6a6a0;
-  --mt-lit: #e8e6e0;
-  /* valley crease (steel blue) */
-  --vl-dim: #8fa9c0;
-  --vl-lit: #cfe0ef;
-  /* gold-foil accent */
-  --gold: #c9a24b;
-  --gold-lit: #e4c264;
+  /* type: integer steps only */
+  --fs-label: 10px;
+  --fs-detail: 12px;
+  --fs-body: 14px;
+  --fs-title: 16px;
+  --fs-value: 24px;
+  --fs-display: 28px;
+  --lh-tight: 16px;
+  --lh-body: 20px;
+  --lh-value: 28px;
 
-  /* text */
-  --tx-1: #edebe4;
-  --tx-2: #a6a29a;
-  /* muted labels: ≥4.5:1 on every dark surface (ground/recess/face/face-hi) */
-  --tx-3: #8c867c;
+  --font-ui: "Overpass", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Overpass Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
-  /* signal red — reserved for 5xx / saturated / offline (see red rule) */
-  --red: #d46a5e;
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s8: 32px;
 
-  /* geometry */
-  --skew: -6deg;
-  --fold-step: 55ms;
-  --cell-h: 168px;
-  --cell-h-open: 308px;
-  --cell-h-pkt: 46px;
-  --ease-fold: cubic-bezier(0.2, 0.8, 0.25, 1);
+  /* motion: routine feedback eases out; one continuous live glide. */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 160ms;
+  --dur: 240ms;
+  --dur-slow: 480ms;
+
+  color-scheme: dark;
 }
 
-html {
+:root[data-theme="day"] {
+  --ground: #eceadf;
+  --panel: #f4f2e9;
+  --panel-2: #e7e3d6;
+  --panel-3: #dcd7c8;
+  --ink: #171a13;
+  --ink-2: #3f4539;
+  --ink-3: #5a6052;
+  --rule: rgba(23, 26, 19, 0.14);
+  --rule-2: rgba(23, 26, 19, 0.24);
+  --rule-strong: rgba(23, 26, 19, 0.4);
+  --sand: #7d5f42;
+  --sand-lit: #5f4630;
+  --water: #37627f;
+  --water-lit: #22485f;
+  --moss: #476438;
+  --moss-lit: #33512a;
+  --amber: #8a5a12;
+  --amber-lit: #6d4609;
+  --verm: #a33a28;
+  --focus: #171a13;
+  --selection: rgba(125, 95, 66, 0.24);
+  color-scheme: light;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
   background: var(--ground);
-  /* The skewed bands (skewX on .sheet/.cache/etc.) bleed ink past the
-     viewport edges. body clips paint, but the document scroll box is html —
-     without this, the bleed makes the page horizontally scrollable on
-     narrow viewports. clip (not hidden) so no scroll container is created. */
-  overflow-x: clip;
+  color: var(--ink);
 }
 
 body {
-  margin: 0;
-  background:
-    linear-gradient(
-      115deg,
-      transparent 30%,
-      rgba(232, 230, 224, 0.025) 46%,
-      transparent 62%
-    ),
-    var(--ground);
-  color: var(--tx-1);
-  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
-  line-height: 1.45;
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
   -webkit-font-smoothing: antialiased;
-  overflow-x: clip;
+  text-rendering: optimizeLegibility;
+  transition:
+    background-color var(--dur) var(--ease-soft),
+    color var(--dur) var(--ease-soft);
 }
 
-/* Archivo — the display face (700 italic, tight) */
+::selection {
+  background: var(--selection);
+  color: var(--ink);
+}
+
+*:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* browser surfaces belong to the design too */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-2) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--rule-2);
+  border: 2px solid var(--ground);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--sand);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+a {
+  color: var(--sand-lit);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ── type ─────────────────────────────────────────────────────────────── */
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.label {
+  font-family: var(--font-ui);
+  font-size: var(--fs-label);
+  line-height: var(--lh-tight);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.detail {
+  font-size: var(--fs-detail);
+  line-height: var(--lh-tight);
+  color: var(--ink-2);
+}
+
+.value {
+  font-family: var(--font-mono);
+  font-size: var(--fs-value);
+  line-height: var(--lh-value);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.title {
+  font-size: var(--fs-title);
+  line-height: var(--lh-body);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+
 .display {
-  font-family: "Archivo", "JetBrains Mono", sans-serif;
-  font-style: italic;
-  font-weight: 700;
-  letter-spacing: -0.015em;
+  font-size: var(--fs-display);
+  line-height: 32px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
 }
 
-/* counter-skew: keeps text crisp + horizontal inside the skewed sheet */
-.unskew {
-  transform: skewX(calc(-1 * var(--skew)));
+/* data-class tags: the honesty boundary, always visible */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-label);
+  line-height: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.tag::before {
+  content: "";
+  width: 4px;
+  height: 4px;
+  background: currentColor;
+  flex: none;
+}
+.tag.router {
+  color: var(--moss);
+}
+.tag.engine {
+  color: var(--water);
+}
+.tag.device {
+  color: var(--sand);
+}
+.tag.est {
+  color: var(--amber);
+}
+.tag.muted {
+  color: var(--ink-3);
 }
 
-button {
-  font-family: inherit;
+/* ── surfaces ─────────────────────────────────────────────────────────── */
+
+.sheet {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  transition:
+    background-color var(--dur) var(--ease-soft),
+    border-color var(--dur) var(--ease-soft);
+}
+
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  min-height: 36px;
+  padding: 0 var(--s3);
+  border-bottom: 1px solid var(--rule);
+}
+
+.sheet-head .label {
+  color: var(--ink-2);
+}
+
+.rule {
+  height: 1px;
+  background: var(--rule);
+  border: 0;
+  margin: 0;
+}
+
+/* ── controls ─────────────────────────────────────────────────────────── */
+
+.btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 5px 9px;
+  background: transparent;
+  border: 1px solid var(--rule-2);
+  border-radius: 0;
+  color: var(--ink-2);
+  font-family: var(--font-ui);
+  font-size: var(--fs-label);
+  line-height: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out);
+}
+.btn:hover {
+  color: var(--ink);
+  border-color: var(--sand);
+}
+.btn[aria-pressed="true"],
+.btn.on {
+  color: var(--ink);
+  border-color: var(--sand);
+  background: var(--panel-3);
+}
+.btn:disabled {
+  color: var(--ink-3);
+  border-color: var(--rule);
+  cursor: not-allowed;
+}
+.btn .icon {
+  width: 12px;
+  height: 12px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--rule-2);
+  background: var(--panel);
+}
+.seg .btn {
+  border: 0;
+  border-right: 1px solid var(--rule);
+  min-height: 26px;
+  padding: 4px 8px;
+}
+.seg .btn:last-child {
+  border-right: 0;
+}
+.seg .btn[aria-pressed="true"] {
+  background: var(--panel-3);
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 var(--sand);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid currentColor;
+  font-family: var(--font-ui);
+  font-size: var(--fs-label);
+  line-height: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  white-space: nowrap;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+.chip::before {
+  content: "";
+  width: 4px;
+  height: 4px;
+  background: currentColor;
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+.chip.ok {
+  color: var(--moss);
+}
+.chip.warn {
+  color: var(--amber);
+}
+.chip.err {
+  color: var(--verm);
+}
+.chip.info {
+  color: var(--water);
+}
+.chip.muted {
+  color: var(--ink-3);
+}
+
+/* range slider: a survey ruler, not a rounded pill */
+input[type="range"] {
+  appearance: none;
+  width: 100%;
+  height: 20px;
+  background: transparent;
+  cursor: ew-resize;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 1px;
+  background: var(--rule-2);
+}
+input[type="range"]::-moz-range-track {
+  height: 1px;
+  background: var(--rule-2);
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 8px;
+  height: 16px;
+  margin-top: -8px;
+  background: var(--sand);
+  border: 1px solid var(--ground);
+  border-radius: 0;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 8px;
+  height: 16px;
+  background: var(--sand);
+  border: 1px solid var(--ground);
+  border-radius: 0;
+}
+input[type="range"]:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+}
+
+/* ── layout primitives ────────────────────────────────────────────────── */
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.right {
+  margin-left: auto;
+}
+.wrap {
+  flex-wrap: wrap;
+}
+.nowrap {
+  white-space: nowrap;
+}
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.muted {
+  color: var(--ink-3);
+}
+.dim {
+  color: var(--ink-2);
+}
+.ok {
+  color: var(--moss);
+}
+.warn {
+  color: var(--amber);
+}
+.err {
+  color: var(--verm);
+}
+.water {
+  color: var(--water);
+}
+.sand {
+  color: var(--sand);
 }
 
 .sr-only {
@@ -98,1516 +472,137 @@ button {
   padding: 0;
   margin: -1px;
   overflow: hidden;
-  clip: rect(0 0 0 0);
+  clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
 }
 
-/* A <table> treats width as a minimum and sizes to its content (large
-   tables blow past 1px and extend the document scroll region even though
-   paint is clipped). Collapse the layout box so it can never produce
-   horizontal overflow, while keeping the element a real table for AT. */
-.sr-only:is(table) {
-  display: block;
-  width: 1px;
+/* ── tables ───────────────────────────────────────────────────────────── */
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--fs-detail);
+  line-height: var(--lh-tight);
+  font-variant-numeric: tabular-nums;
+}
+.data-table th {
+  position: sticky;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out);
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  border-bottom: 1px solid var(--rule-2);
+  padding: 6px 8px;
+  text-align: left;
+  font-family: var(--font-ui);
+  font-size: var(--fs-label);
+  line-height: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.data-table th:hover {
+  color: var(--ink);
+}
+.data-table th.num {
+  text-align: right;
+}
+.data-table td {
+  border-bottom: 1px solid var(--rule);
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out);
+  padding: 6px 8px;
+  white-space: nowrap;
+  color: var(--ink-2);
+}
+.data-table td.num {
+  text-align: right;
+}
+.data-table tbody tr:hover td {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+.data-table tbody tr.selected td {
+  background: var(--panel-3);
+  color: var(--ink);
+}
+.data-table tbody tr.selected td:first-child {
+  box-shadow: inset 2px 0 0 var(--sand);
+}
+.data-table .empty td {
+  color: var(--ink-3);
+  font-family: var(--font-ui);
+  font-size: var(--fs-detail);
+  text-align: left;
 }
 
-:focus-visible {
-  outline: 1px solid var(--gold-lit);
+/* ── toggle ───────────────────────────────────────────────────────────── */
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-label);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  cursor: pointer;
+  user-select: none;
+}
+.check input {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  cursor: pointer;
+}
+.check input:checked {
+  background: var(--sand);
+  border-color: var(--sand);
+}
+.check input:focus-visible {
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
-/* ── crease line: 1px scored fold with a lit edge ─────────────────────── */
-.crease {
-  position: relative;
-  height: 1px;
-  background: rgba(166, 166, 160, 0.28);
-}
-.crease::after {
-  content: "";
-  position: absolute;
-  top: 1px;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background: rgba(232, 230, 224, 0.1);
-}
+/* ── motion ───────────────────────────────────────────────────────────── */
 
-/* ── page frame ───────────────────────────────────────────────────────── */
-.page {
-  max-width: 1320px;
-  margin: 0 auto;
-  padding: 18px 28px 48px;
-}
-
-/* ── masthead ─────────────────────────────────────────────────────────── */
-.masthead {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 20px;
-  flex-wrap: wrap;
-  padding-bottom: 12px;
-}
-.mast-title {
-  font-size: 30px;
-  line-height: 1;
-  margin: 0;
-  color: var(--mt-lit);
-}
-.mast-title em {
-  color: var(--gold);
-  font-style: inherit;
-}
-.mast-sub {
-  margin-top: 6px;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-}
-.mast-mid {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-}
-.mast-right {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-.clock {
-  font-size: 21px;
-  color: var(--tx-1);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.02em;
-}
-
-.status-line {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  font-size: 11px;
-  color: var(--tx-2);
-  letter-spacing: 0.05em;
-  flex-wrap: wrap;
-}
-.status-line b {
-  color: var(--mt-lit);
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-}
-.stat-dot {
-  color: var(--tx-3);
-}
-
-.health {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 10px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--gold-lit);
-}
-.health i {
-  width: 7px;
-  height: 7px;
-  background: var(--gold-lit);
-  box-shadow: 0 0 8px rgba(228, 194, 100, 0.8);
-  display: inline-block;
-}
-.health[data-h="degraded"] {
-  color: var(--tx-2);
-}
-.health[data-h="degraded"] i {
-  background: var(--tx-3);
-  box-shadow: none;
-}
-.health[data-h="offline"] {
-  color: var(--red);
-}
-.health[data-h="offline"] i {
-  background: var(--red);
-  box-shadow: 0 0 8px rgba(212, 106, 94, 0.7);
-}
-
-/* ── stale banner: the last truth, flagged as old ─────────────────────── */
-/* Shown when the feed drops: the sheet keeps its last numbers but the
-   whole page carries a red time anchor so "the data stopped" is the
-   loudest thing on screen. Red is the offline reservation, legitimately. */
-.stale-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 14px;
-  padding: 7px 12px;
-  border: 1px solid rgba(212, 106, 94, 0.55);
-  border-top-color: rgba(212, 106, 94, 0.9);
-  background: rgba(212, 106, 94, 0.07);
-  color: var(--red);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-.stale-banner .stale-clock {
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.04em;
-  font-weight: 500;
-}
-.stale-banner .stale-why {
-  color: var(--tx-2);
-  text-transform: none;
-  letter-spacing: 0.03em;
-}
-.stale-banner .stale-why b {
-  color: var(--tx-1);
-  font-weight: 500;
-}
-
-/* ── packet row: inline readout (mobile/folded) ───────────────────────── */
-.pkt-detail {
-  display: none;
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  color: var(--tx-2);
-  gap: 12px;
-}
-.pkt-detail b {
-  color: var(--tx-1);
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-}
-.pkt-detail .red {
-  color: var(--red);
-}
-/* a folded sheet never shows the opened-fold layout — the packet row is
-   the open state on mobile; the .is-open min-height would otherwise win
-   and leave a 308px empty box */
-.sheet.is-folded .fold-cell.is-open .cell-open {
-  display: none;
-}
-.fold-cell.is-open .cell-pkt .pkt-detail {
-  display: flex;
-}
-/* when a packet row is open it expands a touch so the detail has room */
-.sheet.is-folded .fold-cell.is-open {
-  min-height: 72px;
-}
-
-/* ── readout grouping: live state leads, totals demote ────────────────── */
-.readout .group-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 7px 0 4px;
-  margin-top: 4px;
-  border-top: 1px solid rgba(166, 166, 160, 0.28);
-}
-.readout .group-head:first-child {
-  margin-top: 0;
-  border-top: none;
-  padding-top: 0;
-}
-.readout .group-head .gk {
-  color: var(--tx-3);
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  font-size: 9px;
-}
-.readout .group-head .gt {
-  color: var(--tx-2);
-  font-size: 9px;
-  letter-spacing: 0.04em;
-}
-.readout .totals-toggle {
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-  background: transparent;
-  border: none;
-  border-top: 1px solid rgba(166, 166, 160, 0.28);
-  padding: 6px 0 4px;
-  margin-top: 4px;
-  cursor: pointer;
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-}
-.readout .totals-toggle:hover {
-  color: var(--tx-1);
-}
-.readout .totals-toggle .est-hint {
-  color: var(--gold);
-}
-.readout .totals-rows {
-  overflow: hidden;
-}
-.readout .totals-rows.collapsed {
-  display: none;
-}
-
-/* ── browser surfaces: theming the parts we did not draw ──────────────── */
-/* The sheet is dense tabular data — the caret, selection and scrollbars
-   belong to the world, not to the browser default. */
-::selection {
-  background: rgba(201, 162, 75, 0.32);
-  color: var(--tx-1);
-}
-* {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(166, 166, 160, 0.35) transparent;
-}
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-::-webkit-scrollbar-track {
-  background: var(--ground);
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(166, 166, 160, 0.3);
-  border: 2px solid var(--ground);
-}
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(166, 166, 160, 0.5);
-}
-::placeholder {
-  color: var(--tx-3);
-  opacity: 1;
-}
-input,
-select,
-textarea {
-  caret-color: var(--gold-lit);
-}
-
-/* gold-foil packet control — the signature interaction */
-.packet-btn {
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--gold);
-  background: linear-gradient(
-    180deg,
-    rgba(201, 162, 75, 0.16),
-    rgba(201, 162, 75, 0.04)
-  );
-  border: 1px solid rgba(201, 162, 75, 0.55);
-  border-top-color: rgba(228, 194, 100, 0.9);
-  padding: 8px 14px;
-  cursor: pointer;
-  transition:
-    color 0.25s,
-    box-shadow 0.25s,
-    background 0.25s;
-}
-.packet-btn:hover {
-  color: var(--gold-lit);
-  box-shadow:
-    0 0 18px rgba(201, 162, 75, 0.28),
-    inset 0 1px 0 rgba(228, 194, 100, 0.4);
-}
-
-/* ── gpu crease-gauge ─────────────────────────────────────────────────── */
-/* one-time affordance hint under the sheet — flat (not skewed): it is a
-   caption on the margin, teaching the fold, not part of the tessellation */
-.sheet-hint {
-  margin-top: 6px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  color: var(--tx-3);
-}
-.sheet-hint .hint-x {
-  margin-left: auto;
-  font-size: 10px;
-  line-height: 1;
-  color: var(--tx-3);
-  background: transparent;
-  border: 1px solid rgba(166, 166, 160, 0.25);
-  padding: 2px 6px;
-  cursor: pointer;
-  transition:
-    color 0.2s,
-    border-color 0.2s;
-}
-.sheet-hint .hint-x:hover {
-  color: var(--tx-1);
-  border-color: rgba(232, 230, 224, 0.5);
-}
-.gpu-gauge {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-}
-.gpu-seg {
-  width: 12px;
-  height: 9px;
-  transform: skewX(-18deg);
-  border: 1px solid rgba(143, 169, 192, 0.35);
-  background: rgba(143, 169, 192, 0.1);
-}
-.gpu-seg.on {
-  background: var(--gold);
-  border-color: var(--gold-lit);
-  box-shadow: 0 0 7px rgba(201, 162, 75, 0.55);
-}
-.gpu-seg.wait {
-  border-top: 1px solid var(--red);
-}
-.gpu-num {
-  font-size: 10px;
-  color: var(--tx-2);
-  margin-left: 5px;
-  font-variant-numeric: tabular-nums;
-}
-.gpu-wait {
-  font-size: 10px;
-  color: var(--red);
-  margin-left: 5px;
-}
-.gpu-none {
-  font-size: 10px;
-  color: var(--tx-3);
-  letter-spacing: 0.12em;
-}
-
-/* ── the sheet: tessellated parallelogram grid under isometric skew ──── */
-.sheet-viewport {
-  overflow: visible;
-  margin-top: 18px;
-}
-.sheet {
-  position: relative;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(252px, 1fr));
-  gap: 1px;
-  background: var(--recess);
-  border: 1px solid rgba(166, 166, 160, 0.3);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 224, 0.07);
-  transform: skewX(var(--skew));
-  transform-origin: 50% 0;
-}
-/* the diagonal sheen — ~3% light shift along the tessellation diagonal */
-.sheet::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(
-    115deg,
-    transparent 34%,
-    rgba(232, 230, 224, 0.03) 48%,
-    transparent 62%
-  );
-  pointer-events: none;
-}
-
-/* ── fold-cell ────────────────────────────────────────────────────────── */
-.fold-cell {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  background: var(--face);
-  min-height: var(--cell-h);
-  border-top: 1px solid rgba(232, 230, 224, 0.1);
-  box-shadow: 0 1px 0 rgba(232, 230, 224, 0.05);
-  cursor: pointer;
-  transition:
-    transform 0.3s var(--ease-fold),
-    box-shadow 0.3s var(--ease-fold),
-    min-height 0.5s var(--ease-fold) var(--fold-delay, 0ms),
-    opacity 0.4s var(--ease-fold) var(--fold-delay, 0ms),
-    background 0.3s;
-}
-.fold-cell:hover {
-  transform: translateY(-3px);
-  z-index: 3;
-  background: var(--face-hi);
-  box-shadow:
-    0 10px 26px rgba(0, 0, 0, 0.55),
-    inset 0 1px 0 rgba(228, 194, 100, 0.55);
-}
-/* gold lit-edge sweep across the fold on hover */
-.fold-cell::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, var(--gold-lit), transparent);
-  background-size: 50% 100%;
-  background-repeat: no-repeat;
-  background-position: -60% 0;
-  opacity: 0;
-  transition:
-    opacity 0.3s,
-    background-position 0.8s var(--ease-fold);
-  z-index: 4;
-}
-.fold-cell:hover::before {
-  opacity: 1;
-  background-position: 160% 0;
-}
-/* saturated / 429: the cell inverts to red-on-ground */
-.fold-cell.is-saturated {
-  border-top-color: rgba(212, 106, 94, 0.85);
-  box-shadow:
-    inset 0 1px 0 rgba(212, 106, 94, 0.5),
-    0 0 22px rgba(212, 106, 94, 0.1);
-}
-/* opened fold: spans the row, full-height trace, warm gold selection glow.
-   FIXED at the committed 308px (min = max) — the readout column scrolls
-   inside, the sheet never grows: the 30s/60s glance scale must stay
-   comparable between the collapsed cell and its opened fold */
-.fold-cell.is-open {
-  grid-column: 1 / -1;
-  min-height: var(--cell-h-open);
-  max-height: var(--cell-h-open);
-  cursor: default;
-  background: var(--face-hi);
-  box-shadow:
-    0 0 0 1px rgba(228, 194, 100, 0.4),
-    0 0 48px rgba(201, 162, 75, 0.16),
-    0 14px 44px rgba(0, 0, 0, 0.55);
-}
-
-/* undulation — the deployed sheet breathes along the diagonal */
-@keyframes undulate {
-  0%,
-  100% {
-    transform: translateY(0);
+@media (max-width: 639px) {
+  .btn,
+  .seg .btn {
+    min-height: 44px;
+    padding: 8px 10px;
   }
-  50% {
-    transform: translateY(-2px);
+  input[type="range"] {
+    height: 44px;
   }
-}
-@media (prefers-reduced-motion: no-preference) {
-  .sheet.is-deployed:not(.is-folded) .cell-face {
-    animation: undulate 6.5s ease-in-out infinite;
-    animation-delay: calc(var(--fold-delay, 0ms) * -16);
+  .check {
+    min-height: 44px;
+  }
+  .value {
+    font-size: var(--fs-title);
+    line-height: var(--lh-body);
   }
 }
 
-/* the deploy cascade: cells unfold along the diagonal, stepped */
-@keyframes fold-in {
-  0% {
-    transform: scaleY(0.14) skewY(2deg);
-    opacity: 0;
-  }
-  60% {
-    opacity: 1;
-  }
-  100% {
-    transform: none;
-    opacity: 1;
-  }
-}
-.sheet.cascade .fold-cell {
-  animation: fold-in 0.6s var(--ease-fold) backwards;
-  animation-delay: var(--fold-delay, 0ms);
-}
-
-/* ── cell interiors ───────────────────────────────────────────────────── */
-.cell-face {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  position: relative;
-  padding: 10px 14px 8px;
-  gap: 6px;
-}
-
-.cell-top {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-}
-.crease-id {
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  color: var(--mt-lit);
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-}
-.crease-id .name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.tier {
-  font-size: 9px;
-  letter-spacing: 0.12em;
-  color: var(--vl-dim);
-  border: 1px solid rgba(143, 169, 192, 0.4);
-  padding: 1px 4px;
-  flex: none;
-}
-.tier.king {
-  color: var(--gold-lit);
-  border-color: rgba(201, 162, 75, 0.55);
-}
-.cell-val {
-  font-size: 30px;
-  font-weight: 500;
-  line-height: 1;
-  color: var(--mt-lit);
-  font-variant-numeric: tabular-nums;
-}
-.cell-val .max {
-  font-size: 13px;
-  color: var(--tx-3);
-}
-.cell-val.saturated {
-  color: var(--red);
-}
-.cell-trace {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-}
-.cell-detail {
-  display: flex;
-  gap: 14px;
-  font-size: 10px;
-  color: var(--tx-2);
-  letter-spacing: 0.04em;
-  opacity: 0;
-  transform: translateY(2px);
-  transition:
-    opacity 0.25s,
-    transform 0.25s;
-  white-space: nowrap;
-  overflow: hidden;
-}
-.fold-cell:hover .cell-detail,
-.fold-cell:focus-visible .cell-detail {
-  opacity: 1;
-  transform: none;
-}
-.cell-detail b {
-  color: var(--tx-1);
-  font-weight: 500;
-}
-.cell-detail .red {
-  color: var(--red);
-}
-/* saturation story: the red inversion is status, not alarm — say what it
-   means in the same glance. 429 stays valley blue (policy working). */
-.sat-note {
-  font-size: 10px;
-  letter-spacing: 0.04em;
-  color: var(--tx-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.sat-note .st-throttle {
-  color: var(--vl-lit);
-  font-weight: 500;
-}
-
-/* ── packet row (folded / compact / mobile mode) ──────────────────────── */
-.cell-pkt {
-  display: none;
-  align-items: center;
-  gap: 12px;
-  flex: 1;
-  min-height: 0;
-  padding: 0 4px;
-}
-.sheet.is-folded {
-  grid-template-columns: 1fr;
-}
-.sheet.is-folded .fold-cell {
-  min-height: var(--cell-h-pkt);
-  cursor: default;
-}
-.sheet.is-folded .cell-face,
-.sheet.is-folded .cell-open {
-  display: none;
-}
-.sheet.is-folded .cell-pkt {
-  display: flex;
-}
-.pkt-id {
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  color: var(--tx-2);
-  width: 86px;
-  flex: none;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.pkt-trace {
-  flex: 1;
-  min-width: 0;
-  height: 26px;
-}
-.pkt-val {
-  font-size: 15px;
-  font-weight: 500;
-  color: var(--mt-lit);
-  font-variant-numeric: tabular-nums;
-  width: 26px;
-  text-align: right;
-}
-
-/* ── opened fold: full-height trace + readout column + switcher ───────── */
-.cell-open {
-  display: none;
-  flex: 1;
-  min-height: 0;
-  grid-template-columns: minmax(0, 1fr) 272px;
-  /* definite row: both columns are capped by the fold's fixed height, so
-     the readout scrolls inside instead of growing the sheet */
-  grid-template-rows: 100%;
-  gap: 18px;
-}
-.fold-cell.is-open .cell-open {
-  display: grid;
-}
-.fold-cell.is-open .cell-face {
-  display: none;
-}
-.open-trace-wrap {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-.open-trace {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-  border: 1px solid rgba(166, 166, 160, 0.18);
-}
-.open-legend {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  color: var(--tx-2);
-  margin-top: 4px;
-}
-/* the window control scales what you are looking at — it sits in the
-   legend, next to the signal it applies to */
-.open-legend .legend-right {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.open-legend .win-head {
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-}
-.open-legend .swatch {
-  display: inline-block;
-  width: 14px;
-  height: 2px;
-  vertical-align: middle;
-  margin-right: 5px;
-}
-.swatch.gold {
-  background: var(--gold-lit);
-}
-.swatch.valley {
-  background: var(--vl-dim);
-}
-.switcher-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
-  flex-wrap: wrap;
-}
-.switcher {
-  display: flex;
-  gap: 6px;
-  min-width: 0;
-  flex-wrap: wrap;
-}
-.switcher button {
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-  background: transparent;
-  border: 1px solid rgba(166, 166, 160, 0.25);
-  padding: 4px 9px;
-  cursor: pointer;
-  transition:
-    color 0.2s,
-    border-color 0.2s,
-    box-shadow 0.2s;
-}
-.switcher button:hover {
-  color: var(--tx-1);
-  border-color: rgba(232, 230, 224, 0.5);
-}
-.switcher button.on {
-  color: var(--gold-lit);
-  border-color: rgba(201, 162, 75, 0.7);
-  box-shadow: inset 0 1px 0 rgba(228, 194, 100, 0.35);
-}
-/* the fold control is distinct from a signal option — it is the exit */
-/* signal groups carry a crease sub-label — the decision is
-   "which family, then which signal", not 12 flat buttons */
-.switcher-row .sig-head {
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-  margin-right: -2px;
-}
-.switcher-row .esc {
-  margin-left: auto;
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-2);
-  background: transparent;
-  border: 1px solid rgba(166, 166, 160, 0.18);
-  padding: 4px 9px;
-  cursor: pointer;
-  transition:
-    color 0.2s,
-    border-color 0.2s;
-}
-.switcher-row .esc:hover {
-  color: var(--tx-1);
-  border-color: rgba(232, 230, 224, 0.5);
-}
-.readout {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  min-width: 0;
-  /* the engine v2 readout is long — the column scrolls against the
-     opened fold's fixed height */
-  overflow-y: auto;
-  min-height: 0;
-  max-height: 100%;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(166, 166, 160, 0.3) transparent;
-}
-.readout .grp {
-  margin-top: 6px;
-  padding-top: 4px;
-  border-top: 1px solid rgba(166, 166, 160, 0.18);
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-}
-.readout .v .err {
-  color: var(--red);
-}
-.readout .row {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 5px 0;
-  border-bottom: 1px solid rgba(166, 166, 160, 0.12);
-  font-size: 11px;
-  min-width: 0;
-}
-.readout .row:last-child {
-  border-bottom: none;
-}
-.readout .k {
-  color: var(--tx-3);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  font-size: 10px;
-  flex: none;
-}
-.readout .v {
-  color: var(--tx-1);
-  font-variant-numeric: tabular-nums;
-  /* long values (backend names, "1843 ms · 62 samples", URLs) truncate
-     inside the column instead of running off the fold */
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: right;
-}
-.readout .v .est {
-  color: var(--gold);
-  font-size: 9px;
-  letter-spacing: 0.1em;
-}
-.readout .v.red {
-  color: var(--red);
-}
-.open-url {
-  font-size: 10px;
-  color: var(--tx-3);
-  margin-top: 2px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* ── fleet strip ──────────────────────────────────────────────────────── */
-.fleet-strip {
-  margin-top: 16px;
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: 1px;
-  background: var(--recess);
-  border: 1px solid rgba(166, 166, 160, 0.3);
-  transform: skewX(var(--skew));
-  transform-origin: 50% 0;
-}
-.fleet-cell {
-  background: var(--face);
-  min-height: 118px;
-  padding: 10px 16px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  position: relative;
-}
-.fleet-cell .label {
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-}
-.fleet-cell .label .est {
-  color: var(--gold);
-}
-.fleet-cell .value {
-  font-size: 26px;
-  line-height: 1;
-  color: var(--mt-lit);
-  font-variant-numeric: tabular-nums;
-}
-.fleet-cell .value.hot {
-  color: var(--red);
-}
-.fleet-cell .unit {
-  font-size: 11px;
-  color: var(--tx-3);
-  font-style: normal;
-}
-.fleet-cell .trace-wrap {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-}
-.fleet-foot {
-  margin-top: 6px;
-  font-size: 10px;
-  color: var(--tx-3);
-  letter-spacing: 0.03em;
-  transform: skewX(var(--skew));
-  transform-origin: 50% 0;
-  padding: 0 8px;
-}
-.fleet-foot-real {
-  color: var(--tx-2);
-}
-.fleet-foot-sep {
-  margin: 0 6px;
-}
-
-/* ── engine pools band: kv / mamba cache, scraped from the engines ────── */
-/* Engine truth: valley blue ("real") throughout — the engine's gauges are
-   measured, and gold is reserved for the router's own live signal. Red is
-   the saturation reservation: a pool at ≥90% is the engine's own
-   saturation threshold (retraction/eviction starts), not a router 5xx. */
-.cache {
-  margin-top: 16px;
-  transform: skewX(var(--skew));
-  transform-origin: 50% 0;
-  border: 1px solid rgba(166, 166, 160, 0.3);
-  background: var(--face);
-}
-.cache-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 14px;
-  flex-wrap: wrap;
-  padding: 6px 12px 5px;
-  border-bottom: 1px solid rgba(166, 166, 160, 0.3);
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-}
-.cache-head .real {
-  color: var(--vl-lit);
-}
-.cache-src {
-  letter-spacing: 0.04em;
-  text-transform: none;
-  color: var(--tx-3);
-}
-.cache-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(252px, 1fr));
-  gap: 1px;
-  background: var(--recess);
-}
-.cache-cell {
-  background: var(--face);
-  min-height: 118px;
-  padding: 10px 16px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-.cc-top {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-}
-.cc-name {
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  color: var(--mt-lit);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.cc-eng {
-  font-size: 9px;
-  letter-spacing: 0.12em;
-  color: var(--tx-3);
-  border: 1px solid rgba(143, 169, 192, 0.35);
-  padding: 1px 4px;
-  flex: none;
-}
-.cc-pools {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-.pool {
-  display: grid;
-  grid-template-columns: 44px 1fr 64px;
-  align-items: center;
-  gap: 8px;
-}
-.pool-label {
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-}
-.pool-bar {
-  display: block;
-  position: relative;
-  height: 8px;
-  background: rgba(143, 169, 192, 0.1);
-  border: 1px solid rgba(143, 169, 192, 0.3);
-  overflow: hidden;
-}
-.pool-bar .seg {
-  display: block;
-  height: 100%;
-  width: 100%;
-  transform-origin: left center;
-  transform: scaleX(0);
-  background: var(--vl-dim);
-  transition: transform 0.5s var(--ease-fold);
-}
-.pool-bar .seg.hot {
-  background: var(--red);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 224, 0.25);
-}
-/* held (prefix-cached) share of the kv bar — a lighter valley variant
-   over the live-use segment; same seam logic, never a second color */
-.pool-bar .seg.held {
-  position: absolute;
-  left: 0;
-  transform-origin: left center;
-  background: var(--vl-lit);
-}
-.pool-bar .seg.held.hot {
-  background: var(--red);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 224, 0.25);
-}
-.pool-val {
-  font-size: 11px;
-  color: var(--tx-2);
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-  white-space: nowrap;
-}
-.pool-val.hot {
-  color: var(--red);
-}
-.pool-val .held-sfx {
-  color: var(--tx-3);
-  font-size: 10px;
-}
-.pool-val.hot .held-sfx {
-  color: var(--red);
-  opacity: 0.7;
-}
-.cc-foot {
-  display: flex;
-  gap: 14px;
-  font-size: 10px;
-  letter-spacing: 0.04em;
-  color: var(--tx-3);
-}
-.cc-foot b {
-  color: var(--tx-2);
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-}
-.cc-trace {
-  height: 30px;
-  position: relative;
-}
-.cc-off {
-  font-size: 11px;
-  color: var(--tx-3);
-  letter-spacing: 0.04em;
-  padding: 6px 0;
-}
-.cache-off {
-  padding: 14px 16px 16px;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  color: var(--tx-3);
-}
-
-/* ── sessions: live in-flight stack + conversations ───────────────────── */
-.sessions {
-  margin-top: 16px;
-  transform: skewX(var(--skew));
-  transform-origin: 50% 0;
-  border: 1px solid rgba(166, 166, 160, 0.3);
-  background: var(--face);
-}
-.sessions > .unskew {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-.sess-head {
-  display: flex;
-  align-items: baseline;
-  gap: 14px;
-  padding: 6px 12px 5px;
-  border-bottom: 1px solid rgba(166, 166, 160, 0.3);
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-.sess-label {
-  color: var(--tx-3);
-}
-.sess-inflight {
-  color: var(--tx-2);
-  font-variant-numeric: tabular-nums;
-}
-.sess-inflight.hot {
-  color: var(--gold-lit);
-}
-.sess-est-note {
-  margin-left: auto;
-  color: var(--tx-3);
-  letter-spacing: 0.05em;
-}
-.sess-est-note em {
-  color: var(--gold);
-  font-style: normal;
-}
-.sess-subhead {
-  padding: 4px 12px 2px;
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-}
-.sess-row {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  padding: 5px 12px;
-  border-bottom: 1px solid rgba(166, 166, 160, 0.12);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  min-width: 0;
-  width: 100%;
-  text-align: left;
-  background: transparent;
-  color: inherit;
-  border-left: none;
-  border-right: none;
-  cursor: default;
-  font-family: inherit;
-  letter-spacing: 0.02em;
-}
-.sess-wrap > .sess-row {
-  cursor: pointer;
-}
-.sess-wrap > .sess-row:hover {
-  background: var(--face-hi);
-}
-.sess-elapsed {
-  color: var(--tx-1);
-  min-width: 52px;
-  text-align: right;
-}
-.sess-be {
-  color: var(--tx-1);
-}
-.sess-path {
-  color: var(--tx-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-.sess-sess,
-.sess-id {
-  color: var(--tx-3);
-  font-size: 10px;
-}
-.sess-phase {
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-.sess-phase-admitted {
-  color: var(--vl-dim);
-}
-.sess-phase-streaming {
-  color: var(--gold-lit);
-}
-.sess-tok {
-  color: var(--tx-2);
-  white-space: nowrap;
-}
-.sess-tok .est,
-.sess-head .est {
-  color: var(--gold);
-  font-style: normal;
-  font-size: 9px;
-  letter-spacing: 0.1em;
-}
-.sess-n {
-  color: var(--tx-2);
-  white-space: nowrap;
-}
-.sess-live-chip {
-  color: var(--gold-lit);
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-.sess-age {
-  color: var(--tx-3);
-}
-.sess-ttft {
-  color: var(--tx-2);
-}
-.sess-st {
-  color: var(--tx-2);
-  margin-left: auto;
-  font-weight: 500;
-}
-.sess-st.st-ok {
-  color: var(--gold);
-}
-.sess-st.st-throttle {
-  color: var(--vl-dim);
-}
-.sess-st.st-err {
-  color: var(--red);
-}
-.sess-wrap {
-  position: relative;
-}
-.sess-wrap.sess-active {
-  box-shadow: inset 2px 0 0 var(--gold);
-}
-.sess-scroll {
-  max-height: 360px;
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(166, 166, 160, 0.3) transparent;
-}
-.sess-detail {
-  padding: 4px 12px 8px;
-  border-bottom: 1px solid rgba(166, 166, 160, 0.12);
-  background: var(--face);
-}
-.sess-reqs {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-.sess-reqs th {
-  font-size: 9px;
-  font-weight: 500;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-  text-align: left;
-  padding: 2px 8px 3px 0;
-  border-bottom: 1px solid rgba(166, 166, 160, 0.18);
-  white-space: nowrap;
-}
-.sess-reqs td {
-  padding: 3px 8px 3px 0;
-  border-bottom: 1px solid rgba(166, 166, 160, 0.12);
-  color: var(--tx-2);
-  white-space: nowrap;
-}
-.sess-reqs tr:last-child td {
-  border-bottom: none;
-}
-.sess-reqs .st-ok {
-  color: var(--gold);
-}
-.sess-reqs .st-throttle {
-  color: var(--vl-dim);
-}
-.sess-reqs .st-err {
-  color: var(--red);
-}
-.sess-no-reqs {
-  font-size: 10px;
-  color: var(--tx-3);
-  letter-spacing: 0.04em;
-}
-.sess-hollow {
-  padding: 18px 12px;
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  color: var(--tx-3);
-}
-
-/* ── request tape: the continuous transcript ──────────────────────────── */
-.tape-wrap {
-  margin-top: 16px;
-  transform: skewX(var(--skew));
-  transform-origin: 50% 0;
-  border-top: 1px solid rgba(166, 166, 160, 0.3);
-  border-bottom: 1px solid rgba(166, 166, 160, 0.3);
-  background: linear-gradient(180deg, rgba(22, 21, 19, 0.65), rgba(22, 21, 19, 0.2));
-}
-.tape-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 6px 14px 0;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-}
-.tape-head .spikes {
-  color: var(--tx-2);
-  margin-left: 14px;
-}
-.tape-head .spikes.hot {
-  color: var(--red);
-}
-.tape-head .head-right {
-  display: inline-flex;
-  align-items: center;
-}
-.tape-head .f429 {
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--tx-3);
-  background: transparent;
-  border: 1px solid rgba(166, 166, 160, 0.25);
-  padding: 2px 8px;
-  cursor: pointer;
-  transition:
-    color 0.2s,
-    border-color 0.2s;
-}
-.tape-head .f429:hover {
-  color: var(--tx-1);
-  border-color: rgba(232, 230, 224, 0.5);
-}
-.tape-head .f429[aria-pressed="true"] {
-  color: var(--vl-lit);
-  border-color: rgba(143, 169, 192, 0.6);
-  box-shadow: inset 0 1px 0 rgba(207, 224, 239, 0.3);
-}
-.tape-vp {
-  overflow: hidden;
-  padding: 4px 0 7px;
-  /* fade the edges of the window */
-  -webkit-mask-image: linear-gradient(
-    90deg,
-    transparent 0,
-    #000 3%,
-    #000 97%,
-    transparent 100%
-  );
-  mask-image: linear-gradient(90deg, transparent 0, #000 3%, #000 97%, transparent 100%);
-}
-.tape-track {
-  display: inline-flex;
-  white-space: nowrap;
-  will-change: transform;
-}
-.tape-half {
-  display: inline-flex;
-  white-space: nowrap;
-}
-.tape-entry {
-  display: inline-flex;
-  gap: 8px;
-  padding: 0 18px;
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  align-items: baseline;
-}
-.tape-entry .sep {
-  color: var(--tx-3);
-  opacity: 0.5;
-}
-.tape-entry .t {
-  color: var(--tx-3);
-}
-.tape-entry .be {
-  color: var(--tx-1);
-}
-.tape-entry .pa {
-  color: var(--tx-2);
-}
-.tape-entry .st {
-  font-weight: 500;
-}
-.st-ok {
-  color: var(--gold);
-}
-.st-throttle {
-  color: var(--vl-dim);
-}
-.st-err {
-  color: var(--red);
-}
-.tape-entry .num {
-  color: var(--tx-2);
-}
-.tape-idle {
-  padding: 4px 14px 7px;
-  font-size: 11px;
-  color: var(--tx-3);
-}
-
-/* ── hollow packet: empty state is an unfolded tessellation ───────────── */
-.hollow {
-  margin-top: 18px;
-  min-height: 240px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid rgba(166, 166, 160, 0.22);
-  transform: skewX(var(--skew));
-  transform-origin: 50% 0;
-  background:
-    repeating-linear-gradient(
-      115deg,
-      transparent 0 38px,
-      rgba(166, 166, 160, 0.05) 38px 39px
-    ),
-    repeating-linear-gradient(
-      65deg,
-      transparent 0 38px,
-      rgba(143, 169, 192, 0.045) 38px 39px
-    ),
-    var(--ground);
-}
-.hollow span {
-  transform: skewX(calc(-1 * var(--skew)));
-  color: var(--tx-3);
-  font-size: 12px;
-  letter-spacing: 0.12em;
-}
-
-/* ── reduced motion: no cascade, no undulation, no sweep ──────────────── */
 @media (prefers-reduced-motion: reduce) {
-  .sheet.cascade .fold-cell {
-    animation: none;
-  }
-  .fold-cell,
-  .fold-cell::before,
-  .cell-detail {
-    transition: none;
-  }
-  .pool-bar .seg {
-    transition: none;
-  }
-  .tape-track {
-    transform: none !important;
-  }
-}
-
-/* ── compact ──────────────────────────────────────────────────────────── */
-@media (max-width: 720px) {
-  .page {
-    padding: 14px 14px 36px;
-  }
-  .masthead {
-    align-items: flex-start;
-    flex-direction: column;
-    align-items: stretch;
-  }
-  .mast-right {
-    justify-content: space-between;
-  }
-  .mast-title {
-    font-size: 24px;
-  }
-  .fleet-strip {
-    grid-template-columns: repeat(2, 1fr);
-  }
-  /* the hint teaches hover — mobile has no hover (tap expands the row) */
-  .sheet-hint {
-    display: none;
-  }
-  .fold-cell.is-open {
-    grid-template-columns: 1fr;
-  }
-  .cell-open {
-    grid-template-columns: 1fr !important;
-  }
-  .sess-row {
-    flex-wrap: wrap;
-    row-gap: 2px;
-  }
-  .sess-reqs {
-    display: block;
-    overflow-x: auto;
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }

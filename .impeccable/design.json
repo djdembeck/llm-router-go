@@ -1,380 +1,318 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-08-20T19:55:00Z",
-  "title": "Design System: llm-router-go — Fleet Sheet",
+  "generatedAt": "2026-10-21T18:28:39Z",
+  "title": "Design System: llm-router-go \u2014 Capacity Survey",
   "extensions": {
     "colorMeta": {
       "ink-ground": {
         "role": "neutral",
         "displayName": "Ink Ground",
-        "canonical": "#0a0a0b",
-        "tonalRamp": [
-          "oklch(0.18 0.001 286)",
-          "oklch(0.29 0.001 286)",
-          "oklch(0.39 0.001 286)",
-          "oklch(0.50 0.002 286)",
-          "oklch(0.60 0.002 286)",
-          "oklch(0.71 0.002 286)",
-          "oklch(0.81 0.002 286)",
-          "oklch(0.92 0.002 286)"
-        ]
+        "canonical": "#10130e"
       },
-      "recess": {
+      "survey-panel": {
         "role": "neutral",
-        "displayName": "Recess Seam",
-        "canonical": "#161513",
-        "tonalRamp": [
-          "oklch(0.18 0.002 85)",
-          "oklch(0.29 0.003 85)",
-          "oklch(0.39 0.003 85)",
-          "oklch(0.50 0.003 85)",
-          "oklch(0.60 0.004 85)",
-          "oklch(0.71 0.004 85)",
-          "oklch(0.81 0.004 85)",
-          "oklch(0.92 0.004 85)"
-        ]
+        "displayName": "Survey Panel",
+        "canonical": "#151a13"
       },
-      "cell-face": {
+      "survey-panel-raised": {
         "role": "neutral",
-        "displayName": "Cell Face",
-        "canonical": "#0e0e10",
-        "tonalRamp": [
-          "oklch(0.18 0.002 286)",
-          "oklch(0.29 0.003 286)",
-          "oklch(0.39 0.003 286)",
-          "oklch(0.50 0.003 286)",
-          "oklch(0.60 0.004 286)",
-          "oklch(0.71 0.004 286)",
-          "oklch(0.81 0.004 286)",
-          "oklch(0.92 0.004 286)"
-        ]
+        "displayName": "Raised Panel",
+        "canonical": "#1a2018"
       },
-      "cell-face-hi": {
+      "survey-panel-active": {
         "role": "neutral",
-        "displayName": "Cell Face (raised)",
-        "canonical": "#141416",
-        "tonalRamp": [
-          "oklch(0.18 0.002 286)",
-          "oklch(0.29 0.002 286)",
-          "oklch(0.39 0.003 286)",
-          "oklch(0.50 0.003 286)",
-          "oklch(0.60 0.004 286)",
-          "oklch(0.71 0.004 286)",
-          "oklch(0.81 0.004 286)",
-          "oklch(0.92 0.004 286)"
-        ]
+        "displayName": "Active Panel",
+        "canonical": "#20261d"
       },
-      "mountain-dim": {
-        "role": "tertiary",
-        "displayName": "Mountain Crease (dim)",
-        "canonical": "#a6a6a0",
-        "tonalRamp": [
-          "oklch(0.18 0.005 107)",
-          "oklch(0.29 0.005 107)",
-          "oklch(0.39 0.006 107)",
-          "oklch(0.50 0.006 107)",
-          "oklch(0.60 0.009 107)",
-          "oklch(0.71 0.009 107)",
-          "oklch(0.81 0.009 107)",
-          "oklch(0.92 0.009 107)"
-        ]
+      "chalk": {
+        "role": "neutral",
+        "displayName": "Chalk",
+        "canonical": "#e9e5d8"
       },
-      "mountain-lit": {
-        "role": "tertiary",
-        "displayName": "Mountain Crease (lit)",
-        "canonical": "#e8e6e0",
-        "tonalRamp": [
-          "oklch(0.18 0.005 91)",
-          "oklch(0.29 0.005 91)",
-          "oklch(0.39 0.006 91)",
-          "oklch(0.50 0.006 91)",
-          "oklch(0.60 0.008 91)",
-          "oklch(0.71 0.008 91)",
-          "oklch(0.81 0.008 91)",
-          "oklch(0.92 0.008 91)"
-        ]
+      "chalk-secondary": {
+        "role": "neutral",
+        "displayName": "Chalk Secondary",
+        "canonical": "#b9b5a7"
       },
-      "valley-dim": {
-        "role": "secondary",
-        "displayName": "Valley Crease (dim)",
-        "canonical": "#8fa9c0",
-        "tonalRamp": [
-          "oklch(0.18 0.024 245)",
-          "oklch(0.29 0.027 245)",
-          "oklch(0.39 0.030 245)",
-          "oklch(0.50 0.033 245)",
-          "oklch(0.60 0.044 245)",
-          "oklch(0.71 0.044 245)",
-          "oklch(0.81 0.044 245)",
-          "oklch(0.92 0.044 245)"
-        ]
+      "chalk-muted": {
+        "role": "neutral",
+        "displayName": "Chalk Muted",
+        "canonical": "#8f8c80"
       },
-      "valley-lit": {
-        "role": "secondary",
-        "displayName": "Valley Crease (lit)",
-        "canonical": "#cfe0ef",
-        "tonalRamp": [
-          "oklch(0.18 0.015 245)",
-          "oklch(0.29 0.017 245)",
-          "oklch(0.39 0.019 245)",
-          "oklch(0.50 0.020 245)",
-          "oklch(0.60 0.028 245)",
-          "oklch(0.71 0.028 245)",
-          "oklch(0.81 0.028 245)",
-          "oklch(0.92 0.028 245)"
-        ]
-      },
-      "gold": {
+      "survey-line": {
         "role": "primary",
-        "displayName": "Gold Foil",
-        "canonical": "#c9a24b",
-        "tonalRamp": [
-          "oklch(0.18 0.063 85)",
-          "oklch(0.29 0.070 85)",
-          "oklch(0.39 0.078 85)",
-          "oklch(0.50 0.085 85)",
-          "oklch(0.60 0.115 85)",
-          "oklch(0.71 0.115 85)",
-          "oklch(0.81 0.115 85)",
-          "oklch(0.92 0.115 85)"
-        ]
+        "displayName": "Survey Line \u2014 Sand",
+        "canonical": "#b9a684"
       },
-      "gold-lit": {
+      "survey-line-lit": {
         "role": "primary",
-        "displayName": "Gold Foil (lit)",
-        "canonical": "#e4c264",
-        "tonalRamp": [
-          "oklch(0.18 0.066 90)",
-          "oklch(0.29 0.074 90)",
-          "oklch(0.39 0.081 90)",
-          "oklch(0.50 0.089 90)",
-          "oklch(0.60 0.120 90)",
-          "oklch(0.71 0.120 90)",
-          "oklch(0.81 0.120 90)",
-          "oklch(0.92 0.120 90)"
-        ]
+        "displayName": "Survey Line \u2014 Lit",
+        "canonical": "#d3c2a2"
       },
-      "text-primary": {
+      "water": {
+        "role": "secondary",
+        "displayName": "Water \u2014 KV / Engine",
+        "canonical": "#7fa3c4"
+      },
+      "moss": {
+        "role": "secondary",
+        "displayName": "Moss \u2014 Live / Router",
+        "canonical": "#8fae74"
+      },
+      "amber": {
+        "role": "tertiary",
+        "displayName": "Amber \u2014 Attention / Estimate",
+        "canonical": "#d6a445"
+      },
+      "vermilion": {
+        "role": "tertiary",
+        "displayName": "Vermilion \u2014 Failure",
+        "canonical": "#e07a66"
+      },
+      "day-ground": {
         "role": "neutral",
-        "displayName": "Text Primary",
-        "canonical": "#edebe4",
-        "tonalRamp": [
-          "oklch(0.18 0.005 94)",
-          "oklch(0.29 0.006 94)",
-          "oklch(0.39 0.007 94)",
-          "oklch(0.50 0.007 94)",
-          "oklch(0.60 0.010 94)",
-          "oklch(0.71 0.010 94)",
-          "oklch(0.81 0.010 94)",
-          "oklch(0.92 0.010 94)"
-        ]
+        "displayName": "Day Ground",
+        "canonical": "#eceadf"
       },
-      "text-secondary": {
+      "day-panel": {
         "role": "neutral",
-        "displayName": "Text Secondary",
-        "canonical": "#a6a29a",
-        "tonalRamp": [
-          "oklch(0.18 0.007 85)",
-          "oklch(0.29 0.008 85)",
-          "oklch(0.39 0.008 85)",
-          "oklch(0.50 0.009 85)",
-          "oklch(0.60 0.012 85)",
-          "oklch(0.71 0.012 85)",
-          "oklch(0.81 0.012 85)",
-          "oklch(0.92 0.012 85)"
-        ]
+        "displayName": "Day Panel",
+        "canonical": "#f4f2e9"
       },
-      "text-muted": {
+      "day-ink": {
         "role": "neutral",
-        "displayName": "Text Muted",
-        "canonical": "#8c867c",
-        "tonalRamp": [
-          "oklch(0.18 0.013 85)",
-          "oklch(0.29 0.014 85)",
-          "oklch(0.39 0.015 85)",
-          "oklch(0.50 0.016 85)",
-          "oklch(0.60 0.020 85)",
-          "oklch(0.71 0.020 85)",
-          "oklch(0.81 0.020 85)",
-          "oklch(0.92 0.020 85)"
-        ]
+        "displayName": "Day Ink",
+        "canonical": "#171a13"
       },
-      "signal-red": {
-        "role": "signal",
-        "displayName": "Signal Red",
-        "canonical": "#d46a5e",
-        "tonalRamp": [
-          "oklch(0.18 0.096 36)",
-          "oklch(0.29 0.106 36)",
-          "oklch(0.39 0.117 36)",
-          "oklch(0.50 0.127 36)",
-          "oklch(0.60 0.173 36)",
-          "oklch(0.71 0.173 36)",
-          "oklch(0.81 0.173 36)",
-          "oklch(0.92 0.173 36)"
-        ]
+      "day-survey-line": {
+        "role": "primary",
+        "displayName": "Day Survey Line",
+        "canonical": "#7d5f42"
+      },
+      "day-water": {
+        "role": "secondary",
+        "displayName": "Day Water",
+        "canonical": "#37627f"
+      },
+      "day-moss": {
+        "role": "secondary",
+        "displayName": "Day Moss",
+        "canonical": "#476438"
+      },
+      "day-amber": {
+        "role": "tertiary",
+        "displayName": "Day Amber",
+        "canonical": "#8a5a12"
+      },
+      "day-vermilion": {
+        "role": "tertiary",
+        "displayName": "Day Vermilion",
+        "canonical": "#a33a28"
       }
     },
     "typographyMeta": {
       "display": {
-        "displayName": "Display",
-        "purpose": "Masthead wordmark only (Archivo 700 italic, 30px, -0.015em; 24px under 720px). The -go suffix is gold."
-      },
-      "body": {
-        "displayName": "Body",
-        "purpose": "Readout rows, fleet foot, feed notes — JetBrains Mono 400 at 13px/1.45."
-      },
-      "label": {
-        "displayName": "Label",
-        "purpose": "Panel/fleet-cell/tape-head labels: 10px, 0.14em, uppercase, muted."
+        "displayName": "Wordmark",
+        "purpose": "llm-router-go only; -go in sand."
       },
       "data-value": {
         "displayName": "Data Value",
-        "purpose": "The fold-cell's current in-flight count: 30px 500 tabular, lit warm gray; 26px in the fleet strip."
+        "purpose": "Readings strip values and the largest panel number."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Section heads, column heads, data-class tags, controls."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Reading sublines and explanatory copy."
+      },
+      "detail": {
+        "displayName": "Detail",
+        "purpose": "Source notes, feed metadata, table footers."
+      },
+      "data-detail": {
+        "displayName": "Data Detail",
+        "purpose": "Axis labels, token figures, secondary measurements."
       }
     },
-    "shadows": [
-      { "name": "cell-rest", "value": "0 1px 0 rgba(232,230,224,0.05)", "purpose": "The crease score under each cell's 1px lit top border — the only shadow at rest, a 1px score, not a blur." },
-      { "name": "hover-lift", "value": "0 10px 26px rgba(0,0,0,0.55), inset 0 1px 0 rgba(228,194,100,0.55)", "purpose": "Hover: the crease rises (translateY(-3px)) with a deep drop and a gold lit top edge." },
-      { "name": "opened-fold", "value": "0 0 0 1px rgba(228,194,100,0.4), 0 0 48px rgba(201,162,75,0.16), 0 14px 44px rgba(0,0,0,0.55)", "purpose": "Opened fold: 1px gold ring + 48px warm gold halo + drop — the selection glow." },
-      { "name": "saturated", "value": "inset 0 1px 0 rgba(212,106,94,0.5), 0 0 22px rgba(212,106,94,0.1)", "purpose": "Saturated/429-at-cell: the cell inverts to red-on-ground with a faint red halo. Note: a 429 on the TAPE is not this — it is valley blue (capacity rejection = policy working)." },
-      { "name": "packet-btn-hover", "value": "0 0 18px rgba(201,162,75,0.28), inset 0 1px 0 rgba(228,194,100,0.4)", "purpose": "The gold-foil deploy control's hover glow." },
-      { "name": "health-live", "value": "0 0 8px rgba(228,194,100,0.8)", "purpose": "The live feed dot in the masthead (8px, live gold only; degraded has none, offline is red at 0.7)." }
-    ],
+    "shadows": [],
     "motion": [
-      { "name": "ease-fold", "value": "cubic-bezier(0.2, 0.8, 0.25, 1)", "purpose": "The fold easing for every cell transition (--ease-fold): fast start, long settling tail." },
-      { "name": "fold-cascade-step", "value": "55ms", "purpose": "Per-cell delay in the diagonal deploy cascade (--fold-step); each cell's --fold-delay is order*55ms, so the unfold travels along the tessellation diagonal." },
-      { "name": "fold-in", "value": "0.6s", "purpose": "One cell's unfold: scaleY(0.14) skewY(2deg) opacity 0 → none, over 0.6s with ease-fold, animation-fill backwards." },
-      { "name": "undulate", "value": "6.5s ease-in-out infinite", "purpose": "The deployed sheet breathes: cell faces translate up 2px on a 6.5s loop, offset per-cell by calc(var(--fold-delay) * -16) so the wave rides the diagonal. Only under prefers-reduced-motion: no-preference." },
-      { "name": "hover-sweep", "value": "0.8s", "purpose": "The 2px gold lit-edge sweep across the fold on hover: background-position -60% → 160% over 0.8s (opacity 0.3s)." },
-      { "name": "cell-lift", "value": "0.3s", "purpose": "Hover lift (transform/box-shadow) and background change timing." },
-      { "name": "detail-fade", "value": "0.25s", "purpose": "The hover detail readout row fades in with a 2px rise." },
-      { "name": "packet-btn", "value": "0.25s", "purpose": "The deploy control's color/box-shadow/background transitions." },
-      { "name": "trace-scroll", "value": "requestAnimationFrame", "purpose": "Not CSS: the scope's window scrolls at frame rate on a virtual clock anchored to the NEWEST server sample (data arrives on 500ms ticks); the y-scale eases at 0.15 lerp/frame and is scoped to the visible window. Window span is selectable (30s/60s/5m) over a 5-minute history buffer; the line is one uniform color across the whole window. Under prefers-reduced-motion: reduce the rAF loop is off and the trace redraws on data ticks only." }
+      {
+        "name": "state-change",
+        "value": "160ms cubic-bezier(0.16,1,0.3,1)",
+        "purpose": "Routine control and surface feedback."
+      },
+      {
+        "name": "metric-window",
+        "value": "15s rolling mean, refreshed 5s",
+        "purpose": "TTFT and engine throughput; printed on the cell."
+      },
+      {
+        "name": "metric-hold",
+        "value": "5000ms",
+        "purpose": "KV and gauge values hold before display; counts stay live."
+      },
+      {
+        "name": "value-tween",
+        "value": "1600ms cubic-bezier(0.65,0,0.35,1) for TTFT/prefill/decode/KV; 480ms for counts",
+        "purpose": "Measured values ease in-out without chasing each scrape; no overshoot; exact value stays in the SR text."
+      },
+      {
+        "name": "live-edge",
+        "value": "1000ms linear, ~30fps canvas paint",
+        "purpose": "The profile's live edge glides continuously between 1s data ticks; stops offscreen and under reduced motion."
+      },
+      {
+        "name": "row-flip",
+        "value": "220ms cubic-bezier(0.16,1,0.3,1)",
+        "purpose": "Live session rows preserve identity when the stack reflows; no entrance or exit animation."
+      },
+      {
+        "name": "request-table",
+        "value": "none",
+        "purpose": "The request table updates instantly; bursts must not flash or shift."
+      },
+      {
+        "name": "theme",
+        "value": "240ms cubic-bezier(0.4,0,0.2,1)",
+        "purpose": "Night/day surface cross-fade."
+      },
+      {
+        "name": "prefill-track",
+        "value": "1000ms linear",
+        "purpose": "Prefill progress advances with the request's age."
+      }
     ],
     "breakpoints": [
-      { "name": "compact", "value": "720px", "purpose": "The single responsive breakpoint: masthead stacks, fleet strip goes single-column, the opened fold's readout drops under the trace, and (in JS) the sheet auto-folds to the packet row." }
+      {
+        "name": "mobile",
+        "value": "640px"
+      },
+      {
+        "name": "tablet",
+        "value": "960px"
+      },
+      {
+        "name": "live-band",
+        "value": "1200px"
+      },
+      {
+        "name": "wide-lower",
+        "value": "1600px"
+      }
     ]
   },
   "components": [
     {
-      "name": "Packet Control (deploy/fold)",
-      "kind": "button",
-      "refersTo": "packet-btn",
-      "description": "The signature interaction: one gold-foil button that folds or deploys the entire tessellation in a stepped diagonal cascade; aria-pressed reflects state.",
-      "html": "<button class=\"ds-packet-btn\" aria-pressed=\"true\">[FOLD]</button>",
-      "css": ".ds-packet-btn { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase; color: #c9a24b; background: linear-gradient(180deg, rgba(201,162,75,0.16), rgba(201,162,75,0.04)); border: 1px solid rgba(201,162,75,0.55); border-top-color: rgba(228,194,100,0.9); padding: 8px 14px; border-radius: 0; cursor: pointer; transition: color 0.25s, box-shadow 0.25s, background 0.25s; } .ds-packet-btn:hover { color: #e4c264; box-shadow: 0 0 18px rgba(201,162,75,0.28), inset 0 1px 0 rgba(228,194,100,0.4); } .ds-packet-btn:focus-visible { outline: 1px solid #e4c264; outline-offset: 2px; }"
-    },
-    {
-      "name": "Fold Cell (deployed)",
-      "kind": "card",
-      "refersTo": "fold-cell",
-      "description": "One backend, one fold: crease ID + tier chip, big tabular value, a live gold trace on the crease grid, and a hover-only detail row. Hover lifts the crease and sweeps a gold lit-edge.",
-      "html": "<div class=\"ds-fold-cell\" role=\"button\" tabindex=\"0\" aria-expanded=\"false\"><div class=\"ds-cell-face\"><div class=\"ds-cell-top\"><span class=\"ds-crease-id\"><span class=\"ds-name\">vllm-king-0</span><span class=\"ds-tier ds-tier-king\">T0·KING</span></span><span class=\"ds-cell-val\">7<span class=\"ds-max\">/16</span></span></div><div class=\"ds-cell-trace\"><svg viewBox=\"0 0 220 64\" preserveAspectRatio=\"none\" aria-hidden=\"true\"><polyline points=\"0,46 28,43 56,48 84,38 112,41 140,32 168,28 196,21 220,15\" fill=\"none\" stroke=\"#c9a24b\" stroke-width=\"1.5\" opacity=\"0.9\"/><circle cx=\"220\" cy=\"15\" r=\"2\" fill=\"#e4c264\"/></svg></div></div></div>",
-      "css": ".ds-fold-cell { position: relative; display: flex; flex-direction: column; background: #0e0e10; min-height: 168px; border: 0; border-top: 1px solid rgba(232,230,224,0.1); box-shadow: 0 1px 0 rgba(232,230,224,0.05); border-radius: 0; cursor: pointer; font-family: 'JetBrains Mono', ui-monospace, monospace; transition: transform 0.3s cubic-bezier(0.2,0.8,0.25,1), box-shadow 0.3s cubic-bezier(0.2,0.8,0.25,1), background 0.3s; } .ds-fold-cell:hover { transform: translateY(-3px); background: #141416; box-shadow: 0 10px 26px rgba(0,0,0,0.55), inset 0 1px 0 rgba(228,194,100,0.55); } .ds-fold-cell::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, #e4c264, transparent); background-size: 50% 100%; background-repeat: no-repeat; background-position: -60% 0; opacity: 0; transition: opacity 0.3s, background-position 0.8s cubic-bezier(0.2,0.8,0.25,1); } .ds-fold-cell:hover::before { opacity: 1; background-position: 160% 0; } .ds-cell-val { font-size: 30px; font-weight: 500; color: #e8e6e0; font-variant-numeric: tabular-nums; } .ds-cell-val .ds-max { font-size: 13px; color: #8c867c; }"
-    },
-    {
-      "name": "Opened Fold (expanded cell)",
-      "kind": "card",
-      "refersTo": "fold-cell-open",
-      "description": "A clicked fold opens in place: spans the row (308px), gold ring + halo, full-height trace with a signal switcher (router signals, engine signals when the backend's /metrics feed is live, and a 30s/60s/5m window selector), ttft overlay, legend, and a 272px readout column that SCROLLS (thin scrollbar, no glow) against the fixed 308px height. The readout is grouped: live-state, rates, then the grouped engine readout (requests · real / tokens · real / cache / latency · real / capacity — running, waiting + cap/defer split, retracted, lifetime completed + finished-reason breakdown + aborted/preempted, compute/cache-hit prefill tok/s + decode tok/s + lifetime prompt/gen totals + gen:prompt ratio, kv % + full/SWA/mamba pool split + pool token stats + hit rates + mm cache + hicache + memory GB, TTFT + stream/batch split + ITL + e2e + queue + prefill/decode stage means + per-tok ms + mean request shape, SLO cap + context length), then lifetime totals behind a + toggle. Values ellipsize inside the column; engine nulls render — or the row is absent.",
-      "html": "<div class=\"ds-opened-fold\"><div class=\"ds-open-trace-wrap\"><div class=\"ds-switcher-row\"><div class=\"ds-switcher\"><button class=\"on\">in-flight</button><button>req/s</button><button>ttft</button><button>tok-est est</button><button>bytes/s</button></div><span class=\"ds-win-sep\"></span><div class=\"ds-switcher\"><button>engine run</button><button>eng prefill</button><button>eng decode</button></div><span class=\"ds-win-sep\"></span><div class=\"ds-switcher\"><button>30s</button><button class=\"on\">60s</button><button>5m</button></div><button class=\"ds-esc\">fold ✕</button></div><div class=\"ds-open-trace\"><svg viewBox=\"0 0 420 180\" preserveAspectRatio=\"none\" aria-hidden=\"true\"><line x1=\"0\" y1=\"62\" x2=\"420\" y2=\"62\" stroke=\"rgba(143,169,192,0.45)\" stroke-dasharray=\"4 4\"/><text x=\"416\" y=\"58\" fill=\"rgba(143,169,192,0.6)\" font-size=\"9\" text-anchor=\"end\" font-family=\"'JetBrains Mono', monospace\">16</text><polyline points=\"0,130 40,124 80,134 120,112 160,118 200,96 240,104 280,84 320,92 360,70 390,60 418,48\" fill=\"none\" stroke=\"#c9a24b\" stroke-width=\"1.5\" opacity=\"0.9\"/><circle cx=\"418\" cy=\"48\" r=\"2\" fill=\"#e4c264\"/></svg></div></div><div class=\"ds-readout\"><div class=\"ds-row\"><span class=\"ds-k\">kv cache</span><span class=\"ds-v\">42%</span></div></div></div>",
-      "css": ".ds-opened-fold { display: grid; grid-template-columns: minmax(0,1fr) 272px; gap: 18px; background: #141416; min-height: 308px; box-shadow: 0 0 0 1px rgba(228,194,100,0.4), 0 0 48px rgba(201,162,75,0.16), 0 14px 44px rgba(0,0,0,0.55); border-radius: 0; padding: 10px 14px 8px; font-family: 'JetBrains Mono', ui-monospace, monospace; } .ds-open-trace-wrap { position: relative; display: flex; flex-direction: column; min-height: 0; } .ds-switcher-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; } .ds-switcher { display: flex; gap: 6px; min-width: 0; flex-wrap: wrap; } .ds-switcher button { font-family: inherit; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #8c867c; background: transparent; border: 1px solid rgba(166,166,160,0.25); border-radius: 0; padding: 4px 9px; cursor: pointer; } .ds-switcher button.on { color: #e4c264; border-color: rgba(201,162,75,0.7); box-shadow: inset 0 1px 0 rgba(228,194,100,0.35); } .ds-win-sep { width: 1px; align-self: stretch; margin: 2px 4px; background: rgba(166,166,160,0.25); } .ds-esc { margin-left: auto; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #a6a29a; background: transparent; border: 1px solid rgba(166,166,160,0.18); padding: 4px 9px; border-radius: 0; } .ds-readout { min-width: 0; } .ds-readout .ds-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid rgba(166,166,160,0.12); font-size: 11px; min-width: 0; } .ds-readout .ds-k { color: #8c867c; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; flex: none; } .ds-readout .ds-v { color: #edebe4; font-variant-numeric: tabular-nums; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }"
-    },
-    {
-      "name": "Fleet Strip Cell",
-      "kind": "card",
-      "refersTo": "fleet-cell",
-      "description": "One of four wide aggregate cells (req/s · measured, ttft, tok/s · new-prefill est, decode tok/s · real) on the same skewed grid: uppercase label, 26px tabular value, live trace below. The est (gold) and real (steel-blue) pairing is the honest data boundary: body-based prefill estimate beside the engine's measured throughput.",
-      "html": "<div class=\"ds-fleet-cell\"><span class=\"ds-fleet-label\">decode tok/s · <span class=\"ds-real\">real</span></span><span class=\"ds-fleet-value\">320</span><div class=\"ds-fleet-trace\"><svg viewBox=\"0 0 220 48\" preserveAspectRatio=\"none\" aria-hidden=\"true\"><polyline points=\"0,30 28,26 56,33 84,24 112,29 140,18 168,23 196,12 220,9\" fill=\"none\" stroke=\"#8fa9c0\" stroke-width=\"1.5\" opacity=\"0.9\"/><circle cx=\"220\" cy=\"9\" r=\"2\" fill=\"#cfe0ef\"/></svg></div></div>",
-      "css": ".ds-fleet-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: #161513; border: 1px solid rgba(166,166,160,0.3); transform: skewX(-6deg); transform-origin: 50% 0; margin-top: 16px; } .ds-fleet-cell { background: #0e0e10; min-height: 118px; padding: 10px 16px 8px; display: flex; flex-direction: column; gap: 4px; border-radius: 0; font-family: 'JetBrains Mono', ui-monospace, monospace; } .ds-fleet-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #8c867c; } .ds-est { color: #c9a24b; } .ds-real { color: #cfe0ef; } .ds-fleet-value { font-size: 26px; line-height: 1; color: #e8e6e0; font-variant-numeric: tabular-nums; } .ds-fleet-trace { flex: 1; min-height: 0; position: relative; background: linear-gradient(115deg, transparent 30%, rgba(143,169,192,0.09) 30.25%, transparent 30.5%), repeating-linear-gradient(90deg, transparent 0 43px, rgba(166,166,160,0.12) 43px 44px); }"
-    },
-    {
-      "name": "Request Tape Entry",
+      "name": "Reading Cell",
       "kind": "custom",
-      "refersTo": "tape-entry",
-      "description": "One line of the continuously scrolling request transcript: t · backend · path · status · ttft · dur · ~tok(est) / — gold 200, steel-blue throttled (a 429 is the policy working, not a failure), red errors.",
-      "html": "<span class=\"ds-tape-entry\"><span class=\"ds-t\">14:02:11</span><span class=\"ds-be\">vllm-king-0</span><span class=\"ds-pa\">/v1/chat/completions</span><span class=\"ds-st ds-st-ok\">200</span><span class=\"ds-num\">212ms</span><span class=\"ds-num\">1.9s</span><span class=\"ds-num\">~142</span><span class=\"ds-sep\">/</span></span>",
-      "css": ".ds-tape-entry { display: inline-flex; gap: 8px; padding: 0 18px; font-size: 11px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; align-items: baseline; white-space: nowrap; } .ds-tape-entry .ds-t { color: #8c867c; } .ds-tape-entry .ds-be { color: #edebe4; } .ds-tape-entry .ds-pa { color: #a6a29a; } .ds-tape-entry .ds-st { font-weight: 500; } .ds-st-ok { color: #c9a24b; } .ds-st-throttle { color: #8fa9c0; } .ds-st-err { color: #d46a5e; } .ds-tape-entry .ds-num { color: #a6a29a; } .ds-tape-entry .ds-sep { color: #8c867c; opacity: 0.5; }"
+      "refersTo": "reading-cell",
+      "description": "One measured fleet reading; a button when it selects a profile layer.",
+      "html": "<button class=\"reading\"><span class=\"label\">TTFT <i class=\"tag router\">router</i></span><span class=\"value\">241ms</span><span class=\"sub\">p50 198ms \u00b7 p95 812ms \u00b7 n 614</span></button>",
+      "css": ".reading{display:flex;flex-direction:column;gap:2px;padding:8px 12px 9px;background:#151a13;border:0;border-right:1px solid rgba(233,229,216,.10);color:#e9e5d8;text-align:left;border-radius:0}.reading[aria-pressed=\"true\"]{background:#1a2018;box-shadow:inset 0 -2px 0 #b9a684}.reading .value{font:500 24px/28px 'Overpass Mono',monospace;font-variant-numeric:tabular-nums}.reading .label{font:600 10px/12px Overpass,sans-serif;letter-spacing:.12em;text-transform:uppercase;color:#8f8c80}"
     },
     {
-      "name": "Sessions Sheet",
-      "kind": "custom",
-      "refersTo": "sessions",
-      "description": "The router's conversation memory, under the tape: the in-flight request stack (oldest on top, like a queue) and the live conversation sessions, as one more skewed band on the sheet. Identity is the conversation prefix hash (sha1 of the message history up to the last turn, 12 hex chars — a forked conversation gets its own id at its second turn). Active sessions carry a 2px gold left edge — the only gold edge at rest, because it is the live signal. Every token figure is body-based and wears the gold est label.",
-      "html": "<section class=\"ds-sessions\" aria-label=\"sessions\"><div class=\"ds-sess-head\"><span class=\"ds-sess-label\">sessions</span><span class=\"ds-sess-inflight\">in flight · <b class=\"hot\">1</b></span><span class=\"ds-sess-est-note\">token figures · <em>est</em></span></div><div class=\"ds-sess-subhead\">in flight — live</div><div class=\"ds-sess-live\"><span class=\"ds-sess-elapsed\">12.4s</span><span class=\"ds-sess-be\">vllm-king-0</span><span class=\"ds-sess-path\">/v1/chat/completions</span><span class=\"ds-sess-sess\">a1b2c3d4e5f6</span><span class=\"ds-sess-phase ds-sess-phase-streaming\">streaming</span><span class=\"ds-sess-tok\">ctx 1200 <em>est</em></span><span class=\"ds-sess-tok\">new 45 <em>est</em></span></div><button class=\"ds-sess-row ds-sess-active\" aria-expanded=\"true\"><span class=\"ds-sess-id\">a1b2c3d4e5f6</span><span class=\"ds-sess-be\">vllm-king-0</span><span class=\"ds-sess-n\">5 reqs</span><span class=\"ds-sess-live-chip\">live</span><span class=\"ds-sess-tok\">ctx 1245 <em>est</em></span><span class=\"ds-sess-tok\">cached 1200 <em>est</em></span><span class=\"ds-sess-ttft\">ttft 55ms</span><span class=\"ds-sess-tok\">200 tok <em>est</em></span><span class=\"ds-sess-st ds-st-ok\">200</span></button></section>",
-      "css": ".ds-sessions { transform: skewX(-6deg); transform-origin: 50% 0; border: 1px solid rgba(166,166,160,0.3); background: #0e0e10; margin-top: 16px; border-radius: 0; font-family: 'JetBrains Mono', ui-monospace, monospace; } .ds-sessions > div { transform: skewX(6deg); } .ds-sess-head { display: flex; align-items: baseline; gap: 14px; padding: 8px 16px; border-bottom: 1px solid rgba(166,166,160,0.18); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; } .ds-sess-label { color: #8c867c; } .ds-sess-inflight { color: #a6a29a; } .ds-sess-inflight .hot { color: #c9a24b; } .ds-sess-est-note { margin-left: auto; color: #8c867c; } .ds-sess-est-note em, .ds-sess-tok em { color: #c9a24b; font-style: normal; font-size: 9px; letter-spacing: 0.1em; } .ds-sess-subhead { padding: 5px 16px 2px; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: #8c867c; } .ds-sess-live { display: flex; gap: 10px; align-items: baseline; padding: 5px 16px; font-size: 11px; font-variant-numeric: tabular-nums; border-bottom: 1px solid rgba(166,166,160,0.12); white-space: nowrap; overflow: hidden; } .ds-sess-elapsed { color: #edebe4; min-width: 44px; text-align: right; } .ds-sess-be { color: #edebe4; } .ds-sess-path { color: #a6a29a; overflow: hidden; text-overflow: ellipsis; max-width: 220px; } .ds-sess-sess { color: #8c867c; font-size: 10px; } .ds-sess-phase { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; padding: 1px 6px; border: 1px solid; border-radius: 0; } .ds-sess-phase-admitted { color: #8fa9c0; border-color: rgba(143,169,192,0.4); } .ds-sess-phase-streaming { color: #c9a24b; border-color: rgba(201,162,75,0.5); } .ds-sess-row { display: flex; gap: 10px; align-items: baseline; width: 100%; text-align: left; background: transparent; border: 0; border-bottom: 1px solid rgba(166,166,160,0.12); padding: 6px 16px; font-size: 11px; font-family: inherit; font-variant-numeric: tabular-nums; color: inherit; cursor: pointer; min-width: 0; } .ds-sess-active { box-shadow: inset 2px 0 0 #c9a24b; } .ds-sess-id { color: #8c867c; font-size: 10px; } .ds-sess-n { color: #a6a29a; } .ds-sess-live-chip { color: #c9a24b; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; } .ds-sess-ttft { color: #a6a29a; } .ds-sess-st { margin-left: auto; font-weight: 500; } .ds-sess-reqs { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; } .ds-sess-reqs th { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: #8c867c; text-align: left; padding: 4px 8px; border-bottom: 1px solid rgba(166,166,160,0.18); } .ds-sess-reqs td { padding: 4px 8px; border-bottom: 1px solid rgba(166,166,160,0.1); color: #a6a29a; } .ds-sess-scroll { max-height: 360px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(166,166,160,0.3) transparent; }"
+      "name": "Data-Class Tag",
+      "kind": "chip",
+      "refersTo": "button",
+      "description": "The honesty boundary: router/engine/device/est, with a 4px square.",
+      "html": "<span class=\"tag engine\">engine</span>",
+      "css": ".tag{display:inline-flex;align-items:center;gap:4px;font:600 10px/12px Overpass,sans-serif;letter-spacing:.1em;text-transform:uppercase;color:#8f8c80}.tag:before{content:\"\";width:4px;height:4px;background:currentColor}.tag.router{color:#8fae74}.tag.engine{color:#7fa3c4}.tag.device{color:#b9a684}.tag.est{color:#d6a445}"
     },
     {
-      "name": "GPU Crease Gauge",
+      "name": "Fleet Profile",
       "kind": "custom",
-      "refersTo": "gpu-seg",
-      "description": "One skewed parallelogram segment per GPU budget slot: empty = steel-blue 10%, used = gold with lit border and glow, the next pending slot flashes a red top border when the queue is waiting.",
-      "html": "<span class=\"ds-gpu-gauge\" aria-label=\"gpu budget 3 of 5 used\"><i class=\"ds-gpu-seg ds-on\"></i><i class=\"ds-gpu-seg ds-on\"></i><i class=\"ds-gpu-seg ds-on\"></i><i class=\"ds-gpu-seg ds-wait\"></i><i class=\"ds-gpu-seg\"></i><span class=\"ds-gpu-num\">3/5 gpu</span><span class=\"ds-gpu-wait\">+1 waiting</span></span>",
-      "css": ".ds-gpu-gauge { display: inline-flex; align-items: center; gap: 3px; font-family: 'JetBrains Mono', ui-monospace, monospace; } .ds-gpu-seg { width: 12px; height: 9px; transform: skewX(-18deg); border: 1px solid rgba(143,169,192,0.35); background: rgba(143,169,192,0.1); border-radius: 0; display: inline-block; } .ds-gpu-seg.ds-on { background: #c9a24b; border-color: #e4c264; box-shadow: 0 0 7px rgba(201,162,75,0.55); } .ds-gpu-seg.ds-wait { border-top: 1px solid #d46a5e; } .ds-gpu-num { font-size: 10px; color: #a6a29a; margin-left: 5px; font-variant-numeric: tabular-nums; } .ds-gpu-wait { font-size: 10px; color: #d46a5e; margin-left: 5px; }"
+      "refersTo": "profile-panel",
+      "description": "The signature elevation sheet: per-backend KV ridges, request bars, live edge, survey cursor.",
+      "html": "<section class=\"profile\"><header><span class=\"label\">FLEET PROFILE</span><span class=\"readout\">live \u00b7 11:42:03 / KV 78%</span></header><canvas aria-hidden=\"true\"></canvas><footer>last 78% / avg 61% / min 12% / max 94%</footer></section>",
+      "css": ".profile{background:#151a13;border:1px solid rgba(233,229,216,.10);display:flex;flex-direction:column}.profile canvas{height:320px;width:100%;display:block;cursor:crosshair}.profile header,.profile footer{display:flex;justify-content:space-between;padding:6px 12px;border-bottom:1px solid rgba(233,229,216,.10)}.profile footer{border-bottom:0;border-top:1px solid rgba(233,229,216,.10)}"
     },
     {
-      "name": "Hollow Packet (empty state)",
+      "name": "Live Session Row",
       "kind": "custom",
-      "refersTo": "hollow",
-      "description": "The empty state is an unfolded tessellation — the skewed ground plane with faint diagonal seam lines and no cells, not an empty-state card.",
-      "html": "<div class=\"ds-hollow\" role=\"status\"><span>no backends configured — set BACKENDS in the router</span></div>",
-      "css": ".ds-hollow { min-height: 240px; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(166,166,160,0.22); border-radius: 0; background: repeating-linear-gradient(115deg, transparent 0 38px, rgba(166,166,160,0.05) 38px 39px), repeating-linear-gradient(65deg, transparent 0 38px, rgba(143,169,192,0.045) 38px 39px), #0a0a0b; } .ds-hollow span { color: #8c867c; font-size: 12px; letter-spacing: 0.12em; font-family: 'JetBrains Mono', ui-monospace, monospace; }"
+      "refersTo": "live-session-row",
+      "description": "One in-flight request: age, phase, backend, token estimates, prefill track, first byte.",
+      "html": "<div class=\"sess\"><div><b>0:12</b> <span class=\"chip info\">ADMITTED</span> <span>vllm-king</span></div><div>/v1/chat/completions</div><div>ctx 1.5k <i class=\"tag est\">est</i> \u00b7 new 902 <i class=\"tag est\">est</i></div><div class=\"track\"><i style=\"width:62%\"></i></div></div>",
+      "css": ".sess{display:flex;flex-direction:column;gap:5px;padding:8px 12px;border-bottom:1px solid rgba(233,229,216,.10);background:#151a13}.sess .track{height:3px;background:#20261d;border:1px solid rgba(233,229,216,.10)}.sess .track i{display:block;height:100%;background:#d6a445}"
     },
     {
-      "name": "Masthead Title",
+      "name": "Data Table",
       "kind": "custom",
-      "refersTo": "mast-title",
-      "description": "The sheet's wordmark: Archivo 700 italic 30px in lit warm gray with a gold -go foil stamp, above a 10px uppercase muted subtitle.",
-      "html": "<div><h1 class=\"ds-mast-title\">llm-router<em>-go</em></h1><div class=\"ds-mast-sub\">fleet sheet · gpu-aware inference routing</div></div>",
-      "css": ".ds-mast-title { font-family: 'Archivo', 'JetBrains Mono', sans-serif; font-style: italic; font-weight: 700; letter-spacing: -0.015em; font-size: 30px; line-height: 1; margin: 0; color: #e8e6e0; } .ds-mast-title em { color: #c9a24b; font-style: inherit; } .ds-mast-sub { margin-top: 6px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #8c867c; }"
+      "refersTo": "data-table-row",
+      "description": "Ruled numeric sheet; sticky first column, right-aligned numbers, source dots in heads.",
+      "html": "<table class=\"data-table\"><thead><tr><th>BACKEND</th><th class=\"num\">KV</th></tr></thead><tbody><tr><td>vllm-king</td><td class=\"num\">78%</td></tr></tbody></table>",
+      "css": ".data-table{width:100%;border-collapse:collapse;font:400 12px/16px 'Overpass Mono',monospace;font-variant-numeric:tabular-nums}.data-table th{border-bottom:1px solid rgba(233,229,216,.18);padding:6px 8px;text-align:left;font:600 10px/12px Overpass,sans-serif;letter-spacing:.1em;text-transform:uppercase;color:#8f8c80;background:#151a13}.data-table td{border-bottom:1px solid rgba(233,229,216,.10);padding:6px 8px;color:#b9b5a7}.data-table td.num{text-align:right}"
+    },
+    {
+      "name": "Stale Banner",
+      "kind": "custom",
+      "refersTo": "topbar",
+      "description": "The feed-loss state: frozen truth, explicit age, re-arming endpoint.",
+      "html": "<div class=\"stale\"><i></i><span><b>STALE</b> \u2014 last data 11:42:03 \u00b7 14s ago</span><span class=\"right\">re-arming /metrics/stream</span></div>",
+      "css": ".stale{display:flex;align-items:center;gap:12px;padding:6px 20px;background:#151a13;border-bottom:1px solid #e07a66;color:#e07a66;font:400 12px/16px Overpass,sans-serif}.stale i{width:8px;height:8px;background:#e07a66}.stale b{letter-spacing:.1em}.stale .right{margin-left:auto;color:#8f8c80}"
     }
   ],
   "narrative": {
-    "northStar": "The Miura Fleet Sheet",
-    "overview": "The fleet is a sheet. Every backend is a fold-cell in one tessellated Miura grid, and the grid undulates with live load — what an operator sees at a glance is a single continuous surface, the whole fleet's requests, latency, and GPU pressure as one field of linked creases, not a scatter of unrelated cards. The world is dark-ink: a matte near-black sheet (#0a0a0b) scored with warm-gray mountain creases and steel-blue valley creases, carrying a single gold-foil live signal. The first thing the eye lands on is a live gold line moving on the sheet.\n\nThis is an operate-in-situ surface: an ML-infrastructure operator checks it while traffic is live, at arm's length, in a dark room. Density is high but disciplined — the data is the decoration. Every number is the router's actual in-flight state (never a stale or derived approximation), and the honesty boundary is visual: token figures come in two labeled kinds — estimated prefill (gold est, request-body based) and the engine's own measured throughput (steel-blue real, scraped from each backend's /metrics). The committed refusals, carried from the world contract: a row of equal dashboard cards, and the dark \"near-black + one neon accent + glowing edges\" ops board — here gold is a signal line, not a glow, and the sheet is one field, not a card grid.",
+    "northStar": "The Capacity Survey",
+    "overview": "The fleet is terrain. A dark survey sheet applies level lines, spot heights, grid references, and a marginal scale to live GPU/KV/session telemetry, with a cream day sheet that inverts the same roles. The standard ops shell keeps controls familiar; the world enters through type, palette, density, and the Fleet Profile. Every figure carries its source: router, engine, device, or est. Stale data freezes and says so; missing engine data is hatched, never guessed.",
     "keyCharacteristics": [
-      "One tessellated field of sharp-cornered parallelogram fold-cells under a shared isometric skew (-6deg)",
-      "Gold-foil (#c9a24b) as the only hot color: the live trace, the active state, nothing decorative",
-      "Uniform-color trace lines across the full visible window (30s/60s/5m over 5 minutes of history) — no afterglow fade; the line stays the same color end to end",
-      "Depth by fold geometry, not shadows: recessed 1px seams, 1px crease-scored lit edges, a ~3% diagonal sheen",
-      "Archivo 700 italic for the masthead; JetBrains Mono for every number, ID, label, and line of the tape",
-      "Two-labeled token truth: est (body-based prefill estimate, gold) beside real (engine-measured prefill/decode tok/s, steel-blue, from the backend's /metrics)",
-      "A sessions band under the tape: the in-flight request stack (oldest on top) and live conversations, each row's token figures est-labeled, active conversations wearing the only gold edge at rest",
-      "A grouped engine readout in the opened fold (requests/tokens/cache/latency/capacity · real): full/SWA/Mamba pool usage, per-stage latency (prefill/decode/queue/ITL/e2e/per-token), finished-reason breakdowns, lifetime totals — the backend's own /metrics truth",
-      "One pull deploys the whole field: the [DEPLOY]/[FOLD] packet control cascades every cell in a stepped diagonal (55ms per cell)",
-      "The same sheet folds to a thin packet row — the mobile/compact mode is the fold, not a separate layout"
+      "Dark olive-ink survey sheet + paired cream day sheet",
+      "Sand level lines, water KV, moss live, amber estimate, vermilion failure",
+      "Overpass + Overpass Mono; integer 2px type steps; tabular figures",
+      "Zero radius, 1px rules, no ambient shadow or glow",
+      "Fleet Profile is the only history chart; live sessions sit beside it",
+      "Frozen truth on feed loss, explicitly labelled stale"
     ],
     "rules": [
-      { "name": "The One Hot Color Rule", "body": "Gold is the live signal and nothing else. Its rarity — thin lines, small lit edges, one button — is the point. A screen with a gold surface, a gold block, or gold used for emphasis of a non-signal value has left the world.", "section": "colors" },
-      { "name": "The Red Reservation Rule", "body": "Red appears only on 5xx / saturated / offline — the failure conditions — plus the STALE feed-loss banner. A 429 on the tape is NOT red: it is valley blue (a capacity rejection with Retry-After is the policy working as designed). If a red pixel isn't a failure condition, delete it.", "section": "colors" },
-      { "name": "The Est Label Rule", "body": "Token figures are either estimated (gold est, 9px, 0.1em — body-based prefill/context estimates, including every session row and per-request table figure) or the engine's measured values (steel-blue real — tok/s, pool stats, latency, completed counts). Anywhere a token number appears, its kind is labeled: fleet strip, readout rows, tape column, sessions. A token figure without est or real is a lie about the data.", "section": "typography" },
-      { "name": "The Uniform Line Rule", "body": "A trace line is one color across its entire visible window — gold (#c9a24b, α 0.9, 1.5px) or valley steel (#8fa9c0, α 0.45 for overlays). No afterglow fade, no brightness-as-age encoding: the operator must be able to follow a signal's shape across the full 5-minute history without the line's color changing under them. Only the newest sample wears the lit head dot.", "section": "colors" },
-      { "name": "The Tabular Rule", "body": "Every live number uses tabular numerals. A ticking value that shifts horizontal weight has broken the sheet's calm.", "section": "typography" },
-      { "name": "The Fold-Is-Depth Rule", "body": "If a surface isn't reacting to hover, selection, or failure, it carries no shadow and no glow. Ambient depth is geometry — seams, crease scores, the sheen — not blur. Glassmorphism, heavy drop shadows, and decorative glows are outside this world.", "section": "elevation" },
-      { "name": "The Value-Wins Rule", "body": "A fold effect that makes a value hard to read loses to the value. The skew must never put a number behind another number; the cascade must not delay reading a value; text inside the skew is always counter-skewed; long values ellipsize inside their column instead of running off the fold.", "section": "elevation" }
+      {
+        "name": "The Source Rule",
+        "body": "Every figure carries router, engine, device, or est. A number without a source is a lie about the data.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Failure Rule",
+        "body": "Vermilion is failure only. A 429 stays water; a stale feed and a saturated pool are the only other failures.",
+        "section": "colors"
+      },
+      {
+        "name": "The Integer-Step Rule",
+        "body": "Type sizes use only 10/12/14/16/24/28; line heights 12/16/20/28/32. No fractional sizes.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Rule",
+        "body": "Every measured figure is mono and tabular; a ticking value never shifts its neighbours.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-Sheet Rule",
+        "body": "No ambient shadow, glow, glass, or gradient. Depth is the 1px rule, the water fill, and the panel gaps.",
+        "section": "elevation"
+      },
+      {
+        "name": "The No-Data Rule",
+        "body": "Nulls break the line and hatch the lane. Never interpolate between backends or forward-fill a gap.",
+        "section": "components"
+      }
     ],
     "dos": [
-      "Do use gold (#c9a24b / #e4c264) only for live signals and active states: the trace line and its lit head, hover/selection edges, the packet control, focus outlines, and the est label.",
-      "Do use steel-blue (#8fa9c0 / #cfe0ef) for the secondary signal family: the ttft overlay, limit lines, and REAL engine-measured figures (decode tok/s cell, engine signals).",
-      "Do counter-skew (.unskew) every text element inside a skewed container, so numbers stay horizontal, crisp, and selectable.",
-      "Do label every token figure: gold est for body-based prefill estimates, steel-blue real for engine-measured throughput — and show both in the fleet strip so the boundary is visible.",
-      "Do use tabular numerals on every value that ticks.",
-      "Do keep the sr-only flat table next to the tessellation — including the engine columns — so the sheet always has its non-skewed accessible twin.",
-      "Do draw traces as a scrolling scope: server timestamps, eased window-scoped y-scale, one uniform color across the window, lit head dot, 30s/60s/5m window over a 5-minute buffer.",
-      "Do render missing engine data as an explicit off/err state (one line in the readout: endpoint absent or unreachable) — never as zero and never as a guess.",
-      "Do honor prefers-reduced-motion: reduce by disabling the deploy cascade, the undulation, the hover sweep, and the rAF scroll — the trace then redraws on ticks only."
+      "Put live sessions beside the profile in the first viewport.",
+      "Label every figure router, engine, device, or est.",
+      "Keep the Fleet Profile as the only history chart.",
+      "Hatch missing data and break lines at nulls.",
+      "Freeze the last truth on feed loss and label it stale.",
+      "Use tabular mono and integer 2px type steps.",
+      "Keep 429 water and vermilion for 5xx/saturation."
     ],
     "donts": [
-      "Don't use gold for decoration, emphasis, or any surface — one hot color, live signal only.",
-      "Don't use red (#d46a5e) for anything except 5xx / saturated / offline state and the STALE banner; a 429 stays valley blue on the tape.",
-      "Don't round a corner. Zero radius is the fold; the parallelogram comes from skew, not border-radius.",
-      "Don't fade a trace line's color by age — the line is one color from the oldest visible sample to the head.",
-      "Don't let the skew obscure a value — no number behind another number; if a fold effect delays reading a value, the value wins.",
-      "Don't add ambient shadows, glassmorphism, or glows at rest; shadow/glow is a state response (hover lift, opened-fold ring, saturated inversion) in the exact documented values.",
-      "Don't present the body-based token estimate as measured, and don't present the engine's measured throughput as an estimate — each carries its label.",
-      "Don't run a per-cell 60fps loop — one rAF-driven scope per trace instance, redrawn on data ticks otherwise.",
-      "Don't build the compact/mobile view as a separate layout — it is the folded sheet (packet row), driven by the same deploy state."
+      "Don't use sand as decoration; it is the survey level line.",
+      "Don't add shadows, glows, gradients, glass, or rounded corners.",
+      "Don't use serif or italic type.",
+      "Don't reintroduce KPI cards, sparkline tiles, or a second chart style.",
+      "Don't present the router GPU budget as device utilization.",
+      "Don't show a stale engine's retained gauges as current.",
+      "Don't forward-fill history or claim uncovered percentiles."
     ]
   }
 }

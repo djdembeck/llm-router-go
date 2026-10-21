@@ -13,10 +13,14 @@
 
 import type {
   EngineMetrics,
+  HistoryField,
+  HistoryResponse,
+  HistorySeries,
   LiveReq,
+  RangeName,
   SessionReq,
   SessionsFeed,
-} from "$lib/metrics.js";
+} from "$lib/api.js";
 
 interface MockBackend {
   name: string;
@@ -37,6 +41,7 @@ interface MockBackend {
   bytesRate: number;
   tokEstRate: number;
   reqTotal: number;
+  rejectTotal: number;
   bytesInTotal: number;
   bytesOutTotal: number;
   tokEstTotal: number;
@@ -70,6 +75,7 @@ const BACKENDS: MockBackend[] = [
     bytesRate: 52000,
     tokEstRate: 2400,
     reqTotal: 1284,
+    rejectTotal: 6,
     bytesInTotal: 2600000,
     bytesOutTotal: 183000000,
     tokEstTotal: 4210000,
@@ -100,6 +106,7 @@ const BACKENDS: MockBackend[] = [
     bytesRate: 31000,
     tokEstRate: 1500,
     reqTotal: 512,
+    rejectTotal: 42,
     bytesInTotal: 990000,
     bytesOutTotal: 74000000,
     tokEstTotal: 1810000,
@@ -121,6 +128,7 @@ const walk = (v: number, step: number, lo: number, hi: number) =>
 // request ring, newest last — mirrors the server's bounded burst ring
 export interface BurstReq {
   t: number;
+  start: number;
   backend: string;
   path: string;
   status: number;
@@ -154,7 +162,8 @@ function spawnRequest(t: number): void {
     ? Math.round(120 + Math.random() * 300)
     : Math.round(durMs * (8 + Math.random() * 10));
   ring.push({
-    t,
+    t: t + durMs,
+    start: t,
     backend: b.name,
     path: "/v1/chat/completions",
     status,
@@ -166,6 +175,7 @@ function spawnRequest(t: number): void {
     bytesOut,
   });
   if (ring.length > BURST_CAP) ring.splice(0, ring.length - BURST_CAP);
+  if (rejected) b.rejectTotal++;
   if (!rejected) {
     b.reqTotal++;
     b.bytesInTotal += bytesIn;
@@ -181,6 +191,8 @@ export interface Frame {
   t: number;
   backends: Array<Record<string, unknown>>;
   gpu: { used: number; budget: number; waiting: number; active: boolean };
+  gpuDevices: Array<Record<string, unknown>>;
+  gpuFeed: { status: string; url: string };
   tier0Inflight: number;
   totals: Record<string, unknown>;
 }
@@ -196,7 +208,7 @@ function tick(): Frame {
     const b = BACKENDS[i];
     const spike = b.spikeTicks > 0;
     const cap = b.maxConcurrent;
-    b.inFlight = Math.round(walk(b.inFlight, spike ? 1.4 : 0.8, 0, cap));
+    b.inFlight = Math.max(1, Math.round(walk(b.inFlight, spike ? 1.4 : 0.8, 0, cap)));
     b.waiting = spike
       ? Math.round(walk(b.waiting, 1.2, 1, b.maxQueueDepth))
       : Math.random() < 0.15 ? 1 : 0;
@@ -216,7 +228,7 @@ function tick(): Frame {
     b.tokEstRate = Math.round(walk(b.tokEstRate, spike ? 700 : 300, 0, 9000));
     // engine truth follows the traffic: KV climbs under saturation, decode
     // throughput tracks in-flight, prefill bursts with arrivals.
-    b.engRunning = clamp(b.inFlight, 0, b.maxConcurrent + 2);
+    b.engRunning = clamp(b.inFlight, 1, b.maxConcurrent + 2);
     b.engWaiting = b.waiting + (spike ? 1 : 0);
     b.engKV = Math.round(walk(b.engKV, spike ? 6 : 2, 15, spike ? 99 : 88));
     b.engPrefill = Math.round(walk(b.engPrefill, spike ? 900 : 350, 0, 12000));
@@ -253,6 +265,7 @@ function tick(): Frame {
     bytesRate: b.bytesRate,
     tokEstRate: b.tokEstRate,
     reqTotal: b.reqTotal,
+    rejectTotal: b.rejectTotal,
     bytesInTotal: b.bytesInTotal,
     bytesOutTotal: b.bytesOutTotal,
     tokEstTotal: b.tokEstTotal,
@@ -268,6 +281,31 @@ function tick(): Frame {
       waiting: BACKENDS[1].waiting > 0 && gpuActive ? 1 : 0,
       active: gpuActive,
     },
+    gpuDevices: [
+      {
+        key: "GPU-0",
+        index: 0,
+        name: "H100 80GB",
+        utilPct: clamp(BACKENDS[0].engKV + 14 + Math.random() * 8, 0, 100),
+        memUsedMB: 61000 + Math.random() * 3000,
+        memTotalMB: 81920,
+        tempC: 66 + Math.random() * 5,
+        powerW: 380 + Math.random() * 90,
+        source: "mock",
+      },
+      {
+        key: "GPU-1",
+        index: 1,
+        name: "H100 80GB",
+        utilPct: clamp(BACKENDS[1].engKV + 8 + Math.random() * 10, 0, 100),
+        memUsedMB: 52000 + Math.random() * 5000,
+        memTotalMB: 81920,
+        tempC: 62 + Math.random() * 6,
+        powerW: 330 + Math.random() * 80,
+        source: "mock",
+      },
+    ],
+    gpuFeed: { status: "ok", url: "mock://dcgm" },
     tier0Inflight: tier0.reduce((a, b) => a + b.inFlight, 0),
     totals: {
       inFlight: BACKENDS.reduce((a, b) => a + b.inFlight, 0),
@@ -279,6 +317,23 @@ function tick(): Frame {
       bytesInTotal: BACKENDS.reduce((a, b) => a + b.bytesInTotal, 0),
       bytesOutTotal: BACKENDS.reduce((a, b) => a + b.bytesOutTotal, 0),
       tokEstTotal: BACKENDS.reduce((a, b) => a + b.tokEstTotal, 0),
+      rejectTotal: BACKENDS.reduce((a, b) => a + b.rejectTotal, 0),
+      ttftMs:
+        BACKENDS.reduce((a, b) => a + b.ttftMs * b.ttftSampleCount, 0) /
+        Math.max(1, BACKENDS.reduce((a, b) => a + b.ttftSampleCount, 0)),
+      ttftSampleCount: BACKENDS.reduce((a, b) => a + b.ttftSampleCount, 0),
+      engineOk: 2,
+      engineRunning: BACKENDS.reduce((a, b) => a + b.engRunning, 0),
+      engineWaiting: BACKENDS.reduce((a, b) => a + b.engWaiting, 0),
+      prefillTokS: BACKENDS.reduce((a, b) => a + b.engPrefill, 0),
+      prefillCacheTokS: 420,
+      decodeTokS: BACKENDS.reduce((a, b) => a + b.engDecode, 0),
+      kvPeak: Math.max(...BACKENDS.map((b) => b.engKV)),
+      kvUsedTok: 1700000,
+      kvCapTok: 2500000,
+      kvMemGB: 28.4,
+      weightMemGB: 12.1,
+      hitRate: (ENG[0].hitRate + ENG[1].hitRate) / 2,
     },
   };
 }
@@ -450,6 +505,7 @@ function engineV2(i: number): EngineMetrics {
     hitRate: e.hitRate,
     prefillTokS: Math.round(b.engPrefill * (1 - e.hitRate)),
     prefillCacheTokS: Math.round(b.engPrefill * e.hitRate),
+    prefillTotalTokS: Math.round(b.engPrefill),
     decodeTokS: b.engDecode,
     ttftMs: b.engTTFT,
     itlMs: e.itl,
@@ -508,6 +564,18 @@ function engineV2(i: number): EngineMetrics {
           abort: e.finAbort,
           error: e.finError,
         },
+    ttftSamples: 40,
+    itlSamples: 40,
+    e2eSamples: 20,
+    queueSamples: 20,
+    prefillSamples: sg ? 0 : 12,
+    decodeSamples: sg ? 0 : 12,
+    perTokSamples: sg ? 0 : 12,
+    promptSamples: 4,
+    genSamples: 4,
+    ttftStreamSamples: sg ? 20 : 0,
+    ttftNonStreamSamples: sg ? 8 : 0,
+    httpStatus: 200,
   };
 }
 
@@ -688,7 +756,8 @@ export function synthSessions(nowMs: number): SessionsFeed {
   const live: LiveReq[] = [];
   for (const c of CONVS) {
     if (c.liveStart !== null) {
-      const streaming = nowMs - c.liveStart > 3500;
+      const firstByteMs = 200 + (c.ctxTok % 1800);
+      const streaming = nowMs - c.liveStart > firstByteMs;
       live.push({
         id: ++liveReqId,
         sess: c.id,
@@ -701,7 +770,7 @@ export function synthSessions(nowMs: number): SessionsFeed {
         newTok: c.liveNewTok,
         ...liveFields({
           stream: true,
-          streamMs: streaming ? c.liveStart + 3500 : 0,
+          streamMs: streaming ? c.liveStart + firstByteMs : 0,
           startMs: c.liveStart,
           newTok: c.liveNewTok,
         }),
@@ -711,7 +780,8 @@ export function synthSessions(nowMs: number): SessionsFeed {
   for (const l of LONE_LIVE) {
     // lone requests loop: when they finish, restart a few seconds out
     if (nowMs - l.start > 18000) l.start = nowMs - 1000;
-    const streaming = nowMs - l.start > 3500;
+    const firstByteMs = 250 + (l.ctxTok % 1500);
+    const streaming = nowMs - l.start > firstByteMs;
     live.push({
       id: ++liveReqId,
       sess: "",
@@ -724,7 +794,7 @@ export function synthSessions(nowMs: number): SessionsFeed {
       newTok: l.newTok,
       ...liveFields({
         stream: l.stream,
-        streamMs: streaming ? l.start + 3500 : 0,
+        streamMs: streaming ? l.start + firstByteMs : 0,
         startMs: l.start,
         newTok: l.newTok,
       }),
@@ -802,6 +872,202 @@ export function synthSessions(nowMs: number): SessionsFeed {
 
 /** The bounded request ring, newest last. */
 export function mockBurst(limit: number): BurstReq[] {
-  const n = Math.min(1000, Math.max(10, Number(limit) || 500));
+  const n = Math.min(2000, Math.max(10, Number(limit) || 500));
   return ring.slice(-n);
+}
+
+// ── synthetic history (dev profile) ──────────────────────────────────────
+// The dev server has no sampler, so the profile would be empty. This builds
+// a plausible wave per range with the same dense-grid shape as the router's
+// /metrics/history: nulls are gaps, never forward-filled.
+
+const H_STEP: Record<RangeName, number> = {
+  "5m": 1000,
+  "1h": 5000,
+  "6h": 60000,
+  "24h": 120000,
+  "7d": 900000,
+  "30d": 3600000,
+};
+const H_COUNT: Record<RangeName, number> = {
+  "5m": 300,
+  "1h": 720,
+  "6h": 360,
+  "24h": 720,
+  "7d": 672,
+  "30d": 720,
+};
+
+function wave(i: number, period: number, phase = 0): number {
+  return Math.sin((i / period) * Math.PI * 2 + phase);
+}
+
+export function mockHistory(range: RangeName): HistoryResponse {
+  const stepMs = H_STEP[range] ?? 5000;
+  const n = H_COUNT[range] ?? 720;
+  const now = Date.now();
+  const from = Math.floor((now - n * stepMs) / stepMs) * stepMs;
+  const to = from + (n - 1) * stepMs;
+  const t = Array.from({ length: n }, (_, i) => from + i * stepMs);
+  const col = (f: (i: number) => number | null): (number | null)[] =>
+    t.map((_, i) => f(i));
+
+  const backs: HistorySeries[] = BACKENDS.map((b, bi) => {
+    const sg = b.name.toLowerCase().includes("sglang");
+    const max = Math.max(1, b.maxConcurrent);
+    const kvBase = sg ? 58 : 42;
+    const spikeAt = sg ? Math.floor(n * 0.82) : -1;
+    const spike = (i: number) =>
+      spikeAt >= 0 && i >= spikeAt ? Math.max(0, 1 - (i - spikeAt) / 18) * 34 : 0;
+    const kv = col((i) => Math.round(clamp(kvBase + wave(i, 34, bi) * 9 + spike(i), 2, 99)));
+    const running = col((i) =>
+      Math.round(clamp(b.engRunning + wave(i, 21, bi * 0.7) * 1.3, 0, max + 2)),
+    );
+    const waiting = col((i) =>
+      Math.round(clamp(wave(i, 14, bi + 1) > 0.72 ? 1 + spike(i) / 20 : 0, 0, 4)),
+    );
+    const prefill = col((i) =>
+      Math.round(clamp(b.engPrefill * (0.72 + wave(i, 18, bi) * 0.22 + spike(i) / 120), 0, 14000)),
+    );
+    const cache = col((i) => Math.round(clamp(prefill[i]! * 0.16, 0, 4000)));
+    const decode = col((i) =>
+      Math.round(clamp(b.engDecode * (0.8 + wave(i, 26, bi * 1.4) * 0.18), 0, 900)),
+    );
+    const ttft = col((i) =>
+      Math.round(clamp(b.ttftMs * (0.85 + wave(i, 23, bi * 0.9) * 0.22 + spike(i) / 90), 40, 3000)),
+    );
+    const reqRate = col((i) =>
+      +clamp(0.8 + wave(i, 17, bi) * 0.5 + spike(i) / 60, 0, 9).toFixed(2),
+    );
+    const hit = col((i) => +clamp(0.36 + wave(i, 41, bi * 2) * 0.1, 0.1, 0.75).toFixed(3));
+    return {
+      name: b.name,
+      t,
+      series: {
+        inFlight: running,
+        waiting,
+        maxConcurrent: col(() => b.maxConcurrent),
+        prefillInFlight: col((i) => Math.round(clamp(wave(i, 19, bi) * 1.2 + 0.5, 0, b.prefillMax))),
+        prefillWaiting: col(() => 0),
+        reqRate,
+        tokEstRate: col((i) => Math.round(clamp(reqRate[i]! * 2200, 0, 9000))),
+        ewmaMs: col((i) => Math.round(b.ewmaMs * (0.9 + wave(i, 30, bi) * 0.1))),
+        ttftMs: ttft,
+        ttftMax: col((i) => Math.round(ttft[i]! * 2.4)),
+        ttftSamples: col((i) => i + 1),
+        engineRunning: running,
+        engineWaiting: waiting,
+        prefillTokS: prefill,
+        prefillCacheTokS: cache,
+        decodeTokS: decode,
+        kvPct: kv,
+        kvHeldPct: sg ? col((i) => Math.round(clamp(kv[i]! * 0.08, 0, 20))) : col(() => null),
+        kvMax: kv,
+        kvUsedTok: sg ? col((i) => Math.round((kv[i]! / 100) * 2500000)) : col(() => null),
+        kvCapTok: sg ? col(() => 2500000) : col(() => null),
+        kvMemGB: sg ? col((i) => +(22 + kv[i]! * 0.09).toFixed(1)) : col(() => null),
+        weightMemGB: sg ? col(() => 12.1) : col(() => null),
+        hitRate: hit,
+        engineTTFTMs: col((i) => Math.round(ttft[i]! * 0.88)),
+      },
+    };
+  });
+
+  const sum = (k: HistoryField): (number | null)[] =>
+    col((i) => {
+      let s = 0;
+      let any = false;
+      for (const b of backs) {
+        const v = b.series[k]?.[i];
+        if (v != null) {
+          s += v;
+          any = true;
+        }
+      }
+      return any ? s : null;
+    });
+  const maxOf = (k: HistoryField): (number | null)[] =>
+    col((i) => {
+      let m: number | null = null;
+      for (const b of backs) {
+        const v = b.series[k]?.[i];
+        if (v != null && (m == null || v > m)) m = v;
+      }
+      return m;
+    });
+  const avgOf = (k: HistoryField): (number | null)[] =>
+    col((i) => {
+      let s = 0;
+      let c = 0;
+      for (const b of backs) {
+        const v = b.series[k]?.[i];
+        if (v != null) {
+          s += v;
+          c++;
+        }
+      }
+      return c ? s / c : null;
+    });
+
+  const fleet: HistorySeries = {
+    name: "fleet",
+    t,
+    series: {
+      inFlight: sum("inFlight"),
+      waiting: sum("waiting"),
+      reqRate: sum("reqRate"),
+      tokEstRate: sum("tokEstRate"),
+      ttftMs: avgOf("ttftMs"),
+      ttftMax: maxOf("ttftMax"),
+      ttftSamples: sum("ttftSamples"),
+      engineRunning: sum("engineRunning"),
+      engineWaiting: sum("engineWaiting"),
+      prefillTokS: sum("prefillTokS"),
+      prefillCacheTokS: sum("prefillCacheTokS"),
+      decodeTokS: sum("decodeTokS"),
+      kvPct: maxOf("kvPct"),
+      kvMax: maxOf("kvMax"),
+      kvUsedTok: sum("kvUsedTok"),
+      kvCapTok: sum("kvCapTok"),
+      kvMemGB: sum("kvMemGB"),
+      weightMemGB: sum("weightMemGB"),
+      hitRate: avgOf("hitRate"),
+    },
+  };
+
+  const gpu = [
+    ["GPU-0", 0, "H100 80GB", 61000],
+    ["GPU-1", 1, "H100 80GB", 52000],
+  ].map(([key, index, name, mem]) => ({
+    key: String(key),
+    index: Number(index),
+    name: String(name),
+    source: "mock",
+    t,
+    series: {
+      utilPct: col((i) => Math.round(clamp(64 + wave(i, 22, Number(index)) * 12 + 8, 0, 100))),
+      memUsedMB: col((i) => Math.round(Number(mem) + wave(i, 40, Number(index)) * 2200)),
+      memTotalMB: col(() => 81920),
+      tempC: col((i) => Math.round(64 + wave(i, 55, Number(index)) * 3)),
+      powerW: col((i) => Math.round(370 + wave(i, 28, Number(index)) * 40)),
+    },
+  }));
+
+  return {
+    from,
+    to,
+    stepMs,
+    range,
+    backends: backs,
+    fleet,
+    gpu,
+    gpuFeed: { status: "ok", url: "mock://dcgm" },
+    ttft: {
+      n: Math.min(900, Math.round(n / 2)),
+      coverageMs: Math.min(300000, n * stepMs),
+      p50: 236,
+      p95: 780,
+    },
+    now,
+  };
 }

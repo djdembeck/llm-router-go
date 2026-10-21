@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,6 +17,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +45,7 @@ type Backend struct {
 // ─── Parsed body (single-pass, heavy fields stay raw) ──────────────────────
 
 type rawMessage struct {
+	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
 }
 
@@ -257,7 +260,8 @@ func (d *durationTracker) avgSeconds() float64 {
 // that recordAccept registered at admission; only accepted samples are
 // retired from the pending window on completion.
 type requestSample struct {
-	T            time.Time
+	T            time.Time // completion
+	Start        time.Time // admission — the profile draws the request interval
 	Backend      string
 	Path         string
 	Status       int
@@ -273,11 +277,12 @@ type requestSample struct {
 
 // backendMetrics holds per-backend lifetime counters (completed requests
 // only), the streaming TTFT EWMA (updated at first response byte), and the
-// pending window — requests accepted but not yet completed, which feeds the
-// live rates. Rates measure arrival, not completion: a decode can run for
-// minutes, but the request's demand began the moment it was admitted.
+// trailing arrival window that feeds the live rates. Rates measure arrival,
+// not completion: a decode can run for minutes, but the request's demand
+// began the moment it was admitted.
 type backendMetrics struct {
 	reqTotal      int64
+	rejectedTotal int64
 	bytesInTotal  int64
 	bytesOutTotal int64
 	tokEstTotal   int64
@@ -287,18 +292,29 @@ type backendMetrics struct {
 	reqRate       float64
 	bytesRate     float64
 	tokEstRate    float64
-	// pending: demand recorded at admission, not yet completed. computeRates
-	// divides it by the tick interval to get the live rate, then decays the
-	// remainder back by (interval / window).
-	pending       float64
-	pendingReq    float64
-	pendingTokEst float64
+	// arrivals: a fixed ring of 100 ms demand buckets over the trailing
+	// rateWindowS. recordAccept writes the current bucket; computeRates sums
+	// the buckets inside the window and divides by the full window. There is
+	// no decay and completion never subtracts: the rate is a true trailing
+	// arrival average with a hard cutoff.
+	arrivals [rateBucketN]rateBucket
 }
 
-// rateWindowS is how far back the live-rate window reaches. A single tick's
-// arrivals produce a full-window rate, so even sparse traffic shows a real
-// sustained rate instead of a 2×-per-tick spike that returns to zero.
-const rateWindowS = 30
+// The live rate is the trailing 30 s arrival average, evaluated every 500 ms
+// from 300 × 100 ms buckets. See the dated contract revision in
+// .impeccable/metrics-contract.md.
+const (
+	rateWindowS  = 30
+	rateBucketMs = 100
+	rateBucketN  = rateWindowS * 1000 / rateBucketMs
+)
+
+type rateBucket struct {
+	t   int64 // bucket start, unix millis
+	req float64
+	byt float64
+	tok float64
+}
 
 // backendMetricSnapshot is the lock-free view of backendMetrics used by the
 // frame builder.
@@ -310,31 +326,49 @@ type backendMetricSnapshot struct {
 	BytesRate       float64
 	TokEstRate      float64
 	ReqTotal        int64
+	RejectedTotal   int64
 	BytesInTotal    int64
 	BytesOutTotal   int64
 	TokEstTotal     int64
 }
 
 // metricsRegistry is the mutex-guarded home for request counters, the TTFT
-// EWMA, and the bounded burst ring (newest appended, oldest evicted).
+// EWMA, and the bounded burst ring (a fixed circular buffer: no per-append
+// copies once full).
 type metricsRegistry struct {
 	mu       sync.Mutex
 	backends map[string]*backendMetrics
 	ring     []requestSample
+	ringHead int // next write index
+	ringN    int
 	ringCap  int
+
+	// ttft: the last 4096 eligible streaming first-byte samples, for the
+	// router-side p50/p95 over a requested history window.
+	ttft     [4096]ttftSample
+	ttftHead int
+	ttftN    int
+}
+
+type ttftSample struct {
+	t  int64
+	ms float64
 }
 
 func newMetricsRegistry() *metricsRegistry {
-	return &metricsRegistry{backends: map[string]*backendMetrics{}, ringCap: 500}
+	return &metricsRegistry{backends: map[string]*backendMetrics{}, ringCap: 2000}
 }
 
 var metrics = newMetricsRegistry()
 
 // recordAccept records the demand side of a request the moment it is
-// admitted for proxying: the pending window counters that feed the live
+// admitted for proxying: the 100 ms arrival bucket that feeds the live
 // rates. Rejections (429/413) are not "accepted" — they never enter a
 // backend — and are not recorded here.
 func (m *metricsRegistry) recordAccept(backend string, bytesIn int64, tokEst int) {
+	nowMs := time.Now().UnixMilli()
+	start := nowMs / rateBucketMs * rateBucketMs
+	idx := int(start/rateBucketMs) % rateBucketN
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	bm, ok := m.backends[backend]
@@ -342,9 +376,13 @@ func (m *metricsRegistry) recordAccept(backend string, bytesIn int64, tokEst int
 		bm = &backendMetrics{}
 		m.backends[backend] = bm
 	}
-	bm.pendingReq += 1
-	bm.pending += float64(bytesIn)
-	bm.pendingTokEst += float64(tokEst)
+	b := &bm.arrivals[idx]
+	if b.t != start {
+		*b = rateBucket{t: start}
+	}
+	b.req++
+	b.byt += float64(bytesIn)
+	b.tok += float64(tokEst)
 }
 
 // recordFirstByte captures TTFT at first response byte, while the request is
@@ -369,12 +407,62 @@ func (m *metricsRegistry) recordFirstByte(backend string, ttftMs float64) {
 	}
 	bm.ttftSamples++
 	bm.ttftMsNow = ttftMs
+	now := time.Now().UnixMilli()
+	m.ttft[m.ttftHead] = ttftSample{t: now, ms: ttftMs}
+	m.ttftHead = (m.ttftHead + 1) % len(m.ttft)
+	if m.ttftN < len(m.ttft) {
+		m.ttftN++
+	}
+}
+
+// ttftPercentiles returns the eligible streaming first-byte sample count,
+// actual coverage (oldest→newest), and p50/p95 over [from, to]. Percentiles
+// are computed from real samples; when the ring covers less than the
+// requested window, coverageMs says so.
+func (m *metricsRegistry) ttftPercentiles(from, to int64) (n int, coverageMs int64, p50, p95 float64) {
+	m.mu.Lock()
+	vals := make([]float64, 0, m.ttftN)
+	var oldest, newest int64
+	for i := 0; i < m.ttftN; i++ {
+		idx := (m.ttftHead - m.ttftN + i + len(m.ttft)) % len(m.ttft)
+		s := m.ttft[idx]
+		if s.t < from || s.t > to {
+			continue
+		}
+		vals = append(vals, s.ms)
+		if oldest == 0 || s.t < oldest {
+			oldest = s.t
+		}
+		if s.t > newest {
+			newest = s.t
+		}
+	}
+	m.mu.Unlock()
+	n = len(vals)
+	if n == 0 {
+		return 0, 0, 0, 0
+	}
+	sort.Float64s(vals)
+	pick := func(q float64) float64 {
+		i := int(q * float64(n-1))
+		if i < 0 {
+			i = 0
+		}
+		if i >= n {
+			i = n - 1
+		}
+		return vals[i]
+	}
+	if newest > oldest {
+		coverageMs = newest - oldest
+	}
+	return n, coverageMs, pick(0.5), pick(0.95)
 }
 
 // recordRequest folds one COMPLETED (or rejected) request into per-backend
-// lifetime counters and the burst ring, and retires it from the pending
-// window if it had been accepted. Lifetime totals count completed work only;
-// the pending counters are the live-rate source until completion.
+// lifetime counters and the burst ring. Completion does not touch the rate
+// window: rates measure arrivals, and their 30 s tail is a property of the
+// window, not of the request's lifetime.
 func (m *metricsRegistry) recordRequest(backend string, s requestSample) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -383,22 +471,20 @@ func (m *metricsRegistry) recordRequest(backend string, s requestSample) {
 		bm = &backendMetrics{}
 		m.backends[backend] = bm
 	}
-	// Retire the pending demand for requests that were actually accepted and
-	// proxied. Router-originated rejections (413/429) never enter the
-	// pending window — counting them would inflate the live rate with
-	// demand that never reached a backend.
-	if s.accepted {
-		bm.pendingReq--
-		bm.pending -= float64(s.BytesIn)
-		bm.pendingTokEst -= float64(s.NewTokensEst)
+	if !s.accepted {
+		bm.rejectedTotal++
 	}
 	bm.reqTotal++
 	bm.bytesInTotal += s.BytesIn
 	bm.bytesOutTotal += s.BytesOut
 	bm.tokEstTotal += int64(s.NewTokensEst)
-	m.ring = append(m.ring, s)
-	if len(m.ring) > m.ringCap {
-		m.ring = m.ring[len(m.ring)-m.ringCap:]
+	if m.ring == nil {
+		m.ring = make([]requestSample, m.ringCap)
+	}
+	m.ring[m.ringHead] = s
+	m.ringHead = (m.ringHead + 1) % m.ringCap
+	if m.ringN < m.ringCap {
+		m.ringN++
 	}
 }
 
@@ -407,44 +493,44 @@ func (m *metricsRegistry) recordRequest(backend string, s requestSample) {
 func (m *metricsRegistry) burst(limit int) []requestSample {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	n := len(m.ring)
-	if limit > n {
-		limit = n
+	if limit > m.ringN {
+		limit = m.ringN
 	}
 	if limit < 0 {
 		limit = 0
 	}
-	out := make([]requestSample, limit)
-	copy(out, m.ring[n-limit:])
+	out := make([]requestSample, 0, limit)
+	start := m.ringHead - limit
+	for i := 0; i < limit; i++ {
+		idx := ((start+i)%m.ringCap + m.ringCap) % m.ringCap
+		out = append(out, m.ring[idx])
+	}
 	return out
 }
 
-// computeRates refreshes per-backend req/bytes/tok-est live rates. Each tick,
-// the whole pending window is divided by the tick interval — a request
-// admitted this tick contributes a full window-length rate — and then the
-// window decays back by (interval / window) so its tail lingers for the
-// rest of rateWindowS instead of vanishing on the next tick. The result is a
-// sustained rate that tracks arrivals, not completion deltas: a 10-minute
-// decode shows its true admission rate from the moment it was accepted.
-func (m *metricsRegistry) computeRates(dt time.Duration) {
-	if dt <= 0 {
-		return
-	}
-	dtS := dt.Seconds()
-	window := float64(rateWindowS)
-	if window < dtS {
-		window = dtS
-	}
+// computeRates refreshes per-backend req/bytes/tok-est live rates from the
+// trailing 30 s arrival buckets. The full window is the denominator even
+// when traffic is sparse, so the value is a sustained arrival rate rather
+// than a per-tick spike. A bucket older than the window is excluded with a
+// hard cutoff (no decay tail).
+func (m *metricsRegistry) computeRates(now time.Time) {
+	cutoff := now.Add(-rateWindowS * time.Second).UnixMilli()
+	nowMs := now.UnixMilli()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, bm := range m.backends {
-		bm.reqRate = bm.pendingReq / dtS
-		bm.bytesRate = float64(bm.pending) / dtS
-		bm.tokEstRate = bm.pendingTokEst / dtS
-		decay := dtS / window
-		bm.pendingReq *= 1 - decay
-		bm.pending *= 1 - decay
-		bm.pendingTokEst *= 1 - decay
+		var req, byt, tok float64
+		for i := range bm.arrivals {
+			b := &bm.arrivals[i]
+			if b.t > cutoff && b.t <= nowMs {
+				req += b.req
+				byt += b.byt
+				tok += b.tok
+			}
+		}
+		bm.reqRate = req / rateWindowS
+		bm.bytesRate = byt / rateWindowS
+		bm.tokEstRate = tok / rateWindowS
 	}
 }
 
@@ -464,6 +550,7 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 		BytesRate:       bm.bytesRate,
 		TokEstRate:      bm.tokEstRate,
 		ReqTotal:        bm.reqTotal,
+		RejectedTotal:   bm.rejectedTotal,
 		BytesInTotal:    bm.bytesInTotal,
 		BytesOutTotal:   bm.bytesOutTotal,
 		TokEstTotal:     bm.tokEstTotal,
@@ -527,7 +614,25 @@ type engineView struct {
 	PrefillTokS      float64  `json:"prefillTokS"`
 	PrefillCacheTokS float64  `json:"prefillCacheTokS"`
 	DecodeTokS       float64  `json:"decodeTokS"`
+	PrefillTotalTokS float64  `json:"prefillTotalTokS"`
 	TTFTms           float64  `json:"ttftMs"`
+	HTTPStatus       int      `json:"httpStatus"`
+	LastError        string   `json:"lastError,omitempty"`
+
+	// Interval observation counts (additive). 0 = no observations in this
+	// scrape interval, so a numeric mean of 0 renders as "—", never a real
+	// zero. These are the honesty boundary for histogram means.
+	TTFTSamples          int64 `json:"ttftSamples"`
+	ITLSamples           int64 `json:"itlSamples"`
+	E2ESamples           int64 `json:"e2eSamples"`
+	QueueSamples         int64 `json:"queueSamples"`
+	PrefillSamples       int64 `json:"prefillSamples"`
+	DecodeSamples        int64 `json:"decodeSamples"`
+	PerTokSamples        int64 `json:"perTokSamples"`
+	PromptSamples        int64 `json:"promptSamples"`
+	GenSamples           int64 `json:"genSamples"`
+	TTFTStreamSamples    int64 `json:"ttftStreamSamples"`
+	TTFTNonStreamSamples int64 `json:"ttftNonStreamSamples"`
 
 	// Interval means (ms).
 	ITLms   float64 `json:"itlMs"`
@@ -598,7 +703,9 @@ type histState struct {
 	sum, cnt float64
 	t        time.Time
 	lastSum  float64
+	lastCnt  float64
 	have     bool // a delta mean has been computed (else lastSum is stale/zero)
+	seen     bool // this histogram appeared in the current scrape
 }
 
 type engineScrape struct {
@@ -608,7 +715,13 @@ type engineScrape struct {
 	// The endpoint is structurally absent until the engine restarts, so
 	// probes back off to engineOffBackoff instead of once per second.
 	offNext time.Time
-	view    engineView
+	// errNext/errDelay bound non-404 failures (401/403/5xx) with an
+	// exponential 1s→30s retry instead of hammering a broken endpoint.
+	errNext    time.Time
+	errDelay   time.Duration
+	httpStatus int
+	lastErr    string
+	view       engineView
 	// counters: rate-differenced between scrapes, keyed by name+labels.
 	counters map[string]float64
 	cTimes   map[string]time.Time
@@ -690,23 +803,33 @@ func (e *engineRegistry) scrape(name string) {
 		e.mu.Unlock()
 		return
 	}
+	if s.status == "err" && time.Now().Before(s.errNext) {
+		e.mu.Unlock()
+		return
+	}
 	url := s.url
 	e.mu.Unlock()
 
+	var httpStatus int
+	var fetchErr error
 	body, gone, ok := func() ([]byte, bool, bool) {
 		resp, err := e.client.Get(url)
 		if err != nil {
+			fetchErr = err
 			return nil, false, false
 		}
 		defer resp.Body.Close()
+		httpStatus = resp.StatusCode
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
 			return nil, true, false
 		}
 		if resp.StatusCode != http.StatusOK {
+			fetchErr = fmt.Errorf("engine metrics HTTP %d", resp.StatusCode)
 			return nil, false, false
 		}
 		b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		if err != nil {
+			fetchErr = err
 			return nil, false, false
 		}
 		return b, false, true
@@ -717,18 +840,37 @@ func (e *engineRegistry) scrape(name string) {
 	if !ok {
 		if gone {
 			s.status = "off"
+			s.lastErr = ""
+			s.httpStatus = httpStatus
 			s.offNext = time.Now().Add(engineOffBackoff)
 		} else {
 			s.status = "err"
-			s.offNext = time.Time{}
+			s.httpStatus = httpStatus
+			if fetchErr != nil {
+				s.lastErr = fetchErr.Error()
+			} else {
+				s.lastErr = "engine metrics unavailable"
+			}
+			if s.errDelay == 0 {
+				s.errDelay = time.Second
+			} else if s.errDelay < engineOffBackoff {
+				s.errDelay *= 2
+			}
+			s.errNext = time.Now().Add(s.errDelay)
 		}
 		// Rates and interval means are deltas over a scrape interval; a stale
-		// delta would mislead, so zero them. Gauges and lifetime counters keep
-		// their last known values (lifetime facts).
+		// delta would mislead, so zero them and re-baseline every counter and
+		// histogram. Gauges and lifetime counters keep their last known
+		// values (lifetime facts).
+		s.resetBaselines()
 		s.zeroIntervalFields()
 		return
 	}
 	s.offNext = time.Time{}
+	s.errNext = time.Time{}
+	s.errDelay = 0
+	s.httpStatus = httpStatus
+	s.lastErr = ""
 	s.scrapeBody(parsePromText(body))
 }
 
@@ -748,6 +890,20 @@ func (s *engineScrape) zeroIntervalFields() {
 	v.QueueMs = 0
 	v.MeanPromptTok = 0
 	v.MeanGenTok = 0
+	v.PrefillTotalTokS = 0
+	v.TTFTSamples = 0
+	v.ITLSamples = 0
+	v.E2ESamples = 0
+	v.QueueSamples = 0
+	v.PrefillSamples = 0
+	v.DecodeSamples = 0
+	v.PerTokSamples = 0
+	v.PromptSamples = 0
+	v.GenSamples = 0
+	v.TTFTStreamSamples = 0
+	v.TTFTNonStreamSamples = 0
+	v.HTTPStatus = s.httpStatus
+	v.LastError = s.lastErr
 	if v.TTFTStreamMs != nil {
 		*v.TTFTStreamMs = 0
 	}
@@ -779,10 +935,29 @@ func (s *engineScrape) zeroIntervalFields() {
 // re-baselined on reset.
 func (s *engineScrape) scrapeBody(samples []promSample) {
 	now := time.Now()
+	if s.seenEng == nil {
+		s.seenEng = map[string]bool{}
+	}
+	if s.hists == nil {
+		s.hists = map[string]*histState{}
+	}
+	if s.counters == nil {
+		s.counters = map[string]float64{}
+	}
+	if s.cTimes == nil {
+		s.cTimes = map[string]time.Time{}
+	}
 	if len(samples) == 0 {
 		s.status = "err"
+		s.lastErr = "empty engine metrics body"
+		s.resetBaselines()
 		s.zeroIntervalFields()
 		return
+	}
+	for _, h := range s.hists {
+		h.have = false
+		h.lastCnt = 0
+		h.seen = false
 	}
 
 	// First pass: family detection + gauge accumulation.
@@ -988,7 +1163,7 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 	s.status = "ok"
 	// A new ok scrape publishes a fresh view: optional fields default to nil
 	// (null) and are re-filled only when the engine reports them.
-	view := engineView{Status: "ok"}
+	view := engineView{Status: "ok", HTTPStatus: s.httpStatus}
 
 	// Family: the most recently detected engine wins the view; both stay
 	// recorded in seenEng for the Engine label.
@@ -1163,28 +1338,44 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 	// Second pass: token counter rates + histograms, in the detected family.
 	if vllm {
 		var promptTokS float64
-		var bySrc bool
+		var seenCompute, seenCache, seenPromptTotal bool
 		for _, sm := range samples {
 			switch sm.name {
 			case "vllm:prompt_tokens_by_source_total":
 				switch sm.labels["source"] {
 				case "local_compute":
 					view.PrefillTokS += s.counterRate(sm, now)
-					bySrc = true
+					seenCompute = true
 				case "local_cache_hit":
 					view.PrefillCacheTokS += s.counterRate(sm, now)
-					bySrc = true
+					seenCache = true
 				}
 			case "vllm:prompt_tokens_total":
 				promptTokS += s.counterRate(sm, now)
+				seenPromptTotal = true
 			case "vllm:generation_tokens_total":
 				view.DecodeTokS += s.counterRate(sm, now)
 			}
 		}
-		// Compute-only prefill comes from by_source when present; older vLLM
-		// builds without it fall back to prompt_tokens_total (0 cache rate).
-		if !bySrc {
+		// Compute-only prefill comes from by_source only when the split is
+		// complete; a single source label must not pass for the whole. Older
+		// vLLM builds without by_source fall back to prompt_tokens_total.
+		switch {
+		case seenCompute && seenCache:
+			view.PrefillTotalTokS = view.PrefillTokS + view.PrefillCacheTokS
+		case seenCompute:
+			view.PrefillCacheTokS = 0
+			view.PrefillTotalTokS = view.PrefillTokS
+		case seenCache:
+			view.PrefillTokS = 0
+			view.PrefillTotalTokS = view.PrefillCacheTokS
+		default:
 			view.PrefillTokS = promptTokS
+			view.PrefillCacheTokS = 0
+			view.PrefillTotalTokS = promptTokS
+		}
+		if seenPromptTotal {
+			view.PrefillTotalTokS = promptTokS
 		}
 		// Lifetime token totals: latest raw counter values (sum across engines).
 		var vllmPrompt, vllmGen int64
@@ -1254,8 +1445,10 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 		for _, sm := range samples {
 			if sm.name == "sglang:realtime_tokens_total" {
 				switch sm.labels["mode"] {
-				case "prefill_compute", "prefill_cache":
+				case "prefill_compute":
 					view.PrefillTokS += s.counterRate(sm, now)
+				case "prefill_cache":
+					view.PrefillCacheTokS += s.counterRate(sm, now)
 				case "decode":
 					view.DecodeTokS += s.counterRate(sm, now)
 				}
@@ -1294,6 +1487,37 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 			v := retrTokS
 			view.RetractedTokS = &v
 		}
+		view.PrefillTotalTokS = view.PrefillTokS + view.PrefillCacheTokS
+	}
+	// Histogram observation counts for this interval (0 = no observations).
+	view.TTFTSamples = s.histCount("vllm:time_to_first_token_seconds")
+	view.ITLSamples = s.histCount("vllm:inter_token_latency_seconds")
+	view.E2ESamples = s.histCount("vllm:e2e_request_latency_seconds")
+	view.QueueSamples = s.histCount("vllm:request_queue_time_seconds")
+	view.PrefillSamples = s.histCount("vllm:request_prefill_time_seconds")
+	view.DecodeSamples = s.histCount("vllm:request_decode_time_seconds")
+	view.PerTokSamples = s.histCount("vllm:request_time_per_output_token_seconds")
+	view.PromptSamples = s.histCount("vllm:request_prompt_tokens")
+	view.GenSamples = s.histCount("vllm:request_generation_tokens")
+	if sg {
+		view.TTFTSamples = s.histCount("sglang:time_to_first_token_seconds")
+		view.ITLSamples = s.histCount("sglang:inter_token_latency_seconds")
+		view.E2ESamples = s.histCount("sglang:e2e_request_latency_seconds")
+		view.QueueSamples = s.histCount("sglang:queue_time_seconds")
+		view.PrefillSamples = 0
+		view.DecodeSamples = 0
+		view.PerTokSamples = 0
+		view.PromptSamples = s.histCount("sglang:prompt_tokens_histogram")
+		view.GenSamples = s.histCount("sglang:generation_tokens_histogram")
+		view.TTFTStreamSamples = s.histCount("sglang:time_to_first_token_seconds|true")
+		view.TTFTNonStreamSamples = s.histCount("sglang:time_to_first_token_seconds|false")
+	}
+	// Drop histogram state for series that vanished this scrape: their
+	// baseline must not survive a gap.
+	for k, h := range s.hists {
+		if !h.seen {
+			delete(s.hists, k)
+		}
 	}
 	s.lastT = now
 	s.view = view
@@ -1320,6 +1544,29 @@ func (s *engineScrape) histMeanRaw(key string) float64 {
 func (s *engineScrape) histHas(key string) bool {
 	h, ok := s.hists[key]
 	return ok && h.have
+}
+
+// histCount is the number of observations behind the last interval mean;
+// 0 means "no data", never a measured zero.
+func (s *engineScrape) histCount(key string) int64 {
+	h, ok := s.hists[key]
+	if !ok || !h.have {
+		return 0
+	}
+	return int64(h.lastCnt)
+}
+
+// resetBaselines forgets every counter/histogram baseline so the first
+// scrape after an outage is baseline-only (rates/means 0) instead of a
+// delta spanning the gap.
+func (s *engineScrape) resetBaselines() {
+	s.counters = map[string]float64{}
+	s.cTimes = map[string]time.Time{}
+	for _, h := range s.hists {
+		h.sum, h.cnt, h.lastSum, h.lastCnt = 0, 0, 0, 0
+		h.have, h.seen = false, false
+		h.t = time.Time{}
+	}
 }
 
 // counterKey distinguishes samples of the same metric with different
@@ -1402,16 +1649,20 @@ func (s *engineScrape) updateHist(base string, samples []promSample, now time.Ti
 		if h.t.IsZero() {
 			h.sum, h.cnt = a.sum, a.cnt
 		} else if a.sum >= h.sum && a.cnt >= h.cnt {
-			if d := a.cnt - h.cnt; d > 0 {
+			d := a.cnt - h.cnt
+			if d > 0 {
 				h.lastSum = (a.sum - h.sum) / d
+				h.lastCnt = d
+				h.have = true
 			}
-			h.have = true
 			h.sum, h.cnt = a.sum, a.cnt
 		} else {
 			h.sum, h.cnt = a.sum, a.cnt // reset: re-baseline
 			h.have = false
+			h.lastCnt = 0
 		}
 		h.t = now
+		h.seen = true
 	}
 }
 
@@ -1434,18 +1685,9 @@ func parsePromText(body []byte) []promSample {
 		if line == "" || line[0] == '#' {
 			continue
 		}
-		// Value is the last whitespace-delimited token; drop an optional
-		// trailing epoch-seconds timestamp first.
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		head, val, ok := splitPromLine(line)
+		if !ok {
 			continue
-		}
-		val := fields[len(fields)-1]
-		head := fields[0]
-		// Some collectors emit "name{labels} value ts" — head already has
-		// the labels; value is the token after it.
-		if len(fields) >= 3 && strings.ContainsAny(head, "{}") {
-			val = fields[len(fields)-2]
 		}
 		v, err := strconv.ParseFloat(val, 64)
 		if err != nil {
@@ -1458,6 +1700,51 @@ func parsePromText(body []byte) []promSample {
 		out = append(out, promSample{name: name, labels: labels, value: v})
 	}
 	return out
+}
+
+// splitPromLine separates the metric head from its value without splitting
+// inside a quoted label value or a {...} block. Label values legitimately
+// contain spaces (e.g. modelName="NVIDIA H100 80GB HBM3"); the old
+// strings.Fields approach dropped every such series. An optional trailing
+// timestamp is ignored.
+func splitPromLine(line string) (head, val string, ok bool) {
+	var fields []string
+	start := 0
+	inQuote := false
+	depth := 0
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if inQuote && c == '\\' {
+			i++ // escaped character inside a label value
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = !inQuote
+		case '{':
+			if !inQuote {
+				depth++
+			}
+		case '}':
+			if !inQuote && depth > 0 {
+				depth--
+			}
+		case ' ', '\t':
+			if !inQuote && depth == 0 {
+				if i > start {
+					fields = append(fields, line[start:i])
+				}
+				start = i + 1
+			}
+		}
+	}
+	if start < len(line) {
+		fields = append(fields, line[start:])
+	}
+	if len(fields) < 2 {
+		return "", "", false
+	}
+	return fields[0], fields[1], true
 }
 
 // splitPromHead splits "name{k=\"v\",...}" into name and labels.
@@ -1668,9 +1955,15 @@ var sessions = newSessionRegistry()
 // session (by lastMs) when the store overflows its cap. Caller holds mu.
 func (r *sessionRegistry) put(key string, a *sessionAgg) {
 	if _, ok := r.sessions[key]; !ok && len(r.sessions) >= sessStoreCap {
+		// Never evict a conversation with a request in flight: its
+		// aggregate is the only owner of LiveN and the finish path would
+		// otherwise decrement a recreated aggregate (phantom/negative live).
 		var oldestKey string
 		var oldestMs int64 = math.MaxInt64
 		for k, v := range r.sessions {
+			if v.LiveN > 0 {
+				continue
+			}
 			if v.LastMs < oldestMs {
 				oldestMs = v.LastMs
 				oldestKey = k
@@ -1713,6 +2006,7 @@ func (r *sessionRegistry) start(backend, path string, stream bool, sess string, 
 		}
 		a.Backend = backend
 		a.LiveN++
+		a.LastMs = now
 		a.CtxTok = ctxTok
 		a.NewTok = newTok
 	}
@@ -1781,7 +2075,9 @@ func (r *sessionRegistry) finish(id uint64, status int, durMs, ttftMs float64, b
 		// LiveN still decrements so no phantom liveness lingers, and the
 		// ring/appends are best-effort against whatever survives.
 		if a, ok := r.sessions[l.Sess]; ok {
-			a.LiveN--
+			if a.LiveN > 0 {
+				a.LiveN--
+			}
 			a.appendReq(req)
 			r.put(l.Sess, a)
 		}
@@ -1864,8 +2160,10 @@ func (r *sessionRegistry) feed() sessionsFeed {
 	// sink behind finished sessions) — its effective recency is the newest
 	// live start it owns.
 	liveStarts := map[string]int64{}
+	liveCounts := map[string]int{}
 	for _, l := range r.live {
 		if l.Sess != "" {
+			liveCounts[l.Sess]++
 			if st := l.Start.UnixMilli(); st > liveStarts[l.Sess] {
 				liveStarts[l.Sess] = st
 			}
@@ -1879,6 +2177,9 @@ func (r *sessionRegistry) feed() sessionsFeed {
 	}
 	list := make([]sessSort, 0, len(r.sessions))
 	for _, a := range r.sessions {
+		// The live map is the source of truth for liveness; the stored
+		// counter is repaired here so a missed decrement cannot linger.
+		a.LiveN = liveCounts[a.ID]
 		act := a.LiveN > 0 || nowMs-a.LastMs < sessActiveMs
 		eff := a.LastMs
 		if ls, ok := liveStarts[a.ID]; ok && ls > eff {
@@ -1947,6 +2248,9 @@ func sessionKeyFor(parsed *parsedBody) string {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
+		// Length-framed role + content: different role partitions must not
+		// collide, and concatenation ambiguity is impossible.
+		fmt.Fprintf(&b, "%d:%s:%d:", len(m.Role), m.Role, len(m.Content))
 		b.Write(m.Content)
 	}
 	sum := sha1.Sum([]byte(b.String()))
@@ -2016,6 +2320,7 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/metrics/stream", handleMetricsStream)
 	mux.HandleFunc("/metrics/burst", handleBurst)
 	mux.HandleFunc("/metrics/sessions", handleSessions)
+	mux.HandleFunc("/metrics/history", handleHistory)
 	mux.HandleFunc("/v1/", handleProxy)
 	return mux
 }
@@ -2095,6 +2400,23 @@ func main() {
 	}
 	go engineMetrics.loop()
 
+	// Optional device telemetry: a DCGM or nvidia_gpu_exporter Prometheus
+	// endpoint. Absent by default; the dashboard shows an honest empty state.
+	gpuURL := os.Getenv("GPU_METRICS_URL")
+	gpuReaders.configure(gpuURL)
+	if gpuURL != "" {
+		go gpuReaders.loop()
+		log.Printf("GPU device telemetry: scraping %s", gpuURL)
+	}
+
+	// Server-side history is independent of dashboard clients; it starts
+	// here so the rings cover the process lifetime, not a browser tab.
+	history.configure(os.Getenv("HISTORY_PATH"))
+	if os.Getenv("HISTORY_PATH") != "" {
+		log.Printf("history: persisting series to %s", os.Getenv("HISTORY_PATH"))
+	}
+	go history.loop()
+
 	if totalWeight > 0 {
 		maxBudget := 0
 		mb := os.Getenv("MAX_GPU_BUDGET")
@@ -2162,11 +2484,8 @@ func main() {
 	// scheduler stall does not under-count the interval.
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
-		last := time.Now()
 		for range ticker.C {
-			now := time.Now()
-			metrics.computeRates(now.Sub(last))
-			last = now
+			metrics.computeRates(time.Now())
 		}
 	}()
 
@@ -2362,6 +2681,1119 @@ func estimateRetryAfter(name string) int {
 	return estimate
 }
 
+// ─── Server-side history ──────────────────────────────────────────────────
+//
+// One sampler goroutine (independent of SSE clients) takes a coherent frame
+// every second and appends it to three rings per series: raw 1s × 1h,
+// 1m × 7d, 1h × 30d. Rollups store averages for gauges/rates and maxima for
+// pressure/TTFT. The live frame and the sampler share applyFleetAggregates,
+// so the live edge and stored history cannot diverge.
+//
+// This is the durable truth the dashboard's history ranges read; the browser
+// no longer owns the only copy. An optional HISTORY_PATH keeps the series
+// across restarts (atomic snapshot, series only — lifetime counters stay
+// process-scoped per the contract).
+
+const (
+	hiInFlight = iota
+	hiWaiting
+	hiMaxConc
+	hiPrefillInFlight
+	hiPrefillWaiting
+	hiReqRate
+	hiTokEstRate
+	hiEWMA
+	hiTTFT
+	hiTTFTMax
+	hiTTFTN
+	hiEngRunning
+	hiEngWaiting
+	hiPrefillTokS
+	hiPrefillCacheTokS
+	hiDecodeTokS
+	hiKVPct
+	hiKVHeldPct
+	hiKVMax
+	hiKVUsedTok
+	hiKVCapTok
+	hiKVMemGB
+	hiWeightMemGB
+	hiHitRate
+	hiEngTTFT
+	histFieldN
+)
+
+var histFieldNames = [histFieldN]string{
+	"inFlight", "waiting", "maxConcurrent", "prefillInFlight", "prefillWaiting",
+	"reqRate", "tokEstRate", "ewmaMs", "ttftMs", "ttftMax", "ttftSamples",
+	"engineRunning", "engineWaiting", "prefillTokS", "prefillCacheTokS",
+	"decodeTokS", "kvPct", "kvHeldPct", "kvMax", "kvUsedTok", "kvCapTok",
+	"kvMemGB", "weightMemGB", "hitRate", "engineTTFTMs",
+}
+
+var histMaxFields = [histFieldN]bool{hiTTFTMax: true, hiKVMax: true}
+
+// historyPoint is compact and fixed-layout (~108 B). Flags records which
+// fields were observed; an absent bit serializes as null, never 0.
+type historyPoint struct {
+	T     int64
+	V     [histFieldN]float32
+	Flags uint32
+}
+
+func hpSet(p *historyPoint, i int, v float64) {
+	p.V[i] = float32(v)
+	p.Flags |= 1 << uint(i)
+}
+
+func hpHas(p historyPoint, i int) bool { return p.Flags&(1<<uint(i)) != 0 }
+
+type histAccum struct {
+	t     int64
+	sum   [histFieldN]float64
+	max   [histFieldN]float32
+	n     [histFieldN]int32
+	flags uint32
+}
+
+func (a *histAccum) add(p historyPoint) {
+	for i := 0; i < histFieldN; i++ {
+		if !hpHas(p, i) {
+			continue
+		}
+		v := p.V[i]
+		a.sum[i] += float64(v)
+		if v > a.max[i] {
+			a.max[i] = v
+		}
+		a.n[i]++
+		a.flags |= 1 << uint(i)
+	}
+}
+
+func (a *histAccum) flush(t int64) historyPoint {
+	var p historyPoint
+	p.T = t
+	p.Flags = a.flags
+	for i := 0; i < histFieldN; i++ {
+		if a.n[i] == 0 {
+			continue
+		}
+		if histMaxFields[i] {
+			p.V[i] = a.max[i]
+		} else {
+			p.V[i] = float32(a.sum[i] / float64(a.n[i]))
+		}
+	}
+	return p
+}
+
+type histRing struct {
+	p    []historyPoint
+	head int
+	n    int
+}
+
+func newHistRing(capacity int) *histRing {
+	return &histRing{p: make([]historyPoint, capacity)}
+}
+
+func (r *histRing) add(p historyPoint) {
+	r.p[r.head] = p
+	r.head = (r.head + 1) % len(r.p)
+	if r.n < len(r.p) {
+		r.n++
+	}
+}
+
+// ordered returns oldest→newest.
+func (r *histRing) ordered() []historyPoint {
+	out := make([]historyPoint, 0, r.n)
+	start := r.head - r.n
+	for i := 0; i < r.n; i++ {
+		out = append(out, r.p[((start+i)%len(r.p)+len(r.p))%len(r.p)])
+	}
+	return out
+}
+
+func (r *histRing) load(pts []historyPoint) {
+	for _, p := range pts {
+		if p.T == 0 {
+			continue
+		}
+		r.add(p)
+	}
+}
+
+type seriesHistory struct {
+	raw, minute, hour *histRing
+	mA, hA            histAccum
+	lastMin, lastHour int64
+}
+
+func newSeriesHistory() *seriesHistory {
+	return &seriesHistory{
+		raw:    newHistRing(3600),  // 1 h at 1 s
+		minute: newHistRing(10080), // 7 d at 1 m
+		hour:   newHistRing(720),   // 30 d at 1 h
+	}
+}
+
+func (s *seriesHistory) add(p historyPoint, nowMs int64) {
+	s.raw.add(p)
+
+	minute := nowMs / 60000 * 60000
+	if s.lastMin == 0 {
+		s.lastMin = minute
+	}
+	if minute != s.lastMin {
+		s.minute.add(s.mA.flush(s.lastMin))
+		s.mA = histAccum{}
+		s.lastMin = minute
+	}
+	s.mA.add(p)
+
+	hour := nowMs / 3600000 * 3600000
+	if s.lastHour == 0 {
+		s.lastHour = hour
+	}
+	if hour != s.lastHour {
+		s.hour.add(s.hA.flush(s.lastHour))
+		s.hA = histAccum{}
+		s.lastHour = hour
+	}
+	s.hA.add(p)
+}
+
+// ── GPU device series (small, 5 fields) ──────────────────────────────────
+
+const (
+	guUtil = iota
+	guMemUsed
+	guMemTotal
+	guTemp
+	guPower
+	guFieldN
+)
+
+var gpuFieldNames = [guFieldN]string{"utilPct", "memUsedMB", "memTotalMB", "tempC", "powerW"}
+
+type gpuPoint struct {
+	T     int64
+	V     [guFieldN]float32
+	Flags uint8
+}
+
+type gpuAccum struct {
+	sum   [guFieldN]float64
+	n     [guFieldN]int32
+	flags uint8
+}
+
+func (a *gpuAccum) add(p gpuPoint) {
+	for i := 0; i < guFieldN; i++ {
+		if p.Flags&(1<<uint(i)) == 0 {
+			continue
+		}
+		a.sum[i] += float64(p.V[i])
+		a.n[i]++
+		a.flags |= 1 << uint(i)
+	}
+}
+
+func (a *gpuAccum) flush(t int64) gpuPoint {
+	var p gpuPoint
+	p.T = t
+	p.Flags = a.flags
+	for i := 0; i < guFieldN; i++ {
+		if a.n[i] > 0 {
+			p.V[i] = float32(a.sum[i] / float64(a.n[i]))
+		}
+	}
+	return p
+}
+
+type gpuRing struct {
+	p    []gpuPoint
+	head int
+	n    int
+}
+
+func newGPURing(capacity int) *gpuRing { return &gpuRing{p: make([]gpuPoint, capacity)} }
+
+func (r *gpuRing) add(p gpuPoint) {
+	r.p[r.head] = p
+	r.head = (r.head + 1) % len(r.p)
+	if r.n < len(r.p) {
+		r.n++
+	}
+}
+
+func (r *gpuRing) ordered() []gpuPoint {
+	out := make([]gpuPoint, 0, r.n)
+	start := r.head - r.n
+	for i := 0; i < r.n; i++ {
+		out = append(out, r.p[((start+i)%len(r.p)+len(r.p))%len(r.p)])
+	}
+	return out
+}
+
+func (r *gpuRing) load(pts []gpuPoint) {
+	for _, p := range pts {
+		if p.T != 0 {
+			r.add(p)
+		}
+	}
+}
+
+type gpuSeries struct {
+	raw, minute, hour *gpuRing
+	mA, hA            gpuAccum
+	lastMin, lastHour int64
+}
+
+func newGPUSeries() *gpuSeries {
+	return &gpuSeries{
+		raw:    newGPURing(3600),
+		minute: newGPURing(10080),
+		hour:   newGPURing(720),
+	}
+}
+
+func (s *gpuSeries) add(p gpuPoint, nowMs int64) {
+	s.raw.add(p)
+	minute := nowMs / 60000 * 60000
+	if s.lastMin == 0 {
+		s.lastMin = minute
+	}
+	if minute != s.lastMin {
+		s.minute.add(s.mA.flush(s.lastMin))
+		s.mA = gpuAccum{}
+		s.lastMin = minute
+	}
+	s.mA.add(p)
+	hour := nowMs / 3600000 * 3600000
+	if s.lastHour == 0 {
+		s.lastHour = hour
+	}
+	if hour != s.lastHour {
+		s.hour.add(s.hA.flush(s.lastHour))
+		s.hA = gpuAccum{}
+		s.lastHour = hour
+	}
+	s.hA.add(p)
+}
+
+// ── Store ────────────────────────────────────────────────────────────────
+
+type historyStore struct {
+	mu       sync.Mutex
+	backends map[string]*seriesHistory
+	fleet    *seriesHistory
+	gpus     map[string]*gpuSeries
+	path     string
+	lastSave time.Time
+	saveWarn bool
+}
+
+var history = newHistoryStore()
+
+func newHistoryStore() *historyStore {
+	return &historyStore{
+		backends: map[string]*seriesHistory{},
+		fleet:    newSeriesHistory(),
+		gpus:     map[string]*gpuSeries{},
+	}
+}
+
+func (h *historyStore) configure(path string) {
+	h.mu.Lock()
+	h.path = path
+	h.mu.Unlock()
+	if path != "" {
+		h.loadSnapshot(path)
+	}
+}
+
+func (h *historyStore) loop() {
+	ticker := time.NewTicker(time.Second)
+	for range ticker.C {
+		h.sample()
+		if h.path != "" && time.Since(h.lastSave) >= time.Minute {
+			h.lastSave = time.Now()
+			h.save()
+		}
+	}
+}
+
+func (h *historyStore) sample() {
+	f := buildMetricsFrame()
+	now := f.T
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, b := range f.Backends {
+		s, ok := h.backends[b.Name]
+		if !ok {
+			s = newSeriesHistory()
+			h.backends[b.Name] = s
+		}
+		p := pointFromBackend(b)
+		p.T = now
+		s.add(p, now)
+	}
+	fp := pointFromTotals(f.Totals)
+	fp.T = now
+	h.fleet.add(fp, now)
+	for _, d := range f.GPUDevices {
+		s, ok := h.gpus[d.Key]
+		if !ok {
+			s = newGPUSeries()
+			h.gpus[d.Key] = s
+		}
+		var p gpuPoint
+		p.T = now
+		p.V[guUtil] = float32(d.UtilPct)
+		p.Flags |= 1 << guUtil
+		if d.MemUsedMB > 0 {
+			p.V[guMemUsed] = float32(d.MemUsedMB)
+			p.Flags |= 1 << guMemUsed
+		}
+		if d.MemTotalMB > 0 {
+			p.V[guMemTotal] = float32(d.MemTotalMB)
+			p.Flags |= 1 << guMemTotal
+		}
+		if d.TempC != nil {
+			p.V[guTemp] = float32(*d.TempC)
+			p.Flags |= 1 << guTemp
+		}
+		if d.PowerW != nil {
+			p.V[guPower] = float32(*d.PowerW)
+			p.Flags |= 1 << guPower
+		}
+		s.add(p, now)
+	}
+}
+
+func pointFromBackend(b backendFrame) historyPoint {
+	var p historyPoint
+	hpSet(&p, hiInFlight, float64(b.InFlight))
+	hpSet(&p, hiWaiting, float64(b.Waiting))
+	hpSet(&p, hiMaxConc, float64(b.MaxConcurrent))
+	hpSet(&p, hiPrefillInFlight, float64(b.PrefillInFlight))
+	hpSet(&p, hiPrefillWaiting, float64(b.PrefillWaiting))
+	hpSet(&p, hiReqRate, b.ReqRate)
+	hpSet(&p, hiTokEstRate, b.TokEstRate)
+	if b.EWMAms > 0 {
+		hpSet(&p, hiEWMA, b.EWMAms)
+	}
+	if b.TTFTSampleCount > 0 {
+		hpSet(&p, hiTTFT, b.TTFTms)
+		hpSet(&p, hiTTFTMax, b.TTFTms)
+		hpSet(&p, hiTTFTN, float64(b.TTFTSampleCount))
+	}
+	e := b.Engine
+	if e.Status == "ok" {
+		hpSet(&p, hiEngRunning, e.Running)
+		hpSet(&p, hiEngWaiting, e.Waiting)
+		hpSet(&p, hiPrefillTokS, e.PrefillTokS)
+		hpSet(&p, hiPrefillCacheTokS, e.PrefillCacheTokS)
+		hpSet(&p, hiDecodeTokS, e.DecodeTokS)
+		hpSet(&p, hiKVPct, e.KVPct)
+		hpSet(&p, hiKVMax, e.KVPct)
+		hpSet(&p, hiHitRate, e.HitRate)
+		if e.KVHeldPct != nil {
+			hpSet(&p, hiKVHeldPct, *e.KVHeldPct)
+		}
+		if e.KVUsedTok != nil {
+			hpSet(&p, hiKVUsedTok, *e.KVUsedTok)
+		}
+		if e.KVCapTok != nil {
+			hpSet(&p, hiKVCapTok, *e.KVCapTok)
+		}
+		if e.KVMemGB != nil {
+			hpSet(&p, hiKVMemGB, *e.KVMemGB)
+		}
+		if e.WeightMemGB != nil {
+			hpSet(&p, hiWeightMemGB, *e.WeightMemGB)
+		}
+		if e.TTFTSamples > 0 {
+			hpSet(&p, hiEngTTFT, e.TTFTms)
+		}
+	}
+	return p
+}
+
+func pointFromTotals(t totalsFrame) historyPoint {
+	var p historyPoint
+	hpSet(&p, hiInFlight, float64(t.InFlight))
+	hpSet(&p, hiWaiting, float64(t.Waiting))
+	hpSet(&p, hiReqRate, t.ReqRate)
+	hpSet(&p, hiTokEstRate, t.TokEstRate)
+	if t.TTFTSampleCount > 0 {
+		hpSet(&p, hiTTFT, t.TTFTMs)
+		hpSet(&p, hiTTFTMax, t.TTFTMs)
+		hpSet(&p, hiTTFTN, float64(t.TTFTSampleCount))
+	}
+	if t.EngineOK > 0 {
+		hpSet(&p, hiEngRunning, t.EngineRunning)
+		hpSet(&p, hiEngWaiting, t.EngineWaiting)
+		hpSet(&p, hiPrefillTokS, t.PrefillTokS)
+		hpSet(&p, hiPrefillCacheTokS, t.PrefillCacheTokS)
+		hpSet(&p, hiDecodeTokS, t.DecodeTokS)
+		hpSet(&p, hiKVPct, t.KVPeak)
+		hpSet(&p, hiKVMax, t.KVPeak)
+		hpSet(&p, hiKVUsedTok, t.KVUsedTok)
+		hpSet(&p, hiKVCapTok, t.KVCapTok)
+		hpSet(&p, hiKVMemGB, t.KVMemGB)
+		hpSet(&p, hiWeightMemGB, t.WeightMemGB)
+		hpSet(&p, hiHitRate, t.HitRate)
+	}
+	return p
+}
+
+// ── Query ────────────────────────────────────────────────────────────────
+
+type historyRange struct {
+	Dur    time.Duration
+	Step   time.Duration
+	Source string
+}
+
+var historyRanges = map[string]historyRange{
+	"5m":  {5 * time.Minute, time.Second, "raw"},
+	"1h":  {time.Hour, 5 * time.Second, "raw"},
+	"6h":  {6 * time.Hour, time.Minute, "minute"},
+	"24h": {24 * time.Hour, 2 * time.Minute, "minute"},
+	"7d":  {7 * 24 * time.Hour, 15 * time.Minute, "minute"},
+	"30d": {30 * 24 * time.Hour, time.Hour, "hour"},
+}
+
+type historySeriesOut struct {
+	Name   string                `json:"name"`
+	T      []int64               `json:"t"`
+	Series map[string][]*float64 `json:"series"`
+}
+
+type historyGPUOut struct {
+	Key    string                `json:"key"`
+	Index  int                   `json:"index"`
+	Name   string                `json:"name"`
+	Source string                `json:"source"`
+	T      []int64               `json:"t"`
+	Series map[string][]*float64 `json:"series"`
+}
+
+type historyTTFTOut struct {
+	N          int     `json:"n"`
+	CoverageMs int64   `json:"coverageMs"`
+	P50        float64 `json:"p50"`
+	P95        float64 `json:"p95"`
+}
+
+type historyResponse struct {
+	From     int64              `json:"from"`
+	To       int64              `json:"to"`
+	StepMs   int64              `json:"stepMs"`
+	Range    string             `json:"range"`
+	Backends []historySeriesOut `json:"backends"`
+	Fleet    historySeriesOut   `json:"fleet"`
+	GPU      []historyGPUOut    `json:"gpu"`
+	GPUFeed  gpuFeedFrame       `json:"gpuFeed"`
+	TTFT     historyTTFTOut     `json:"ttft"`
+	Now      int64              `json:"now"`
+}
+
+func (h *historyStore) query(rangeName string, names []string) historyResponse {
+	rng, ok := historyRanges[rangeName]
+	if !ok {
+		rng = historyRanges["1h"]
+		rangeName = "1h"
+	}
+	now := time.Now()
+	stepMs := rng.Step.Milliseconds()
+	from := now.Add(-rng.Dur).UnixMilli()
+	from = from / stepMs * stepMs
+	n := int(rng.Dur.Milliseconds() / stepMs)
+	if n < 1 {
+		n = 1
+	}
+	to := from + int64(n-1)*stepMs
+
+	h.mu.Lock()
+	pick := func(s *seriesHistory) []historyPoint {
+		var ring *histRing
+		switch rng.Source {
+		case "minute":
+			ring = s.minute
+		case "hour":
+			ring = s.hour
+		default:
+			ring = s.raw
+		}
+		return ring.ordered()
+	}
+	fleetPts := pick(h.fleet)
+	backendPts := map[string][]historyPoint{}
+	if len(names) == 0 {
+		for name := range h.backends {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+	}
+	for _, name := range names {
+		if s, ok := h.backends[name]; ok {
+			backendPts[name] = pick(s)
+		}
+	}
+	gpuPts := map[string][]gpuPoint{}
+	gpuMeta := map[string]gpuDeviceFrame{}
+	for key, s := range h.gpus {
+		var ring *gpuRing
+		switch rng.Source {
+		case "minute":
+			ring = s.minute
+		case "hour":
+			ring = s.hour
+		default:
+			ring = s.raw
+		}
+		gpuPts[key] = ring.ordered()
+	}
+	for _, d := range gpuReaders.view() {
+		gpuMeta[d.Key] = d
+	}
+	h.mu.Unlock()
+
+	resp := historyResponse{
+		From: from, To: to, StepMs: stepMs, Range: rangeName, Now: now.UnixMilli(),
+		Backends: make([]historySeriesOut, 0, len(names)),
+		GPUFeed:  gpuReaders.feed(),
+	}
+	resp.Fleet = buildHistSeries("fleet", fleetPts, from, stepMs, n)
+	for _, name := range names {
+		pts, ok := backendPts[name]
+		if !ok {
+			continue
+		}
+		resp.Backends = append(resp.Backends, buildHistSeries(name, pts, from, stepMs, n))
+	}
+	for key, pts := range gpuPts {
+		meta := gpuMeta[key]
+		resp.GPU = append(resp.GPU, buildGPUSeries(key, meta, pts, from, stepMs, n))
+	}
+	sort.Slice(resp.GPU, func(i, j int) bool { return resp.GPU[i].Key < resp.GPU[j].Key })
+	rn, cov, p50, p95 := metrics.ttftPercentiles(from, to+stepMs)
+	resp.TTFT = historyTTFTOut{N: rn, CoverageMs: cov, P50: p50, P95: p95}
+	return resp
+}
+
+func buildHistSeries(name string, pts []historyPoint, from, stepMs int64, n int) historySeriesOut {
+	out := historySeriesOut{Name: name, T: make([]int64, n)}
+	for i := 0; i < n; i++ {
+		out.T[i] = from + int64(i)*stepMs
+	}
+	buckets := make([]histAccum, n)
+	for _, p := range pts {
+		if p.T < from || p.T >= from+int64(n)*stepMs {
+			continue
+		}
+		idx := int((p.T - from) / stepMs)
+		buckets[idx].add(p)
+	}
+	out.Series = map[string][]*float64{}
+	for f := 0; f < histFieldN; f++ {
+		arr := make([]*float64, n)
+		for i := 0; i < n; i++ {
+			if buckets[i].n[f] == 0 {
+				continue
+			}
+			var v float64
+			if histMaxFields[f] {
+				v = float64(buckets[i].max[f])
+			} else {
+				v = buckets[i].sum[f] / float64(buckets[i].n[f])
+			}
+			arr[i] = &v
+		}
+		out.Series[histFieldNames[f]] = arr
+	}
+	return out
+}
+
+func buildGPUSeries(key string, meta gpuDeviceFrame, pts []gpuPoint, from, stepMs int64, n int) historyGPUOut {
+	out := historyGPUOut{Key: key, Index: meta.Index, Name: meta.Name, Source: meta.Source, T: make([]int64, n)}
+	if out.Key == "" {
+		out.Key = "device"
+	}
+	if out.Name == "" {
+		out.Name = out.Key
+	}
+	for i := 0; i < n; i++ {
+		out.T[i] = from + int64(i)*stepMs
+	}
+	buckets := make([]gpuAccum, n)
+	for _, p := range pts {
+		if p.T < from || p.T >= from+int64(n)*stepMs {
+			continue
+		}
+		idx := int((p.T - from) / stepMs)
+		buckets[idx].add(p)
+	}
+	out.Series = map[string][]*float64{}
+	for f := 0; f < guFieldN; f++ {
+		arr := make([]*float64, n)
+		for i := 0; i < n; i++ {
+			if buckets[i].n[f] == 0 {
+				continue
+			}
+			v := buckets[i].sum[f] / float64(buckets[i].n[f])
+			arr[i] = &v
+		}
+		out.Series[gpuFieldNames[f]] = arr
+	}
+	return out
+}
+
+// ── Persistence (optional, atomic snapshot) ──────────────────────────────
+
+const historySnapshotVersion = 2
+
+type histSeriesSnap struct {
+	Raw, Minute, Hour []historyPoint
+}
+
+type histGPUSnap struct {
+	Raw, Minute, Hour []gpuPoint
+}
+
+type historySnapshot struct {
+	Version  int
+	SavedAt  int64
+	Backends map[string]histSeriesSnap
+	Fleet    histSeriesSnap
+	GPUs     map[string]histGPUSnap
+}
+
+func (h *historyStore) snapshotLocked() historySnapshot {
+	snap := historySnapshot{
+		Version:  historySnapshotVersion,
+		SavedAt:  time.Now().UnixMilli(),
+		Backends: map[string]histSeriesSnap{},
+		Fleet:    histSeriesSnap{Raw: h.fleet.raw.ordered(), Minute: h.fleet.minute.ordered(), Hour: h.fleet.hour.ordered()},
+		GPUs:     map[string]histGPUSnap{},
+	}
+	for name, s := range h.backends {
+		snap.Backends[name] = histSeriesSnap{Raw: s.raw.ordered(), Minute: s.minute.ordered(), Hour: s.hour.ordered()}
+	}
+	for key, s := range h.gpus {
+		snap.GPUs[key] = histGPUSnap{Raw: s.raw.ordered(), Minute: s.minute.ordered(), Hour: s.hour.ordered()}
+	}
+	return snap
+}
+
+func (h *historyStore) save() {
+	h.mu.Lock()
+	snap := h.snapshotLocked()
+	path := h.path
+	h.mu.Unlock()
+	if path == "" {
+		return
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			h.warnSave(err)
+			return
+		}
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		h.warnSave(err)
+		return
+	}
+	enc := gob.NewEncoder(f)
+	if err := enc.Encode(snap); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		h.warnSave(err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		h.warnSave(err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		h.warnSave(err)
+	}
+}
+
+func (h *historyStore) warnSave(err error) {
+	if h.saveWarn {
+		return
+	}
+	h.saveWarn = true
+	log.Printf("history: snapshot write failed (continuing in memory): %v", err)
+}
+
+func (h *historyStore) loadSnapshot(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("history: cannot open %s (continuing in memory): %v", path, err)
+		}
+		return
+	}
+	defer f.Close()
+	var snap historySnapshot
+	if err := gob.NewDecoder(f).Decode(&snap); err != nil || snap.Version != historySnapshotVersion {
+		log.Printf("history: ignoring %s (bad snapshot or version)", path)
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.fleet.raw.load(snap.Fleet.Raw)
+	h.fleet.minute.load(snap.Fleet.Minute)
+	h.fleet.hour.load(snap.Fleet.Hour)
+	for name, s := range snap.Backends {
+		sh := newSeriesHistory()
+		sh.raw.load(s.Raw)
+		sh.minute.load(s.Minute)
+		sh.hour.load(s.Hour)
+		h.backends[name] = sh
+	}
+	for key, s := range snap.GPUs {
+		sg := newGPUSeries()
+		sg.raw.load(s.Raw)
+		sg.minute.load(s.Minute)
+		sg.hour.load(s.Hour)
+		h.gpus[key] = sg
+	}
+	log.Printf("history: restored %d backend series, %d device series from %s", len(snap.Backends), len(snap.GPUs), path)
+}
+
+// applyFleetAggregates is the single fleet-aggregation implementation shared
+// by the live frame and the history sampler. Engine sums only include
+// status=="ok" backends; a dead engine's retained gauges are not live load.
+func applyFleetAggregates(f *metricsFrame) {
+	t := &f.Totals
+	var ttftW, ttftN float64
+	var hitH, hitQ, hitMean float64
+	var hitN int
+	for _, b := range f.Backends {
+		e := b.Engine
+		if e.Status == "ok" {
+			t.EngineOK++
+			t.EngineRunning += e.Running
+			t.EngineWaiting += e.Waiting
+			t.PrefillTokS += e.PrefillTokS
+			t.PrefillCacheTokS += e.PrefillCacheTokS
+			t.DecodeTokS += e.DecodeTokS
+			if e.KVPct > t.KVPeak {
+				t.KVPeak = e.KVPct
+			}
+			if e.KVUsedTok != nil {
+				t.KVUsedTok += *e.KVUsedTok
+			}
+			if e.KVCapTok != nil {
+				t.KVCapTok += *e.KVCapTok
+			}
+			if e.KVMemGB != nil {
+				t.KVMemGB += *e.KVMemGB
+			}
+			if e.WeightMemGB != nil {
+				t.WeightMemGB += *e.WeightMemGB
+			}
+			if e.HitQueriesTotal != nil && e.HitHitsTotal != nil && *e.HitQueriesTotal > 0 {
+				hitH += float64(*e.HitHitsTotal)
+				hitQ += float64(*e.HitQueriesTotal)
+			} else if e.HitRate > 0 {
+				hitMean += e.HitRate
+				hitN++
+			}
+		}
+		if b.TTFTSampleCount > 0 {
+			ttftW += b.TTFTms * float64(b.TTFTSampleCount)
+			ttftN += float64(b.TTFTSampleCount)
+		}
+	}
+	if ttftN > 0 {
+		t.TTFTMs = ttftW / ttftN
+		t.TTFTSampleCount = int(ttftN)
+	}
+	if hitQ > 0 {
+		t.HitRate = hitH / hitQ
+	} else if hitN > 0 {
+		t.HitRate = hitMean / float64(hitN)
+	}
+}
+
+// ─── Optional device telemetry (DCGM / nvidia_gpu_exporter) ───────────────
+//
+// The engines expose their own execution truth but not device-wide GPU
+// utilization or VRAM. When GPU_METRICS_URL is set, the router scrapes that
+// Prometheus text endpoint and publishes per-device util/memory/temp/power.
+// Units are normalized: util 0..100, memory MiB, temp °C, power W. Devices
+// are identified by UUID when present, else (hostname, gpu) — never by the
+// bare index, which collides on a federated exporter.
+
+type gpuDeviceFrame struct {
+	Key        string   `json:"key"`
+	Index      int      `json:"index"`
+	Name       string   `json:"name"`
+	UtilPct    float64  `json:"utilPct"`
+	MemUsedMB  float64  `json:"memUsedMB"`
+	MemTotalMB float64  `json:"memTotalMB"`
+	TempC      *float64 `json:"tempC"`
+	PowerW     *float64 `json:"powerW"`
+	Source     string   `json:"source"`
+}
+
+type gpuFeedFrame struct {
+	Status    string `json:"status"` // "" = not configured
+	URL       string `json:"url"`
+	LastError string `json:"lastError,omitempty"`
+}
+
+type gpuRegistry struct {
+	mu       sync.Mutex
+	url      string
+	devices  []gpuDeviceFrame
+	status   string
+	lastErr  string
+	offNext  time.Time
+	errNext  time.Time
+	errDelay time.Duration
+	client   *http.Client
+}
+
+var gpuReaders = newGPURegistry()
+
+func newGPURegistry() *gpuRegistry {
+	return &gpuRegistry{
+		status: "",
+		client: &http.Client{Timeout: 2 * time.Second},
+	}
+}
+
+func (g *gpuRegistry) configure(url string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.url = url
+	if url == "" {
+		g.status = ""
+	}
+}
+
+func (g *gpuRegistry) feed() gpuFeedFrame {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return gpuFeedFrame{Status: g.status, URL: g.url, LastError: g.lastErr}
+}
+
+func (g *gpuRegistry) view() []gpuDeviceFrame {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// A failed scrape means the device values are not current; publish none
+	// rather than stale gauges. gpuFeed carries the reason.
+	if g.status != "ok" || len(g.devices) == 0 {
+		return nil
+	}
+	out := make([]gpuDeviceFrame, len(g.devices))
+	copy(out, g.devices)
+	return out
+}
+
+func (g *gpuRegistry) loop() {
+	ticker := time.NewTicker(time.Second)
+	for range ticker.C {
+		g.scrape()
+	}
+}
+
+func (g *gpuRegistry) scrape() {
+	g.mu.Lock()
+	url := g.url
+	if url == "" {
+		g.mu.Unlock()
+		return
+	}
+	now := time.Now()
+	if g.status == "off" && now.Before(g.offNext) {
+		g.mu.Unlock()
+		return
+	}
+	if g.status == "err" && now.Before(g.errNext) {
+		g.mu.Unlock()
+		return
+	}
+	g.mu.Unlock()
+
+	body, httpStatus, err := func() ([]byte, int, error) {
+		resp, err := g.client.Get(url)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, resp.StatusCode, fmt.Errorf("gpu metrics %s", resp.Status)
+		}
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		return b, resp.StatusCode, err
+	}()
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err != nil {
+		g.status = "err"
+		g.lastErr = err.Error()
+		if httpStatus == http.StatusNotFound || httpStatus == http.StatusMethodNotAllowed {
+			g.status = "off"
+			g.lastErr = ""
+			g.offNext = time.Now().Add(engineOffBackoff)
+		} else {
+			if g.errDelay == 0 {
+				g.errDelay = time.Second
+			} else if g.errDelay < engineOffBackoff {
+				g.errDelay *= 2
+			}
+			g.errNext = time.Now().Add(g.errDelay)
+		}
+		return
+	}
+	g.status = "ok"
+	g.lastErr = ""
+	g.errDelay = 0
+	g.errNext = time.Time{}
+	g.devices = parseGPUDevices(parsePromText(body))
+}
+
+// gpuBuilder accumulates one device across the family-specific metric names.
+type gpuBuilder struct {
+	frame    gpuDeviceFrame
+	haveUtil bool
+	haveMem  bool
+	haveTemp bool
+	havePow  bool
+	haveTot  bool
+	haveFree bool
+	freeMB   float64
+}
+
+func parseGPUDevices(samples []promSample) []gpuDeviceFrame {
+	devs := map[string]*gpuBuilder{}
+	order := []string{}
+	get := func(sm promSample) *gpuBuilder {
+		uuid := sm.labels["UUID"]
+		if uuid == "" {
+			uuid = sm.labels["uuid"]
+		}
+		host := sm.labels["Hostname"]
+		if host == "" {
+			host = sm.labels["hostname"]
+		}
+		idx := sm.labels["gpu"]
+		if idx == "" {
+			idx = sm.labels["device"]
+		}
+		key := uuid
+		if key == "" {
+			key = host + "|" + idx
+		}
+		if key == "|" {
+			key = "device"
+		}
+		b, ok := devs[key]
+		if !ok {
+			i := 0
+			fmt.Sscanf(idx, "%d", &i)
+			name := sm.labels["modelName"]
+			if name == "" {
+				name = sm.labels["name"]
+			}
+			if name == "" {
+				name = sm.labels["gpu_name"]
+			}
+			if name == "" {
+				name = fmt.Sprintf("GPU %d", i)
+			}
+			b = &gpuBuilder{frame: gpuDeviceFrame{Key: key, Index: i, Name: name}}
+			devs[key] = b
+			order = append(order, key)
+		}
+		return b
+	}
+	for _, sm := range samples {
+		switch sm.name {
+		case "DCGM_FI_DEV_GPU_UTIL":
+			b := get(sm)
+			b.frame.UtilPct = sm.value
+			b.frame.Source = "dcgm"
+			b.haveUtil = true
+		case "DCGM_FI_DEV_FB_USED":
+			b := get(sm)
+			b.frame.MemUsedMB = sm.value
+			b.frame.Source = "dcgm"
+			b.haveMem = true
+		case "DCGM_FI_DEV_FB_TOTAL":
+			b := get(sm)
+			b.frame.MemTotalMB = sm.value
+			b.haveTot = true
+		case "DCGM_FI_DEV_FB_FREE":
+			b := get(sm)
+			b.freeMB = sm.value
+			b.haveFree = true
+		case "DCGM_FI_DEV_GPU_TEMP":
+			b := get(sm)
+			v := sm.value
+			b.frame.TempC = &v
+			b.haveTemp = true
+		case "DCGM_FI_DEV_POWER_USAGE":
+			b := get(sm)
+			v := sm.value
+			b.frame.PowerW = &v
+			b.havePow = true
+		case "nvidia_smi_utilization_gpu_ratio":
+			b := get(sm)
+			b.frame.UtilPct = sm.value * 100
+			b.frame.Source = "nvidia"
+			b.haveUtil = true
+		case "nvidia_smi_memory_used_bytes":
+			b := get(sm)
+			b.frame.MemUsedMB = sm.value / (1 << 20)
+			b.frame.Source = "nvidia"
+			b.haveMem = true
+		case "nvidia_smi_memory_total_bytes":
+			b := get(sm)
+			b.frame.MemTotalMB = sm.value / (1 << 20)
+			b.haveTot = true
+		case "nvidia_smi_temperature_gpu":
+			b := get(sm)
+			v := sm.value
+			b.frame.TempC = &v
+			b.haveTemp = true
+		case "nvidia_smi_power_draw_watts":
+			b := get(sm)
+			v := sm.value
+			b.frame.PowerW = &v
+			b.havePow = true
+		}
+	}
+	out := make([]gpuDeviceFrame, 0, len(order))
+	for _, k := range order {
+		b := devs[k]
+		if !b.haveUtil && !b.haveMem {
+			continue
+		}
+		if !b.haveTot && b.haveFree {
+			b.frame.MemTotalMB = b.frame.MemUsedMB + b.freeMB
+		}
+		out = append(out, b.frame)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
 // ─── /metrics/stream (SSE) + /metrics/burst ───────────────────────────────
 
 type backendFrame struct {
@@ -2384,6 +3816,7 @@ type backendFrame struct {
 	BytesRate       float64    `json:"bytesRate"`
 	TokEstRate      float64    `json:"tokEstRate"`
 	ReqTotal        int64      `json:"reqTotal"`
+	RejectTotal     int64      `json:"rejectTotal"`
 	BytesInTotal    int64      `json:"bytesInTotal"`
 	BytesOutTotal   int64      `json:"bytesOutTotal"`
 	TokEstTotal     int64      `json:"tokEstTotal"`
@@ -2397,6 +3830,11 @@ type gpuFrame struct {
 	Active  bool `json:"active"`
 }
 
+// totalsFrame is the fleet aggregate. The router-slot fields are the
+// admission view; the engine fields are gated on status=="ok" so a dead
+// engine's retained gauges never count as live fleet load. buildMetricsFrame
+// and the history sampler use the same applyFleetAggregates function, so the
+// live edge and the stored series cannot diverge.
 type totalsFrame struct {
 	InFlight      int32   `json:"inFlight"`
 	Waiting       int32   `json:"waiting"`
@@ -2404,17 +3842,35 @@ type totalsFrame struct {
 	BytesRate     float64 `json:"bytesRate"`
 	TokEstRate    float64 `json:"tokEstRate"`
 	ReqTotal      int64   `json:"reqTotal"`
+	RejectTotal   int64   `json:"rejectTotal"`
 	BytesInTotal  int64   `json:"bytesInTotal"`
 	BytesOutTotal int64   `json:"bytesOutTotal"`
 	TokEstTotal   int64   `json:"tokEstTotal"`
+
+	TTFTMs           float64 `json:"ttftMs"`
+	TTFTSampleCount  int     `json:"ttftSampleCount"`
+	EngineOK         int     `json:"engineOk"`
+	EngineRunning    float64 `json:"engineRunning"`
+	EngineWaiting    float64 `json:"engineWaiting"`
+	PrefillTokS      float64 `json:"prefillTokS"`
+	PrefillCacheTokS float64 `json:"prefillCacheTokS"`
+	DecodeTokS       float64 `json:"decodeTokS"`
+	KVPeak           float64 `json:"kvPeak"`
+	KVUsedTok        float64 `json:"kvUsedTok"`
+	KVCapTok         float64 `json:"kvCapTok"`
+	KVMemGB          float64 `json:"kvMemGB"`
+	WeightMemGB      float64 `json:"weightMemGB"`
+	HitRate          float64 `json:"hitRate"`
 }
 
 type metricsFrame struct {
-	T             int64          `json:"t"`
-	Backends      []backendFrame `json:"backends"`
-	GPU           gpuFrame       `json:"gpu"`
-	Tier0Inflight int32          `json:"tier0Inflight"`
-	Totals        totalsFrame    `json:"totals"`
+	T             int64            `json:"t"`
+	Backends      []backendFrame   `json:"backends"`
+	GPU           gpuFrame         `json:"gpu"`
+	GPUDevices    []gpuDeviceFrame `json:"gpuDevices"`
+	GPUFeed       gpuFeedFrame     `json:"gpuFeed"`
+	Tier0Inflight int32            `json:"tier0Inflight"`
+	Totals        totalsFrame      `json:"totals"`
 }
 
 // buildMetricsFrame assembles one full live snapshot per the live metrics
@@ -2445,6 +3901,7 @@ func buildMetricsFrame() metricsFrame {
 		bf.BytesRate = ms.BytesRate
 		bf.TokEstRate = ms.TokEstRate
 		bf.ReqTotal = ms.ReqTotal
+		bf.RejectTotal = ms.RejectedTotal
 		bf.BytesInTotal = ms.BytesInTotal
 		bf.BytesOutTotal = ms.BytesOutTotal
 		bf.TokEstTotal = ms.TokEstTotal
@@ -2457,10 +3914,14 @@ func buildMetricsFrame() metricsFrame {
 		f.Totals.BytesRate += ms.BytesRate
 		f.Totals.TokEstRate += ms.TokEstRate
 		f.Totals.ReqTotal += ms.ReqTotal
+		f.Totals.RejectTotal += ms.RejectedTotal
 		f.Totals.BytesInTotal += ms.BytesInTotal
 		f.Totals.BytesOutTotal += ms.BytesOutTotal
 		f.Totals.TokEstTotal += ms.TokEstTotal
 	}
+	applyFleetAggregates(&f)
+	f.GPUDevices = gpuReaders.view()
+	f.GPUFeed = gpuReaders.feed()
 
 	// Active means the GPU budget mechanism is engaged: a budget exists AND
 	// tier-0 has in-flight requests. No budget configured → active false.
@@ -2521,6 +3982,7 @@ func handleMetricsStream(w http.ResponseWriter, r *http.Request) {
 
 type burstRequestFrame struct {
 	T            int64   `json:"t"`
+	Start        int64   `json:"start"`
 	Backend      string  `json:"backend"`
 	Path         string  `json:"path"`
 	Status       int     `json:"status"`
@@ -2541,14 +4003,19 @@ func handleBurst(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	if limit > 1000 {
-		limit = 1000
+	if limit > metrics.ringCap {
+		limit = metrics.ringCap
 	}
 	samples := metrics.burst(limit)
 	out := make([]burstRequestFrame, 0, len(samples))
 	for _, s := range samples {
+		startMs := s.Start.UnixMilli()
+		if s.Start.IsZero() {
+			startMs = s.T.Add(-time.Duration(s.DurMs * float64(time.Millisecond))).UnixMilli()
+		}
 		out = append(out, burstRequestFrame{
 			T:            s.T.UnixMilli(),
+			Start:        startMs,
 			Backend:      s.Backend,
 			Path:         s.Path,
 			Status:       s.Status,
@@ -2562,6 +4029,37 @@ func handleBurst(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"requests": out})
+}
+
+// handleHistory serves the server-side time series for one range. Series are
+// dense, grid-aligned arrays (t[i] = from + i*step); a bucket with no
+// samples in the ring is null, never forward-filled.
+func handleHistory(w http.ResponseWriter, r *http.Request) {
+	rangeName := r.URL.Query().Get("range")
+	if rangeName == "" {
+		rangeName = "1h"
+	}
+	if _, ok := historyRanges[rangeName]; !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "unknown range"})
+		return
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, v := range r.URL.Query()["backend"] {
+		for _, n := range strings.Split(v, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" && !seen[n] {
+				seen[n] = true
+				names = append(names, n)
+			}
+		}
+	}
+	resp := history.query(rangeName, names)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleSessions serves the live in-flight request stack plus the
@@ -2645,6 +4143,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			// Model is unknown at this point; attribute to the default backend.
 			metrics.recordRequest(backends[0].Name, requestSample{
 				T:       time.Now(),
+				Start:   reqStart,
 				Backend: backends[0].Name,
 				Path:    r.URL.Path,
 				Status:  http.StatusRequestEntityTooLarge,
@@ -2694,6 +4193,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	sessKey := sessionKeyFor(&parsed)
 	reqContext := requestSample{
 		T:            time.Now(),
+		Start:        reqStart,
 		Backend:      target.Name,
 		Path:         r.URL.Path,
 		NewTokensEst: newTokens,
@@ -2976,7 +4476,9 @@ func (t *respTracker) finish(backend, path string, status int, ttftMs float64, b
 	}
 	metrics.recordRequest(backend, requestSample{
 		T:            time.Now(),
+		Start:        t.reqStart,
 		Backend:      backend,
+		accepted:     true,
 		Path:         path,
 		Status:       status,
 		Stream:       t.stream,

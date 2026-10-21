@@ -165,6 +165,8 @@ BACKENDS='[
 | `MAX_GPU_BUDGET` | `4` | Maximum weighted GPU usage while any Tier 0 (King) backend is active. |
 | `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Larger requests receive HTTP `413` with `X-Router-Reason: body-too-large`. |
 | `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput used to bound how long a non-streaming request holds a large-prefill slot. The slot is released after the estimated prefill duration or the first response byte, whichever comes first. This bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
+| `HISTORY_PATH` | *(empty)* | Optional file for the dashboard's history rings. Atomic snapshots every minute; empty means memory-only (history resets on restart). |
+| `GPU_METRICS_URL` | *(empty)* | Optional Prometheus text endpoint for device GPU utilization/VRAM/temperature/power (DCGM exporter or nvidia_gpu_exporter). Empty disables device telemetry; engine KV/memory gauges remain available. |
 
 ## API
 
@@ -191,84 +193,95 @@ Requests rejected because a queue, GPU budget, or prefill limit is full receive 
 
 ## Dashboard
 
-The router embeds a live operations dashboard (SvelteKit, served at `/` by the
-same binary). One tessellated "fold sheet" shows every backend as a live
-cell: current in-flight vs its limit, queue depth, large-prefill state, EWMA
-duration, streaming time-to-first-byte (TTFT), live request/byte/token rates,
-and the GPU budget gauge while a King is active. Opening a fold gives a 30s /
-60s / 5m trace (5-minute history buffer) with signal switcher — including the
-backend's **own** running/queue/KV-cache/prefill/decode state scraped from its
-Prometheus `/metrics` — plus full readout. A fleet strip shows aggregate
-requests/sec, TTFT, estimated prefill token rate (`est`), and **real decode
-token throughput** (`real`, from the engines); a live request tape streams the
-most recent requests including router rejections (429/413).
+The router embeds an operations dashboard (SvelteKit, served at `/` by the
+same binary). It is built for the live question first: **what is running, how
+hard are the GPUs working, how fast are prefill/decode/TTFT, and how full is
+the KV cache** — then the same signals over the last 5 minutes to 30 days.
 
-The dashboard is served by the same listener as the management endpoints (so
-it inherits the same deployment boundary: put it behind your TLS/auth reverse
-proxy). It reads three endpoints:
+The first viewport is a ruled readings strip (running, waiting, TTFT, prefill,
+decode, KV cache; a device row appears when GPU telemetry is configured), the
+**Fleet Profile** — one elevation lane per backend with its KV level, live
+request bars (prefill/decode), failure ticks, and a survey cursor — and the
+**live session stack** beside it. Below them: backend detail (router slots vs
+engine running/waiting, KV, KV pool, engine memory, TTFT, prefill, decode, hit
+rate), the recent request feed with CSV export, and the history ranges
+(`5m`, `1h`, `6h`, `24h`, `7d`, `30d`). Every figure carries its data class:
+
+| Tag | Meaning |
+| :--- | :--- |
+| `router` | measured by the router: slots, queue, streaming first-byte TTFT, request/byte rates |
+| `engine` | scraped from the backend's Prometheus `/metrics`: running/waiting, KV, prefill/decode tokens, engine TTFT |
+| `device` | scraped from an optional DCGM / nvidia exporter: device utilization, VRAM, temperature, power |
+| `est` | body-based token estimate (~4 bytes/token), never measured decode |
+
+The same listener serves the dashboard and the management endpoints (so it
+inherits the deployment boundary: put it behind your TLS/auth reverse proxy).
+It reads four endpoints:
 
 | Endpoint | Description |
 | :--- | :--- |
-| `GET /metrics/stream` | SSE feed of full live snapshots every `?interval=` (default `500ms`, clamped `200ms`–`10s`). One JSON frame per `data:` line: per-backend slots, EWMA duration, streaming TTFT (EWMA + latest first-byte sample), live arrival rates (30s window), cumulative counters, engine metrics (v2 — see below), GPU budget state, tier-0 in-flight, and fleet totals. |
-| `GET /metrics/burst` | The most recent completed requests (bounded ring, default capacity `500`, `?limit=` up to `1000`), newest last, including router-originated rejections. |
-| `GET /metrics/sessions` | The in-flight request stack plus conversation-grouped sessions (polling endpoint, see below). |
+| `GET /metrics/stream` | SSE feed of full live snapshots every `?interval=` (default `500ms`, clamped `200ms`–`10s`). Per-backend slots, EWMA duration, streaming TTFT (EWMA + latest first-byte), **30s trailing arrival rates**, cumulative counters, engine metrics, GPU budget state, optional `gpuDevices`, and fleet `totals` (including engine-aggregated throughput and KV peak). |
+| `GET /metrics/history` | Server-side time series. `?range=5m\|1h\|6h\|24h\|7d\|30d` (default `1h`), optional repeated `?backend=`. Dense grid-aligned arrays (`t[i] = from + i*stepMs`); a bucket with no samples is `null`, never forward-filled. Includes per-backend series, the fleet aggregate, device series, and router TTFT p50/p95 with the actual sample count and coverage. |
+| `GET /metrics/burst` | The most recent completed requests (bounded ring, capacity `2000`, `?limit=` default `500`), newest last, including router-originated rejections. |
+| `GET /metrics/sessions` | The in-flight request stack plus conversation-grouped sessions (polling endpoint). |
 
 The frontend connects to `/metrics/stream` via `EventSource` and falls back to
-polling `/stats` if the stream is unavailable. Rebuilt on every code change
+polling `/stats` if the stream is unavailable. In `bun run dev` with no router
+reachable, a dev-only synthetic feed is used and the top bar marks it
+`DEV MOCK`; the production build never loads it. Rebuilt on every code change
 with `cd web && bun run build` and embedded with the `webui` build tag (the
 Docker image does this automatically; the plain `go build` ships a 404 stub
 for the dashboard until `web/build` exists).
 
+### History
+
+A single sampler goroutine records one coherent fleet snapshot per second,
+independent of dashboard clients, into three rings per series:
+
+| Ring | Step | Retention |
+| :--- | :--- | :--- |
+| raw | 1s | 1 hour |
+| minute rollup | 1m | 7 days |
+| hour rollup | 1h | 30 days |
+
+Rollups store averages for gauges/rates and maxima for KV/TTFT pressure. Set
+`HISTORY_PATH=/data/history.gob` (on a mounted volume) to keep the rings
+across restarts; writes are atomic snapshots every minute. The file is
+ignored if it is unreadable or from a different version. Without it, history
+is memory-only and resets when the process restarts — the live view is never
+affected.
+
 ### Engine metrics (v2)
 
-Each backend's fold now exposes the backend's **own** execution truth scraped
-from its Prometheus `/metrics` at 1s, as a full v2 `engine` block. Beyond the
-original running / waiting / KV% / prefill / decode / TTFT, the sheet now
-shows:
+Each backend's engine block is the backend's **own** execution truth scraped
+from its Prometheus `/metrics` at 1s. It carries running/waiting, KV pressure,
+prefill (compute and cache-hit separately), decode throughput, interval
+latency means, lifetime counters, finished-reason breakdown (vLLM), pool
+statistics (SGLang), memory, cache hit rate, and the context/SLO caps. Fields
+an engine does not report render as `null` (`—`). The full field table lives
+in `.impeccable/metrics-contract.md`.
 
-- **Requests** — lifetime completed requests (`reqDoneTotal`) with a
-  **finished-reason breakdown** (`finReasons`: stop / length / abort / error /
-  repetition; vLLM), plus streaming vs non-streaming splits and aborted /
-  preempted / retracted counts.
-- **Token totals + rates** — lifetime prompt/generation token totals, real
-  prefill throughput split into **compute-only** (`prefillTokS`) and
-  **cache-hit** (`prefillCacheTokS`) prefill, decode throughput, and retracted
-  input-token rate. Prefix-cache and multimodal-cache hit rates with raw
-  query/hit totals.
-- **Memory pools** — full / SWA / Mamba pool usage % and pool token stats
-  (used / capacity / free / evictable, Mamba used / capacity), host-tier
-  (HiCache) token usage, KV and weight memory (GB). The per-backend KV bar
-  shows total pool pressure: on SGLang it stacks live use (`kvPct`) plus the
-  prefix-cached **held** share (`kvHeldPct`, derived from the engine's
-  evictable/available gauges — cached KV stays held after a request ends);
-  vLLM's `kvPct` already counts cached blocks, so no held split is shown.
-- **Per-stage latency** — prefill / decode / queue / inter-token / end-to-end
-  means (ms), plus the streaming vs non-streaming TTFT split and per-request
-  mean prompt / generation token length.
-- **Capacity** — SLO-constrained running-request cap and context length
-  (SGLang); waiting-by-reason (capacity / deferred) for vLLM.
-
-Engine fields the engine doesn't report render as `null` (the sheet shows
-`—`). The field table lives in `.impeccable/metrics-contract.md`.
-
-Availability / capability flags:
-
-| Condition | Effect |
-| :--- | :--- |
-| **SGLang started without `--enable-metrics`** (default) | `/metrics` returns 404 → engine `status: "off"`, sheet renders `—`. Start SGLang with `--enable-metrics` to populate it. |
-| **vLLM** | Always serves `/metrics`; no flag needed. |
-| **SGLang Mamba pool** (`mambaPct`, `mambaUsedTok`, `mambaCapTok`) | Appears only with a hybrid / Mamba model; `null` otherwise. |
-| **vLLM finished-reason breakdown** (`finReasons`) | Always available — requires no extra flag. |
-| **SGLang HiCache** (`hicacheHostUsedTok` / `hicacheHostCapTok`) | Appears only when host-tier caching is enabled. |
+Failure handling is explicit: a 404/405 endpoint is `off` and re-probed every
+30s; other failures (`401`, `403`, `5xx`, unreachable) are `err` with the HTTP
+status and message, retried with a bounded exponential backoff. On any failed
+scrape the interval means and rates are zeroed (with their sample counts
+cleared) and every counter/histogram baseline is reset, so the first
+successful scrape after an outage is baseline-only rather than a delta across
+the gap. Gauges keep their last known values for backend detail, but the
+dashboard treats a non-`ok` engine as unavailable — `—` in the live cells and
+hatched in the profile — never as current load.
 
 ### Sessions
 
 `GET /metrics/sessions` returns the router's **in-flight request stack**
 (`live`, oldest on top) plus **conversation-grouped sessions** (`sessions`).
-A session is identified by the SHA-1 of the conversation prefix — the raw
-JSON of every message except the last, truncated to 12 hex chars — so the same
-conversation groups together and a new conversation forks at its second turn.
-Non-chat requests (completions with a `prompt`) have no session.
+A session is identified by the SHA-1 of the conversation prefix — each
+message's role and content, length-framed, for every message except the last,
+truncated to 12 hex chars. This makes formatting changes harmless and keeps
+different role partitions distinct; identical prefixes from independent
+clients still share a session (there is no client identity in the request).
+A new conversation forks at its second turn. Non-chat requests have no
+session id but still appear in `live` and the request feed.
 
 Each session shows its request count, first/last activity, active flag,
 in-flight count, the latest request's context/new/cached token estimates,
@@ -277,35 +290,40 @@ recent sessions expand to their last 32 requests. All token figures here are
 **estimates** (body-based, ~4 bytes/token) — see the measurement boundary
 below — never measured decode tokens.
 
-The live stack additionally carries two prefill-progress fields per
-in-flight request: `estPrefillMs` (estimated prefill duration — `newTok`
-at `PREFILL_TOKENS_PER_SEC`, a router estimate, `0` for non-streaming
-requests) and `streamMs` (UnixMilli of the first response body byte, `0`
-while still admitted). The dashboard renders a prefill progress card for
-large cold prefills (estimated `newTok` ≥ 8192): a gold `est` progress bar
-that fills against `estPrefillMs` while the request is still admitted,
-flipping to a muted "streaming" line on first byte.
+The live stack carries two prefill-progress fields per in-flight request:
+`estPrefillMs` (estimated prefill duration — `newTok` at
+`PREFILL_TOKENS_PER_SEC`, a router estimate, `0` for non-streaming requests
+and zero `newTok`) and `streamMs` (UnixMilli of the first response body byte,
+`0` while still admitted). The dashboard shows an amber prefill bar that
+fills against `estPrefillMs` while the request is admitted and flips to the
+measured first-byte age on first byte.
 
 ### Measurement boundary
 
-Two token figures coexist, labeled differently:
-
-- **`est` — estimated prefill tokens.** The router measures requests, bytes,
-  queue/concurrency/GPU state, total-duration EWMA, and streaming first-byte
-  TTFT directly. It does **not** count output tokens: it streams response
-  bytes through without parsing upstream usage. `tokEst*` figures are the
-  router's estimate of **new prefill tokens** from the request body (~4
-  bytes/token, last-message-only for multi-turn). Requests/sec and bytes/sec
-  are measured.
-- **`real` — engine token throughput.** The router scrapes each backend's own
-  Prometheus `/metrics` endpoint at 1s and derives real prompt/prefill and
-  completion/decode token rates from the engine's counters, plus in-engine
-  running/waiting gauges and KV-cache pressure. vLLM serves `/metrics`
-  always; SGLang only when started with `--enable-metrics` — when the endpoint
-  is absent or unreachable the dashboard says `off`/`err` and renders `—`
-  rather than guessing. This is additive truth, not a replacement for the
-  router's admission view.
-
+- **`router` — measured at admission.** Requests, bytes, queue/concurrency/GPU
+  budget state, total-duration EWMA, and streaming first-byte TTFT. `reqRate`,
+  `bytesRate`, and `tokEstRate` are **trailing 30s arrival averages** (300 ×
+  100ms buckets, evaluated every 500ms), not completion deltas; a request
+  contributes from the moment it is admitted and leaves the window after 30s.
+- **`engine` — measured by the engine.** Running/waiting, KV pressure, real
+  prefill/decode token rates, interval latency means, cache hit rate, and
+  pool/memory gauges. `prefillTokS` is **compute-only** for both families;
+  `prefillCacheTokS` is the cache-hit share and `prefillTotalTokS` is their
+  sum. Engine histogram means carry an observation count (`ttftSamples`, ...);
+  zero samples means no data, rendered `—`.
+- **`est` — body-based estimates.** `tokEst*`, session token figures, and
+  `estPrefillMs` are ~4 bytes/token estimates of NEW prefill tokens; they are
+  never presented as measured decode throughput.
+- **`device` — optional and separate.** `GPU_METRICS_URL` points at a
+  Prometheus text endpoint (DCGM exporter or nvidia_gpu_exporter). The router
+  normalizes utilization to 0–100%, memory to MiB, temperature to °C, and
+  power to W, and identifies devices by UUID (or hostname + GPU index). These
+  are device-wide figures and are never attributed to a backend. Without the
+  variable, device panels show an explicit empty state; the router never
+  derives device utilization from engine counters.
+- **GPU budget is not GPU utilization.** `gpuUsed`/`gpuBudget` are the
+  router's weighted admission-budget units. Device utilization comes only
+  from the `device` source.
 
 ## Architecture
 

@@ -135,7 +135,7 @@ Field semantics (A implements, B displays):
 - `prefillInFlight` / `prefillWaiting` / `prefillMax` — live large-prefill slot state; all `0` when the backend has no large-prefill limit.
 - `avgDurationS` / `ewmaMs` — per-backend EWMA of TOTAL request duration (seconds / milliseconds). Same value, two units. Existing behavior.
 - `ttftMs` / `ttftSampleCount` — per-backend EWMA (milliseconds) of **time-to-first-byte**, measured ONLY for streaming requests (first response byte minus request start). `ttftSampleCount` is the number of streaming samples behind the EWMA; `0` means "no streaming samples yet" → client renders "—" not "0". The EWMA updates at first response byte (while the request is still live), not at completion. `ttftMsNow` is the most recent single first-byte sample (ms) — the live readout value, no smoothing; `0` until the first streaming first-byte is seen.
-- `reqRate` / `bytesRate` / `tokEstRate` — per-backend **live arrival rates**, requests/second, admitted request-bytes/second, and **estimated new prefill tokens/second** (see honest-boundary note). Computed server-side from a 30s decaying pending window: every admitted request adds its demand (1 req, its body bytes, its est tokens) to the window the instant it is accepted, the window is divided by the tick interval for the rate, then decays by (interval / 30s) each tick. The rate therefore tracks ARRIVAL, not completion — a long decode contributes its true admission rate from the moment it is accepted, and the tail lingers ~30s after traffic stops instead of spiking to 2×-per-tick and collapsing to zero. Router-originated rejections (429/413) never enter the window — they are not backend demand.
+- `reqRate` / `bytesRate` / `tokEstRate` — per-backend **live arrival rates**, requests/second, admitted request-bytes/second, and **estimated new prefill tokens/second** (see honest-boundary note). Computed server-side as a trailing 30 s arrival average from 300 × 100 ms demand buckets, evaluated every 500 ms: `rate = Σ(window demand) / 30`. Completion never subtracts; a bucket leaves the window at the hard 30 s cutoff. See the 2026-10-21 revision below. The rate therefore tracks ARRIVAL, not completion — a long decode contributes its true admission rate from the moment it is accepted, and the tail lingers ~30s after traffic stops instead of spiking to 2×-per-tick and collapsing to zero. Router-originated rejections (429/413) never enter the window — they are not backend demand.
 - `reqTotal` / `bytesInTotal` / `bytesOutTotal` / `tokEstTotal` — monotonically increasing counters since process start (bytesIn = request body bytes, bytesOut = response body bytes actually written, tokEst = sum of `estimateNewTokens` over accepted requests).
 - `gpu.used` / `gpu.budget` / `gpu.waiting` — live GPU-budget weighted state. `gpu.active` is `true` when `tier0Inflight > 0`. When no GPU budget is configured, `gpu.budget` is `0` and `active` is `false`.
 - `tier0Inflight` — total in-flight across all tier-0 backends.
@@ -194,8 +194,8 @@ On a non-ok scrape (`"off"`/`"err"`): the **rate** and **mean** fields are zeroe
 ## 2. GET /metrics/burst
 
 A single JSON object: the most recent completed requests in a bounded ring
-(server default capacity 500, configurable via `?limit=` up to 1000). Newest
-last. Backs the live request-feed tape.
+(server capacity 2000; `?limit=` default 500, clamped to the ring capacity).
+Newest last. Backs the live request-feed tape.
 
 ```json
 {
@@ -366,3 +366,145 @@ router (default `http://localhost:80`) when one is up; the store prefers
 `/stats` polling. Never ship the mock in the production build (it is a
 `+server.ts` route that the static `adapter-static` build prerservers/omits;
 the production store only ever hits `/metrics/stream` and `/stats`).
+
+---
+
+## Revision 2026-10-21 — historical dashboard rework
+
+This revision is **additive**: no existing field is removed or renamed and no
+existing type changes. Both slices (the Go router and the SvelteKit client)
+build against this revision.
+
+### Rates (semantics corrected)
+
+`reqRate` / `bytesRate` / `tokEstRate` are **trailing 30 s arrival
+averages**, evaluated every 500 ms from 300 × 100 ms demand buckets per
+backend:
+
+```
+rate = Σ(bucket demand for buckets with t in [now−30s, now]) / 30
+```
+
+There is a hard 30 s cutoff (a step drop, no decay tail); completion never
+subtracts from the window. Worked value: 10 requests admitted at t=0 produce
+`reqRate = 0.3333` from the next evaluation until t=30s, then `0`. The old
+`pending*` decay model is removed. `rejectTotal` is added per backend and in
+`totals` (router-originated rejections; `reqTotal` still includes them).
+
+### Burst
+
+The request ring capacity is **2000**. `GET /metrics/burst?limit=` defaults
+to `500`, is clamped to the ring capacity, and returns newest last. Each
+request sample adds `start` (UnixMilli admission) alongside `t` (completion);
+the dashboard draws the interval from `start` to `t`.
+
+### Additive live fields
+
+- `totals.ttftMs`, `totals.ttftSampleCount` — sample-weighted fleet TTFT.
+- `totals.engineOk`, `engineRunning`, `engineWaiting`, `prefillTokS`,
+  `prefillCacheTokS`, `decodeTokS`, `kvPeak`, `kvUsedTok`, `kvCapTok`,
+  `kvMemGB`, `weightMemGB`, `hitRate` — fleet aggregate, gated on
+  `engine.status == "ok"` for every engine field.
+- `engine.prefillTotalTokS` = compute + cache prefill.
+- `engine.httpStatus`, `engine.lastError` — the last scrape's HTTP status and
+  error, preserved across failures.
+- `engine.*Samples` — observation count for each interval mean
+  (`ttftSamples`, `itlSamples`, `e2eSamples`, `queueSamples`,
+  `prefillSamples`, `decodeSamples`, `perTokSamples`, `promptSamples`,
+  `genSamples`, `ttftStreamSamples`, `ttftNonStreamSamples`). The mean stays
+  numeric for compatibility; **0 samples means no data**, rendered `—`.
+- `gpuDevices[]` — optional device telemetry, each
+  `{key,index,name,utilPct,memUsedMB,memTotalMB,tempC,powerW,source}`.
+  Identified by UUID, else `(hostname, gpu)`; utilization 0–100, memory MiB.
+- `gpuFeed` — `{status,url,lastError}` for the device exporter (`""` = not
+  configured, `"ok"`, `"off"` on 404/405, `"err"` otherwise).
+
+### Engine corrections
+
+- `updateHist` clears its `have` flag at the start of every scrape; a
+  vanished histogram or a zero-count interval reports 0 samples, never a
+  stale mean. Histogram state for absent series is dropped.
+- Any failed scrape resets every counter/histogram baseline; the first
+  successful scrape after an outage is baseline-only (rates/means 0). 401 /
+  403 / 5xx / unreachable back off exponentially 1s → 30s; 404/405 keep the
+  30s `off` backoff.
+- vLLM prefill: compute and cache rates come from
+  `prompt_tokens_by_source_total{local_compute|local_cache_hit}` only when
+  the split is complete; otherwise the total counter feeds `prefillTokS`
+  with `prefillCacheTokS = 0`. `prefillTotalTokS` follows the total counter
+  when present.
+- SGLang prefill: `realtime_tokens_total{mode="prefill_compute"}` →
+  `prefillTokS`; `{prefill_cache}` → `prefillCacheTokS`; decode separate.
+  (Previously compute and cache were both added to `prefillTokS`.)
+
+### Sessions
+
+The session key now hashes `len(role):role:len(content):content` for every
+message except the last (length framing avoids concatenation collisions and
+keeps role changes distinct). A single message uses itself; a conversation
+forks at its second turn. The live map is the source of truth for `liveN` in
+the feed; aggregates with a request in flight are never evicted, and `liveN`
+is clamped at zero.
+
+### History endpoint (new)
+
+`GET /metrics/history?range=5m|1h|6h|24h|7d|30d[&backend=name]` (default
+`1h`; `backend` repeatable or comma-separated). Dense grid:
+`t[i] = from + i*stepMs`, bucket timestamp = bucket start, no forward fill;
+a bucket with no samples is `null`.
+
+| range | source ring | step | points |
+| :--- | :--- | :--- | :--- |
+| 5m | raw 1s | 1s | 300 |
+| 1h | raw 1s | 5s | 720 |
+| 6h | minute | 60s | 360 |
+| 24h | minute | 120s | 720 |
+| 7d | minute | 15m | 672 |
+| 30d | hour | 1h | 720 |
+
+Response:
+
+```json
+{
+  "from": 0, "to": 0, "stepMs": 1000, "range": "5m", "now": 0,
+  "backends": [{
+    "name": "primary",
+    "t": [0],
+    "series": {
+      "inFlight": [null], "waiting": [null], "maxConcurrent": [null],
+      "prefillInFlight": [null], "prefillWaiting": [null],
+      "reqRate": [null], "tokEstRate": [null], "ewmaMs": [null],
+      "ttftMs": [null], "ttftMax": [null], "ttftSamples": [null],
+      "engineRunning": [null], "engineWaiting": [null],
+      "prefillTokS": [null], "prefillCacheTokS": [null],
+      "decodeTokS": [null], "kvPct": [null], "kvHeldPct": [null],
+      "kvMax": [null], "kvUsedTok": [null], "kvCapTok": [null],
+      "kvMemGB": [null], "weightMemGB": [null], "hitRate": [null],
+      "engineTTFTMs": [null]
+    }
+  }],
+  "fleet": {"name": "fleet", "t": [0], "series": {}},
+  "gpu": [{"key": "", "index": 0, "name": "", "source": "",
+           "t": [0], "series": {"utilPct": [null], "memUsedMB": [null],
+           "memTotalMB": [null], "tempC": [null], "powerW": [null]}}],
+  "gpuFeed": {"status": "", "url": ""},
+  "ttft": {"n": 0, "coverageMs": 0, "p50": 0, "p95": 0}
+}
+```
+
+`ttft` is computed only from eligible streaming first-byte samples
+(`ttftMs > 0`) in the router's 4096-sample ring; `coverageMs` is the actual
+span of those samples, so the client must not claim a full-five-minute
+percentile when the ring covers less. Rollups store averages for
+gauges/rates and maxima for `kvMax`/`ttftMax`. The history sampler runs once
+per second independent of SSE clients and shares the fleet aggregation with
+the live frame.
+
+### Dev mock
+
+The dev-only routes are `/dev-metrics/stream`, `/dev-metrics/burst`,
+`/dev-metrics/sessions`, and `/dev-metrics/history`; they emit the same
+shapes from `web/src/lib/mock-synth.ts`. The production static build omits
+all `+server.ts` routes; the store only ever hits `/metrics/stream`,
+`/metrics/history`, `/metrics/burst`, `/metrics/sessions`, and `/stats` in
+production.
