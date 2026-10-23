@@ -258,8 +258,16 @@ from its Prometheus `/metrics` at 1s. It carries running/waiting, KV pressure,
 prefill (compute and cache-hit separately), decode throughput, interval
 latency means, lifetime counters, finished-reason breakdown (vLLM), pool
 statistics (SGLang), memory, cache hit rate, and the context/SLO caps. Fields
-an engine does not report render as `null` (`—`). The full field table lives
-in `.impeccable/metrics-contract.md`.
+an engine does not report render as `null` (`—`). vLLM's
+`cache_config_info{kv_cache_size_tokens="..."}` supplies group-aware KV token
+capacity, summed across data-parallel engines; a missing/invalid capacity
+label leaves it unknown. The pool reads used/capacity independently (for
+example `—/992k`), never inferring used tokens from KV percentage or multiplying
+block count by block size for hybrid models. vLLM does not expose the
+SGLang-specific weight/KV memory gauges; device VRAM and utilization require
+`GPU_METRICS_URL`. Prefill rates can legitimately be zero between prompt
+bursts, even while requests decode. The full field table lives in
+`.impeccable/metrics-contract.md`.
 
 Failure handling is explicit: a 404/405 endpoint is `off` and re-probed every
 30s; other failures (`401`, `403`, `5xx`, unreachable) are `err` with the HTTP
@@ -282,6 +290,13 @@ different role partitions distinct; identical prefixes from independent
 clients still share a session (there is no client identity in the request).
 A new conversation forks at its second turn. Non-chat requests have no
 session id but still appear in `live` and the request feed.
+
+Live entries and admission state are finalized even when an upstream stream
+is truncated or a client disconnects. The request history records `502` for
+an aborted proxy copy or `499` for a client-cancelled request (unless an
+explicit failure status was already recorded); an already-started HTTP
+response is not rewritten. A router restart clears live entries leaked by
+older builds; live requests are not restored from persisted history.
 
 Each session shows its request count, first/last activity, active flag,
 in-flight count, the latest request's context/new/cached token estimates,

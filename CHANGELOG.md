@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Bug Fixes
+
+* **metrics:** retire live requests, release prefill slots, and record request outcomes even when a proxy stream aborts or the client disconnects; preserve HTTP abort behavior instead of leaving phantom sessions
+* **dashboard:** read vLLM's group-aware KV token capacity from `cache_config_info`; show unknown usage as `—` independently of known capacity in live and historical pool readings
+
 ### Features
 
 * **dashboard:** replace the fold-sheet UI with the Capacity Survey — readings strip, Fleet Profile (KV ridges, live request bars, survey cursor), live session stack, backend detail, request feed, night/day sheets

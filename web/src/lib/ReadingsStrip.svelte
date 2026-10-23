@@ -66,6 +66,11 @@
     engineOk ? (averages?.decodeTokS ?? totals?.decodeTokS ?? null) : null,
   );
   const kvNow = $derived(engineOk ? (totals?.kvPeak ?? null) : null);
+  const poolUsed = $derived(
+    m?.backends.every((b) => b.engine.status !== "ok" || b.engine.kvUsedTok != null)
+      ? totals?.kvUsedTok
+      : null,
+  );
   const devices = $derived(
     m?.gpuFeed.status === "ok" ? (m.gpuDevices ?? []) : [],
   );
@@ -218,7 +223,7 @@
       </div>
       <div class="sub mono">
         {#if (totals?.kvCapTok ?? 0) > 0}
-          pool {fmtCompact(totals?.kvUsedTok)}/{fmtCompact(totals?.kvCapTok)}
+          pool {fmtCompact(poolUsed)}/{fmtCompact(totals?.kvCapTok)}
         {:else}
           {(totals?.engineOk ?? 0) > 0 ? "peak across engines" : "no engine feed"}
         {/if}

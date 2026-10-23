@@ -978,6 +978,9 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 	var haveFull, haveSWA, haveMamba bool
 	var kvUsed, kvCap, kvFree, kvEvict float64
 	var haveKVUsed, haveKVCap, haveKVFree, haveKVEvict bool
+	var vllmKVCap float64
+	var haveVllmKVCap bool
+	vllmCapacityComplete := true
 	var mambaUsed, mambaAvail, mambaEvict float64
 	var haveMambaUsed, haveMambaAvail, haveMambaEvict bool
 	var hicacheUsed, hicacheCap float64
@@ -1012,6 +1015,16 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 				if sm.value > kvMax {
 					kvMax = sm.value
 					haveKV = true
+				}
+			case "vllm:cache_config_info":
+				// Group-aware capacity is reported per DP engine. Block count
+				// times block size is not equivalent for hybrid models.
+				capacity, err := strconv.ParseFloat(sm.labels["kv_cache_size_tokens"], 64)
+				if err != nil || capacity <= 0 || math.IsNaN(capacity) || math.IsInf(capacity, 0) || sm.value != 1 {
+					vllmCapacityComplete = false
+				} else {
+					vllmKVCap += capacity
+					haveVllmKVCap = true
 				}
 			case "vllm:num_preemptions_total":
 				preempted += int64(sm.value)
@@ -1194,6 +1207,9 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 
 	// Optional gauges: pointer only when the metric appeared this scrape.
 	if vllm {
+		if haveVllmKVCap && vllmCapacityComplete && !math.IsInf(vllmKVCap, 0) {
+			view.KVCapTok = &vllmKVCap
+		}
 		if haveCap {
 			v := waitCap
 			view.WaitCap = &v
@@ -4382,17 +4398,30 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 
+	proxyReturned := false
+	defer func() {
+		// ReverseProxy aborts a failed body copy with ErrAbortHandler.
+		// Finalize admission state during unwinding without swallowing the
+		// panic or trying to replace an already-committed wire response.
+		prefillRelease()
+		durations[target.Name].record(time.Since(start))
+		status := tracker.status
+		if status < 400 {
+			if r.Context().Err() != nil {
+				status = 499 // client closed request; metrics only
+			} else if !proxyReturned {
+				status = http.StatusBadGateway
+			}
+		}
+		var ttftMs float64
+		if parsed.Stream && !tracker.firstByteAt.IsZero() {
+			ttftMs = float64(tracker.firstByteAt.Sub(start) / time.Millisecond)
+		}
+		tracker.finish(target.Name, r.URL.Path, status, ttftMs, tracker.bytesOut)
+	}()
+
 	proxy.ServeHTTP(tracker, r)
-
-	prefillRelease() // fallback: release if no response was ever written
-	durations[target.Name].record(time.Since(start))
-
-	// TTFT is only meaningful for streaming requests (time to first byte).
-	var ttftMs float64
-	if parsed.Stream && !tracker.firstByteAt.IsZero() {
-		ttftMs = float64(tracker.firstByteAt.Sub(start) / time.Millisecond)
-	}
-	tracker.finish(target.Name, r.URL.Path, tracker.status, ttftMs, tracker.bytesOut)
+	proxyReturned = true
 }
 
 type respTracker struct {

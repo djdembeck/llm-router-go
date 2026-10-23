@@ -398,7 +398,7 @@ stale — no new requests are arriving`.
 ### Backend Detail Table
 
 A full-width ruled table: backend + `KING`/`SUBJECT` role, router slots, engine run/wait, KV%,
-KV pool, engine memory (KV + weights in GiB), router TTFT, engine prefill,
+KV pool (used/capacity tokens; each missing side remains `—`), engine memory (KV + weights in GiB), router TTFT, engine prefill,
 engine decode, cache hit. Column heads carry a source dot (moss router, water
 engine). Engine cells are `—` when the engine is not `ok`; the row title
 carries the last error. Sortable headers; the first column is sticky; numeric

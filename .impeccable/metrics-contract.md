@@ -171,7 +171,8 @@ Aggregation: vLLM request gauges/counter sums are SUMmed across data-parallel en
 | `retracted` | number? | gauge | — | sglang | `num_retracted_reqs` | MAX, nil when absent |
 | `retractedTokS` | number? | rate | — | sglang | `num_retracted_input_tokens_total` | SUM Δ/Δt, nil until baselined |
 | `fullPct` / `swaPct` / `mambaPct` | number? | gauge | — | sglang | `full_token_usage` / `swa_token_usage` / `mamba_usage` | MAX × 100; Mamba nil unless hybrid model |
-| `kvUsedTok` / `kvCapTok` / `kvFreeTok` / `kvEvictTok` | number? | gauge | — | sglang | `num_used_tokens` / `max_total_num_tokens` / `kv_available_tokens` / `kv_evictable_tokens` | MAX each |
+| `kvUsedTok` / `kvFreeTok` / `kvEvictTok` | number? | gauge | — | sglang | `num_used_tokens` / `kv_available_tokens` / `kv_evictable_tokens` | MAX each |
+| `kvCapTok` | number? | gauge | vllm | sglang | vllm `cache_config_info` label `kv_cache_size_tokens` / sglang `max_total_num_tokens` | vllm SUM across DP engines, nil if any emitted config has a missing/invalid/nonpositive capacity; sglang MAX. No block-count fallback or derived used-token estimate. |
 | `mambaUsedTok` / `mambaCapTok` | number? | gauge | — | sglang | `mamba_used_tokens` / (used+available+evictable) | MAX each then sum; nil unless hybrid |
 | `hicacheHostUsedTok` / `hicacheHostCapTok` | number? | gauge | — | sglang | `hicache_host_used_tokens` / `hicache_host_total_tokens` | MAX each; nil when absent |
 | `ttftStreamMs` / `ttftNonStreamMs` | number? | mean | — | sglang | `time_to_first_token_seconds` split by `is_streaming` label | per-label hist mean × 1000; nil for vllm |
@@ -216,7 +217,7 @@ Newest last. Backs the live request-feed tape.
 }
 ```
 
-- `status` is the upstream status as proxied (or the 429/413/503/502 the router itself returned — the router's own rejections are recorded too, so the feed shows capacity rejections live).
+- `status` is the upstream status as proxied (or the 429/413/503/502 the router itself returned — the router's own rejections are recorded too, so the feed shows capacity rejections live). An aborted proxy copy records `502`, and a client-cancelled request records `499`, when no explicit failure status was already recorded. These are request-history outcomes only: an already-committed HTTP response is not rewritten.
 - `ttftMs` is `0` for non-streaming and for router-originated rejections.
 - `durMs` for a router-originated 429 is the queue-wait time before rejection.
 
@@ -292,7 +293,10 @@ but is excluded from `sessions`.
 
 **`live[]`** — in-flight requests only, registered at admission (phase
 `"admitted"`), flipping to `"streaming"` on the first response body byte,
-removed on finish. `id` is a process-wide unique counter. Sorted `startMs`
+removed on finish, including client cancellation and proxy-copy aborts.
+Cleanup is deferred so `http.ErrAbortHandler` cannot strand live entries or
+prefill slots; the panic still propagates to the HTTP server.
+`id` is a process-wide unique counter. Sorted `startMs`
 **ascending** (oldest on top — the stack). Feed cap **256** (oldest evicted
 beyond that); internal live map cap **1024** (evict oldest on insert).
 `ctxTok`/`newTok` are router estimates (see honest boundary).

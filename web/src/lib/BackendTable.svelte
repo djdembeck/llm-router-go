@@ -79,7 +79,7 @@
       engine: er == null ? DASH : `${fmtInt(er)}/${fmtInt(ew)}`,
       engineV: er,
       kv,
-      pool: used != null && cap != null ? `${fmtCompact(used)}/${fmtCompact(cap)}` : DASH,
+      pool: used != null || cap != null ? `${fmtCompact(used)}/${fmtCompact(cap)}` : DASH,
       poolV: used,
       mem: kvGB != null || wGB != null ? `${fmtRate((kvGB ?? 0) + (wGB ?? 0))}` : DASH,
       memV: kvGB != null || wGB != null ? (kvGB ?? 0) + (wGB ?? 0) : null,
@@ -107,7 +107,7 @@
       engineV: ok ? b.engine.running : null,
       kv: ok ? b.engine.kvPct : null,
       pool:
-        ok && b.engine.kvUsedTok != null && b.engine.kvCapTok != null
+        ok && (b.engine.kvUsedTok != null || b.engine.kvCapTok != null)
           ? `${fmtCompact(b.engine.kvUsedTok)}/${fmtCompact(b.engine.kvCapTok)}`
           : DASH,
       poolV: ok ? (b.engine.kvUsedTok ?? null) : null,
@@ -205,7 +205,7 @@
             <button class="sort" onclick={() => sortBy("kv")}><i class="hdot engine"></i>KV</button>
           </th>
           <th class="num" aria-sort={sortKey === "pool" ? (dir === 1 ? "ascending" : "descending") : "none"}>
-            <button class="sort" onclick={() => sortBy("pool")}>KV POOL</button>
+            <button class="sort" title="KV tokens used / capacity; — means not reported" onclick={() => sortBy("pool")}>KV POOL</button>
           </th>
           <th class="num" aria-sort={sortKey === "mem" ? (dir === 1 ? "ascending" : "descending") : "none"}>
             <button class="sort" onclick={() => sortBy("mem")}>ENG MEM</button>
