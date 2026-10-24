@@ -3774,7 +3774,11 @@ func parseGPUDevices(samples []promSample) []gpuDeviceFrame {
 			b.havePow = true
 		case "nvidia_smi_utilization_gpu_ratio":
 			b := get(sm)
-			b.frame.UtilPct = sm.value * 100
+			u := sm.value * 100
+			if math.IsInf(u, 0) { // finite input, overflowing scale
+				continue
+			}
+			b.frame.UtilPct = u
 			b.frame.Source = "nvidia"
 			b.haveUtil = true
 		case "nvidia_smi_memory_used_bytes":
@@ -3805,7 +3809,10 @@ func parseGPUDevices(samples []promSample) []gpuDeviceFrame {
 			continue
 		}
 		if !b.haveTot && b.haveFree {
-			b.frame.MemTotalMB = b.frame.MemUsedMB + b.freeMB
+			total := b.frame.MemUsedMB + b.freeMB
+			if !math.IsInf(total, 0) { // keep 0 over a poisoned total
+				b.frame.MemTotalMB = total
+			}
 		}
 		out = append(out, b.frame)
 	}

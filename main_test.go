@@ -2602,6 +2602,40 @@ nvidia_smi_memory_total_bytes{gpu="1",name="A100",uuid="GPU-bbb"} 2147483648
 	}
 }
 
+func TestGPU_ParseDevices_FiniteOverflowGuarded(t *testing.T) {
+	// Finite samples that make derived values non-finite: a ratio that
+	// overflows the *100 scale, and used+free that overflows a derived
+	// total. Neither may reach json.Marshal as Inf/NaN.
+	body := `
+nvidia_smi_utilization_gpu_ratio{gpu="9",name="Over",uuid="GPU-ovf"} 1.7e308
+DCGM_FI_DEV_FB_USED{gpu="8",name="Big",UUID="GPU-big"} 1.7e308
+DCGM_FI_DEV_FB_FREE{gpu="8",name="Big",UUID="GPU-big"} 1.7e308
+DCGM_FI_DEV_GPU_UTIL{gpu="7",name="Ok",UUID="GPU-ok"} 42
+`
+	out := parseGPUDevices(parsePromText([]byte(body)))
+	byKey := map[string]gpuDeviceFrame{}
+	for _, d := range out {
+		byKey[d.Key] = d
+	}
+	if _, ok := byKey["GPU-ovf"]; ok {
+		t.Errorf("overflowing ratio device present: %+v, want dropped", byKey["GPU-ovf"])
+	}
+	b, ok := byKey["GPU-big"]
+	if !ok {
+		t.Fatalf("big-mem device missing: %+v", out)
+	}
+	if math.IsInf(b.MemTotalMB, 0) || math.IsNaN(b.MemTotalMB) {
+		t.Errorf("derived MemTotalMB = %v, want finite 0 (overflow guarded)", b.MemTotalMB)
+	}
+	if b.MemTotalMB != 0 {
+		t.Errorf("MemTotalMB = %v, want 0 (no TOTAL sample, overflowed fallback)", b.MemTotalMB)
+	}
+	k, ok := byKey["GPU-ok"]
+	if !ok || k.UtilPct != 42 {
+		t.Errorf("ok device = %+v, want util 42", k)
+	}
+}
+
 func TestFleetAggregates_GatesNonOKEngines(t *testing.T) {
 	f := metricsFrame{Backends: []backendFrame{
 		{TTFTms: 100, TTFTSampleCount: 10, Engine: engineView{
