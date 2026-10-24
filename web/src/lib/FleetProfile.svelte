@@ -29,6 +29,7 @@
     layerId,
     range,
     selected,
+    singleBackend,
     cursor = $bindable(null),
     requests,
     sessions,
@@ -42,6 +43,7 @@
     layerId: LayerId;
     range: RangeName;
     selected: string | null;
+    singleBackend: string | null;
     cursor: number | null;
     requests: BurstRequest[];
     sessions: SessionsFeed | null;
@@ -53,11 +55,14 @@
   const layer: LayerDef = $derived(layerById(layerId));
   const lanes: Lane[] = $derived.by(() => {
     void framesVersion;
-    return buildLanes(history, frames, layer);
+    return buildLanes(history, frames, layer, singleBackend);
   });
   const scale = $derived(scaleFor(layer, lanes));
+  const singleServerLane = $derived(
+    singleBackend !== null && !layer.device && lanes.length === 1,
+  );
   const selectedLane = $derived(
-    lanes.find((l) => l.key === selected) ?? lanes[0] ?? null,
+    (singleServerLane ? lanes[0] : lanes.find((l) => l.key === selected)) ?? lanes[0] ?? null,
   );
   const summary = $derived.by(() => {
     if (!selectedLane || !history) return { last: null, avg: null, min: null, max: null };
@@ -77,7 +82,7 @@
   let reduced = false;
   let inView = $state(true);
 
-  const padL = $derived(w < 520 ? 122 : 150);
+  const padL = $derived(singleServerLane ? (w < 520 ? 48 : 58) : (w < 520 ? 122 : 150));
   const PAD_R = 14;
   const PAD_T = 20;
   const PAD_B = 26;
@@ -116,6 +121,7 @@
   const readoutLane = $derived(selectedLane ?? lanes[0] ?? null);
   const readoutV = $derived(readoutLane ? valueAt(readoutLane, readoutT) : null);
   const readoutKv = $derived.by(() => {
+    if (singleBackend !== null) return null;
     const kv = lanes.find((l) => l.key === "__fleet");
     if (!kv) return null;
     return valueAt(kv, readoutT);
@@ -155,7 +161,11 @@
     return frames.length > 0;
   });
 
-  const sliderTimes = $derived(history?.fleet.t ?? []);
+  const sliderTimes = $derived(
+    singleServerLane
+      ? (history?.backends.find((b) => b.name === singleBackend)?.t ?? [])
+      : (history?.fleet.t ?? []),
+  );
   const sliderIndex = $derived(
     sliderTimes.length ? nearestIndex(sliderTimes, cursor ?? edge) : 0,
   );
@@ -287,7 +297,7 @@
       const top = y0 + i * laneH;
       const base = top + laneH - 8;
       const laneScale = laneH - 14;
-      const dim = selected && !lane.isFleet && lane.key !== selected;
+      const dim = !singleServerLane && selected && !lane.isFleet && lane.key !== selected;
       const laneInk = dim ? rgba(ink2, 0.45) : ink2;
 
       // baseline + scale rules
@@ -313,22 +323,23 @@
         }
       }
 
-      // label
-      ctx.fillStyle = lane.isFleet ? sand : laneInk;
-      ctx.textAlign = "right";
-      ctx.font = `${lane.isFleet ? "500 " : ""}${laneH > 44 ? "12" : "11"}px ${mono}`;
-      const labelMax = Math.max(5, Math.floor((padL - 54) / 6.6));
-      ctx.fillText(
-        lane.label.length > labelMax
-          ? `${lane.label.slice(0, labelMax - 1)}…`
-          : lane.label,
-        x0 - 46,
-        top + 10,
-      );
-      if (lane.tier != null) {
-        ctx.fillStyle = rgba(sand, dim ? 0.4 : 0.85);
-        ctx.font = `9px ${mono}`;
-        ctx.fillText(`T${lane.tier}`, x0 - 46, top + 24);
+      if (!singleServerLane) {
+        ctx.fillStyle = lane.isFleet ? sand : laneInk;
+        ctx.textAlign = "right";
+        ctx.font = `${lane.isFleet ? "500 " : ""}${laneH > 44 ? "12" : "11"}px ${mono}`;
+        const labelMax = Math.max(5, Math.floor((padL - 54) / 6.6));
+        ctx.fillText(
+          lane.label.length > labelMax
+            ? `${lane.label.slice(0, labelMax - 1)}…`
+            : lane.label,
+          x0 - 46,
+          top + 10,
+        );
+        if (lane.tier != null) {
+          ctx.fillStyle = rgba(sand, dim ? 0.4 : 0.85);
+          ctx.font = `9px ${mono}`;
+          ctx.fillText(`T${lane.tier}`, x0 - 46, top + 24);
+        }
       }
 
       // contiguous segments (nulls break the line; never interpolated)
@@ -630,7 +641,7 @@
 <div class="profile">
   <div class="profile-head">
     <div class="row wrap">
-      <span class="label">FLEET PROFILE</span>
+      <span class="label">{singleBackend !== null ? "SERVER PROFILE" : "FLEET PROFILE"}</span>
       <span class="tag {layer.source}">{layer.source}</span>
       <span class="detail muted">{layer.note}</span>
     </div>
@@ -696,7 +707,7 @@
         <span class="muted">max</span>
         <TweenNumber value={summary.max} format={(v) => fmtLayerValue(layer, v)} />
       {/key}
-      {#if history?.ttft && history.ttft.n > 0}
+      {#if singleBackend === null && history?.ttft && history.ttft.n > 0}
         <span class="sep">/</span>
         <span class="muted">router ttft</span> p50 {fmtLayerValue(layerById("ttft"), history.ttft.p50)}
         p95 {fmtLayerValue(layerById("ttft"), history.ttft.p95)}
@@ -742,7 +753,7 @@
               <th scope="row">
                 {row.lane.isFleet
                   ? "Fleet"
-                  : `${row.lane.label}${row.lane.tier != null
+                  : `${row.lane.label}${singleBackend === null && row.lane.tier != null
                       ? ` — ${row.lane.tier === 0 ? "King" : "Subject"} (T${row.lane.tier})`
                       : ""}`}
               </th>

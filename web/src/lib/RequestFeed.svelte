@@ -8,11 +8,13 @@
     spikeCount,
     spikePeak,
     open = $bindable(false),
+    singleBackend,
   }: {
     requests: BurstRequest[];
     spikeCount: number;
     spikePeak: number;
     open?: boolean;
+    singleBackend: string | null;
   } = $props();
 
   let onlyErrors = $state(false);
@@ -124,32 +126,36 @@
 
   {#if open}
     <div class="scroll" id="request-log">
-      <table class="data-table">
+      <table class="data-table" class:single={singleBackend != null}>
         <thead>
           <tr>
-            <th>TIME</th>
-            <th>BACKEND</th>
-            <th class="path">PATH</th>
-            <th class="num">STATUS</th>
-            <th class="num">TTFT</th>
-            <th class="num">DUR</th>
-            <th class="num">TOK <span class="tag est">est</span></th>
+            <th class="col-time">TIME</th>
+            {#if singleBackend == null}
+              <th class="col-backend">BACKEND</th>
+            {/if}
+            <th class="col-path">PATH</th>
+            <th class="col-status num">STATUS</th>
+            <th class="col-ttft num">TTFT</th>
+            <th class="col-dur num">DUR</th>
+            <th class="col-tok num">TOK <span class="tag est">est</span></th>
           </tr>
         </thead>
         <tbody>
           {#each shown as r (r.t + ":" + r.start + ":" + r.backend + ":" + r.path + ":" + r.status)}
             <tr>
-              <td class="mono">{fmtClock(r.t)}</td>
-              <td class="mono">{r.backend}</td>
-              <td class="path mono" title={r.path}>{r.path}</td>
-              <td class="num {statusClass(r.status)}">{r.status}</td>
-              <td class="num">{r.ttftMs > 0 ? fmtMs(r.ttftMs) : "—"}</td>
-              <td class="num">{fmtMs(r.durMs)}</td>
-              <td class="num">{fmtInt(r.newTokensEst)}</td>
+              <td class="col-time mono">{fmtClock(r.t)}</td>
+              {#if singleBackend == null}
+                <td class="col-backend mono">{r.backend}</td>
+              {/if}
+              <td class="col-path path mono" title={r.path}>{r.path}</td>
+              <td class="col-status num {statusClass(r.status)}">{r.status}</td>
+              <td class="col-ttft num">{r.ttftMs > 0 ? fmtMs(r.ttftMs) : "—"}</td>
+              <td class="col-dur num">{fmtMs(r.durMs)}</td>
+              <td class="col-tok num">{fmtInt(r.newTokensEst)}</td>
             </tr>
           {:else}
             <tr class="empty">
-              <td colspan="7">
+              <td colspan={singleBackend == null ? 7 : 6}>
                 {onlyErrors ? "no 429+ rejections in the recent ring" : "the tape is quiet"}
               </td>
             </tr>
@@ -184,13 +190,15 @@
   .feed .data-table {
     table-layout: fixed;
   }
-  .feed .data-table th:nth-child(1) { width: 12%; }
-  .feed .data-table th:nth-child(2) { width: 13%; }
-  .feed .data-table th:nth-child(3) { width: 30%; }
-  .feed .data-table th:nth-child(4) { width: 8%; }
-  .feed .data-table th:nth-child(5) { width: 10%; }
-  .feed .data-table th:nth-child(6) { width: 10%; }
-  .feed .data-table th:nth-child(7) { width: 9%; }
+  .feed .data-table .col-time { width: 12%; }
+  .feed .data-table .col-backend { width: 13%; }
+  .feed .data-table .col-path { width: 30%; }
+  .feed .data-table .col-status { width: 8%; }
+  .feed .data-table .col-ttft { width: 10%; }
+  .feed .data-table .col-dur { width: 10%; }
+  .feed .data-table .col-tok { width: 9%; }
+  /* The backend column is omitted in single-server mode; PATH absorbs its share. */
+  .feed .data-table.single .col-path { width: 43%; }
   .path {
     max-width: 220px;
     overflow: hidden;
@@ -209,11 +217,6 @@
   .data-table td.err {
     color: var(--verm);
   }
-  @media (max-width: 639px) {
-    .data-table th.path {
-      display: none;
-    }
-  }
   .foot {
     display: flex;
     gap: var(--s3);
@@ -223,7 +226,7 @@
     font-size: 10px;
   }
   @media (max-width: 639px) {
-    .path {
+    .col-path {
       display: none;
     }
     .foot {

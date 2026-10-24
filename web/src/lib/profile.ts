@@ -172,6 +172,7 @@ export function buildLanes(
   history: HistoryResponse | null,
   frames: Frame[],
   layer: LayerDef,
+  singleBackend: string | null,
 ): Lane[] {
   const lanes: Lane[] = [];
   if (layer.device) {
@@ -222,49 +223,48 @@ export function buildLanes(
     return [...devs.values()].sort((a, b) => a.key.localeCompare(b.key));
   }
 
-  // fleet lane first
-  const fleetPts: LanePoint[] = [];
-  if (history) {
-    const arr = history.fleet?.series?.[layer.field as HistoryField] ?? [];
-    for (let i = 0; i < (history.fleet?.t?.length ?? 0); i++) {
-      fleetPts.push({ t: history.fleet.t[i], v: arr[i] ?? null });
-    }
-  }
-  for (const f of frames) {
-    // The history grid's `to` can be newer than its last sample while the
-    // sampler catches up; the live tail must start after the last real point,
-    // not after the grid end.
-    const last = fleetPts.length ? fleetPts[fleetPts.length - 1].t : 0;
-    if (f.t <= last) continue;
-    fleetPts.push({ t: f.t, v: fleetValue(f.totals, layer) });
-  }
-  lanes.push({
-    key: "__fleet",
-    label: "FLEET",
-    tier: null,
-    isFleet: true,
-    isDevice: false,
-    points: fleetPts,
-    current: productFleetCurrent(frames, layer),
-    source: layer.source,
-  });
-
-  const names: string[] = [];
-  const seen = new Set<string>();
-  for (const b of history?.backends ?? []) {
-    names.push(b.name);
-    seen.add(b.name);
-  }
-  for (const f of frames) {
-    for (const b of f.backends) {
-      if (!seen.has(b.name)) {
-        seen.add(b.name);
-        names.push(b.name);
+  if (singleBackend === null) {
+    // Fleet aggregation is unnecessary when the server lane is authoritative.
+    const fleetPts: LanePoint[] = [];
+    if (history) {
+      const arr = history.fleet?.series?.[layer.field as HistoryField] ?? [];
+      for (let i = 0; i < (history.fleet?.t?.length ?? 0); i++) {
+        fleetPts.push({ t: history.fleet.t[i], v: arr[i] ?? null });
       }
     }
+    for (const f of frames) {
+      // Merge after the last real sample, not the history grid's end.
+      const last = fleetPts.length ? fleetPts[fleetPts.length - 1].t : 0;
+      if (f.t <= last) continue;
+      fleetPts.push({ t: f.t, v: fleetValue(f.totals, layer) });
+    }
+    lanes.push({
+      key: "__fleet",
+      label: "FLEET",
+      tier: null,
+      isFleet: true,
+      isDevice: false,
+      points: fleetPts,
+      current: productFleetCurrent(frames, layer),
+      source: layer.source,
+    });
   }
-  if (names.length === 0 && frames.length) {
-    for (const b of frames[frames.length - 1].backends) names.push(b.name);
+
+  const names: string[] = singleBackend === null ? [] : [singleBackend];
+  if (singleBackend === null) {
+    const seen = new Set<string>();
+    for (const b of history?.backends ?? []) {
+      names.push(b.name);
+      seen.add(b.name);
+    }
+    for (const f of frames) {
+      for (const b of f.backends) {
+        if (!seen.has(b.name)) {
+          seen.add(b.name);
+          names.push(b.name);
+        }
+      }
+    }
   }
 
   for (const name of names) {

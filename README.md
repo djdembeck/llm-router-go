@@ -205,7 +205,18 @@ request bars (prefill/decode), failure ticks, and a survey cursor — and the
 **live session stack** beside it. Below them: backend detail (router slots vs
 engine running/waiting, KV, KV pool, engine memory, TTFT, prefill, decode, hit
 rate), the recent request feed with CSV export, and the history ranges
-(`5m`, `1h`, `6h`, `24h`, `7d`, `30d`). Every figure carries its data class:
+(`5m`, `1h`, `6h`, `24h`, `7d`, `30d`). With exactly one configured backend,
+the dashboard automatically becomes a **server survey**: no fleet rail or
+duplicate aggregate lane, one server identity, a wider profile, compact
+server details, and no repeated backend column in the request log. Device
+telemetry stays device-wide, including every reported GPU. Two or more
+backends retain the fleet navigation and comparison tables. Pause, stale
+feeds, and engine scrape failures do not change the layout mode. Five-minute
+deltas use that server's own history, not a retained fleet aggregate; an
+unknown reference stays `—`. If the feed falls back to `/stats`, engine and
+GPU telemetry are labelled unavailable, not disabled or unconfigured.
+
+Every figure carries its data class:
 
 | Tag | Meaning |
 | :--- | :--- |

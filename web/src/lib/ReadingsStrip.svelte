@@ -20,6 +20,7 @@
     history,
     layerId,
     onLayer,
+    singleBackend,
   }: {
     frame: Frame | null;
     metricFrame?: Frame | null;
@@ -27,12 +28,20 @@
     history: HistoryResponse | null;
     layerId: LayerId;
     onLayer: (id: LayerId) => void;
+    singleBackend: string | null;
   } = $props();
 
+  const single = $derived(singleBackend != null);
+  const deltaHistory = $derived(
+    singleBackend === null
+      ? history?.fleet
+      : history?.backends.find((b) => b.name === singleBackend),
+  );
+
   function prevValue(field: HistoryField): number | null {
-    if (!history) return null;
-    const t = history.fleet?.t ?? [];
-    const arr = history.fleet?.series?.[field] ?? [];
+    if (!history || !deltaHistory) return null;
+    const t = deltaHistory.t;
+    const arr = deltaHistory.series[field] ?? [];
     if (!t.length) return null;
     const target = history.now - 300_000;
     let i = nearestIndex(t, target);
@@ -102,7 +111,7 @@
 </script>
 
 {#if frame}
-  <div class="readings" role="group" aria-label="fleet readings">
+  <div class="readings" role="group" aria-label={single ? "server readings" : "fleet readings"}>
     <div class="cell static">
       <div class="top"><span class="label">RUNNING</span><span class="tag router">router</span></div>
       <div class="val">
@@ -189,7 +198,9 @@
       class:on={layerId === "decode"}
       aria-pressed={layerId === "decode"}
       onclick={() => onLayer("decode")}
-      title="Measured generation tokens/s from the engines."
+      title={single
+        ? "Measured generation tokens/s from this server's engine."
+        : "Measured generation tokens/s from the engines."}
     >
       <div class="top">
         <span class="label">DECODE</span>
@@ -200,7 +211,11 @@
         <span class="unit">tok/s</span>
       </div>
       <div class="sub mono">
-        {(totals?.engineOk ?? 0) > 0 ? `${totals?.engineOk} engines` : "no engine feed"}
+        {(totals?.engineOk ?? 0) > 0
+          ? single
+            ? "engine feed"
+            : `${totals?.engineOk} engines`
+          : "no engine feed"}
         <span class="delta {decodeDelta.dir > 0 ? 'good' : decodeDelta.dir < 0 ? 'bad' : ''}">
           5m {decodeDelta.text}
         </span>
@@ -212,7 +227,9 @@
       class:on={layerId === "kv"}
       aria-pressed={layerId === "kv"}
       onclick={() => onLayer("kv")}
-      title="Hottest KV cache pool across the engines; 90%+ is hot, 75–89% warm. Click for the history profile."
+      title={single
+        ? "KV cache pool for this server; 90%+ is hot, 75–89% warm. Click for the history profile."
+        : "Hottest KV cache pool across the engines; 90%+ is hot, 75–89% warm. Click for the history profile."}
     >
       <div class="top">
         <span class="label">KV CACHE</span>
@@ -225,7 +242,11 @@
         {#if (totals?.kvCapTok ?? 0) > 0}
           pool {fmtCompact(poolUsed)}/{fmtCompact(totals?.kvCapTok)}
         {:else}
-          {(totals?.engineOk ?? 0) > 0 ? "peak across engines" : "no engine feed"}
+          {(totals?.engineOk ?? 0) > 0
+            ? single
+              ? "pool capacity not reported"
+              : "peak across engines"
+            : "no engine feed"}
         {/if}
         <span class="delta {kvDelta.dir > 0 ? 'bad' : kvDelta.dir < 0 ? 'good' : ''}">
           5m {kvDelta.text}

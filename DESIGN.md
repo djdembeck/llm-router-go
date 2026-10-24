@@ -234,10 +234,25 @@ face, or an italic would pull the sheet back toward the editorial cliché.
 
 ## Layout
 
-A centered 1760px frame; the top bar spans it, the body is a 232px fleet rail
-plus a fluid main column. Main order: ruled readings strip → live band
-(Fleet Profile 1fr + live sessions 400px) → backend detail sheet → request
-feed sheet. The page has 12px gaps between sheets and 12–20px inline padding.
+A centered 1760px frame; the top bar spans it. In fleet mode, the body is a
+232px fleet rail plus a fluid main column. Main order: ruled readings strip
+→ live band (Fleet Profile 1fr + live sessions 400px) → backend detail sheet
+→ request feed sheet. The page has 12px gaps between sheets and 12–20px
+inline padding.
+
+Exactly one backend in the latest frame selects server mode, independently
+of engine scrape health. The fleet rail disappears; a compact identity row
+names the server, engine scrape status, request-slot limit, and GPU feed
+status. The main column uses the full frame. Server Profile has only that
+server's history lane, no duplicate fleet aggregate or tier label, and a
+58px axis gutter (48px below 520px). Device layers retain every device lane
+and their labels; devices are never assigned to the server. Server Detail
+is a noninteractive nine-field definition list in three columns (two below
+640px), with all fields retained on phones. It stays above the collapsed
+request log even on wide screens. The log omits its redundant backend
+column, but CSV retains the complete schema. Live rows use request numbers
+rather than repeating the server name. A missing initial frame does not
+assume server mode; pause and stale feeds retain the last known mode.
 
 The readings strip is six equal cells separated by 1px rules at ≥1200px,
 3×2 at 960–1199, and 2×3 below 640. The device readings form a second three-
@@ -248,15 +263,16 @@ along the bottom.
 The profile is a canvas at least 320px tall (280px at 640–959, 240px below
 640); it grows to fill the live-band row when the 560px session stack makes
 the sheet taller, so the signature chart never leaves dead paper inside its
-frame. Its left gutter is 150px (122px below 520px): a 46px lane-label
+frame. Its fleet/device left gutter is 150px (122px below 520px): a 46px lane-label
 column, a 38px scale column, then the plot. The time axis carries 3–6 labels; the lane
 baselines are 1px rules; the scale labels are 10px mono.
 
-The live sessions panel is 400px wide beside the profile at ≥1280px; below
-that it stacks beneath the profile, above the detail sheets. It keeps 6–8
+The live sessions panel is 400px wide beside the profile at ≥1280px. Fleet
+mode stacks it below that width; server mode keeps it beside the profile
+at 1024–1279px with a 360px panel, then stacks below 1024px. It keeps 6–8
 rows visible and scrolls.
 
-The backend detail and request feed are stacked below 1600px; at ≥1600px
+In fleet mode, backend detail and request feed are stacked below 1600px; at ≥1600px
 they sit side by side (1.4fr / 1fr). Tables use
 fixed column widths on desktop and drop the secondary columns below 640px
 (KV pool, engine memory, decode, hit rate) while the request feed drops the

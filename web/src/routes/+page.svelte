@@ -99,6 +99,25 @@
     if (kind) lastFeedKind = kind;
   });
 
+  const singleBackend = $derived(
+    live.frame?.backends.length === 1 ? live.frame.backends[0] : null,
+  );
+  const singleBackendName = $derived(singleBackend?.name ?? null);
+  const statsFallback = $derived(live.feed?.kind === "stats");
+  const fleetMode = $derived((live.frame?.backends.length ?? 0) > 1);
+  const displayMetricFrame = $derived(
+    metricFrame && live.frame &&
+    metricFrame.backends.length === live.frame.backends.length &&
+    metricFrame.backends.every((b, i) => b.name === live.frame?.backends[i]?.name)
+      ? metricFrame
+      : live.frame,
+  );
+  $effect(() => {
+    if (singleBackend || (selected && !live.frame?.backends.some((b) => b.name === selected))) {
+      selected = null;
+    }
+  });
+
   const showStale = $derived(live.stale && !!live.frame);
   const feedName = $derived(
     live.feed
@@ -130,14 +149,14 @@
 </script>
 
 <svelte:head>
-  <title>llm-router-go — fleet survey</title>
+  <title>{singleBackend ? `${singleBackend.name} — server survey` : "llm-router-go — fleet survey"}</title>
   <meta
     name="description"
     content="Live GPU-aware inference routing: sessions, GPU and KV pressure, prefill and decode throughput, TTFT, and history."
   />
 </svelte:head>
 
-<h1 class="sr-only">llm-router-go fleet survey</h1>
+<h1 class="sr-only">{singleBackend ? `${singleBackend.name} server survey` : "llm-router-go fleet survey"}</h1>
 
 <div class="app">
   <TopBar
@@ -161,31 +180,71 @@
     <div class="notice" role="status">{historyError}</div>
   {/if}
 
-  <div class="body">
-    <FleetRail
-      frame={live.frame}
-      metricFrame={metricFrame}
-      history={history.data}
-      {selected}
-      onSelect={(name) => (selected = name)}
-      feed={live.feed}
-      lastFrameAt={live.lastFrameAt}
-      {now}
-    />
+  <div class="body" class:fleet={fleetMode} class:single={singleBackend != null}>
+    {#if fleetMode}
+      <FleetRail
+        frame={live.frame}
+        metricFrame={displayMetricFrame}
+        history={history.data}
+        {selected}
+        onSelect={(name) => (selected = name)}
+        feed={live.feed}
+        lastFrameAt={live.lastFrameAt}
+        {now}
+      />
+    {/if}
 
     <main class="main">
+      {#if singleBackend}
+        <section class="server-context" aria-label="server">
+          <div class="server-identity">
+            <h2 class="server-name mono">{singleBackend.name}</h2>
+            <span
+              class="server-engine detail mono"
+              class:err={singleBackend.engine.status === "err"}
+              title={statsFallback ? "Engine telemetry is unavailable through /stats" : singleBackend.engine.lastError || "Engine Prometheus /metrics scrape"}
+            >
+              <span class="dot" class:ok={singleBackend.engine.status === "ok"} aria-hidden="true"></span>
+              {singleBackend.engine.engine || "engine"} · metrics {statsFallback ? "unavailable" : singleBackend.engine.status === "err" ? "error" : singleBackend.engine.status}
+            </span>
+          </div>
+          <div class="server-context-meta detail mono muted">
+            <span>{singleBackend.maxConcurrent || "unlimited"} request slots</span>
+            <span
+              class:err={live.frame?.gpuFeed.status === "err"}
+              title={statsFallback ? "Device telemetry is unavailable through /stats" : live.frame?.gpuFeed.lastError || "Device telemetry from GPU_METRICS_URL"}
+            >
+              {#if statsFallback}
+                GPU telemetry unavailable
+              {:else if live.frame?.gpuFeed.status === "ok"}
+                {live.frame.gpuDevices?.length ?? 0} GPU devices
+              {:else if live.frame?.gpuFeed.status === "err"}
+                GPU exporter error
+              {:else if live.frame?.gpuFeed.status === "off"}
+                GPU exporter unavailable
+              {:else}
+                GPU metrics not configured
+              {/if}
+            </span>
+          </div>
+        </section>
+      {:else if live.frame?.backends.length === 0}
+        <div class="notice">no backends configured</div>
+      {/if}
       <ReadingsStrip
+        singleBackend={singleBackendName}
         frame={live.frame}
-        metricFrame={metricFrame}
-        averages={metricAverages}
+        metricFrame={displayMetricFrame}
+        averages={displayMetricFrame === metricFrame ? metricAverages : null}
         history={history.data}
         {layerId}
         onLayer={(id) => (layerId = id)}
       />
 
       <div class="live-band">
-        <section class="profile-sheet sheet" aria-label="fleet profile">
+        <section class="profile-sheet sheet" aria-label={singleBackend ? "server profile" : "fleet profile"}>
           <FleetProfile
+            singleBackend={singleBackendName}
             history={history.data}
             frames={live.liveFrames}
             framesVersion={live.framesVersion}
@@ -202,6 +261,7 @@
         </section>
 
         <LiveSessions
+          singleBackend={singleBackendName}
           feed={live.sessions}
           now={live.paused || live.stale ? (live.lastFrameAt ?? now) : now}
           paused={live.paused}
@@ -212,7 +272,8 @@
 
       <div class="lower">
         <BackendTable
-          frame={metricFrame ?? live.frame}
+          singleBackend={singleBackendName}
+          frame={displayMetricFrame}
           history={history.data}
           {cursor}
           {selected}
@@ -221,6 +282,7 @@
           lastFrameAt={live.lastFrameAt}
         />
         <RequestFeed
+          singleBackend={singleBackendName}
           bind:open={requestLogOpen}
           requests={live.requests}
           spikeCount={live.spikeCount}
@@ -241,8 +303,60 @@
   }
   .body {
     display: grid;
-    grid-template-columns: 232px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
+  }
+  .body.fleet {
+    grid-template-columns: 232px minmax(0, 1fr);
+  }
+  .server-context {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--s2) var(--s5);
+    padding: var(--s3) var(--s4);
+    border-bottom: 1px solid var(--rule);
+    background: var(--panel);
+  }
+  .server-identity,
+  .server-context-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    min-width: 0;
+    gap: var(--s2) var(--s4);
+  }
+  .server-name {
+    margin: 0;
+    font-size: var(--fs-title);
+    font-weight: 500;
+    line-height: 20px;
+    overflow-wrap: anywhere;
+  }
+  .server-engine {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--s2);
+    color: var(--ink-3);
+  }
+  .server-engine .dot {
+    width: 5px;
+    height: 5px;
+    flex: 0 0 auto;
+    background: var(--ink-3);
+  }
+  .server-engine .dot.ok {
+    background: var(--moss);
+  }
+  .server-engine.err {
+    color: var(--verm);
+  }
+  .server-engine.err .dot {
+    background: var(--verm);
+  }
+  .body.single .lower {
+    grid-template-columns: minmax(0, 1fr);
   }
   .main {
     display: flex;
@@ -289,8 +403,13 @@
       grid-template-columns: minmax(0, 1fr);
     }
   }
+  @media (min-width: 1024px) and (max-width: 1279px) {
+    .body.single .live-band {
+      grid-template-columns: minmax(0, 1fr) 360px;
+    }
+  }
   @media (max-width: 959px) {
-    .body {
+    .body.fleet {
       grid-template-columns: minmax(0, 1fr);
     }
     .main {

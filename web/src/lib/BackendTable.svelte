@@ -4,6 +4,7 @@
   import { nearestIndex } from "./format";
 
   let {
+    singleBackend,
     frame,
     history,
     cursor,
@@ -12,6 +13,7 @@
     stale,
     lastFrameAt,
   }: {
+    singleBackend: string | null;
     frame: Frame | null;
     history: HistoryResponse | null;
     cursor: number | null;
@@ -129,13 +131,17 @@
     const out: Row[] = [];
     if (cursor != null && history) {
       for (const hs of history.backends) {
+        if (singleBackend && hs.name !== singleBackend) continue;
         const i = nearestIndex(hs.t, cursor);
         if (i < 0) continue;
         out.push(histRow(hs.name, hs, i));
       }
     } else if (frame) {
-      for (const b of frame.backends) out.push(frameRow(b));
+      for (const b of frame.backends) {
+        if (!singleBackend || b.name === singleBackend) out.push(frameRow(b));
+      }
     }
+    if (singleBackend) return out;
     const keyMap: Record<SortKey, keyof Row> = {
       name: "name",
       slots: "slotsV",
@@ -171,10 +177,10 @@
   }
 </script>
 
-<section class="backend-table sheet" aria-label="backend detail">
+<section class="backend-table sheet" aria-label={singleBackend ? "server detail" : "backend detail"}>
   <div class="sheet-head">
     <div class="row wrap">
-      <span class="label">BACKEND DETAIL</span>
+      <span class="label">{singleBackend ? "SERVER DETAIL" : "BACKEND DETAIL"}</span>
       <span class="tag router">router</span>
       <span class="tag engine">engine</span>
       <span class="detail muted">
@@ -185,9 +191,29 @@
             : "current"}
       </span>
     </div>
-    <span class="detail muted hint">click a row to focus its lane</span>
+    {#if !singleBackend}
+      <span class="detail muted hint">click a row to focus its lane</span>
+    {/if}
   </div>
 
+  {#if singleBackend}
+    {#if rows[0]}
+      {@const r = rows[0]}
+      <dl class="server-readings">
+        <div><dt class="label"><i class="hdot router"></i>SLOTS</dt><dd class="mono">{r.slots}</dd></div>
+        <div><dt class="label"><i class="hdot engine"></i>ENGINE RUN/WAIT</dt><dd class="mono">{r.engine}</dd></div>
+        <div><dt class="label"><i class="hdot engine"></i>KV CACHE</dt><dd class="mono" class:hot={(r.kv ?? 0) >= 90} class:warm={(r.kv ?? 0) >= 75 && (r.kv ?? 0) < 90}>{r.kv == null ? DASH : fmtPct(r.kv)}</dd></div>
+        <div><dt class="label"><i class="hdot engine"></i>KV TOKENS USED / CAP</dt><dd class="mono">{r.pool}</dd></div>
+        <div><dt class="label"><i class="hdot engine"></i>ENGINE MEMORY</dt><dd class="mono">{r.mem}{r.mem !== DASH ? " GiB" : ""}</dd></div>
+        <div><dt class="label"><i class="hdot engine"></i>CACHE HIT</dt><dd class="mono">{r.hit == null ? DASH : fmtPct(r.hit)}</dd></div>
+        <div><dt class="label"><i class="hdot router"></i>TTFT</dt><dd class="mono">{r.ttft == null ? DASH : fmtMs(r.ttft)}</dd></div>
+        <div><dt class="label"><i class="hdot engine"></i>PREFILL</dt><dd class="mono">{r.prefill == null ? DASH : `${fmtInt(r.prefill)} tok/s`}</dd></div>
+        <div><dt class="label"><i class="hdot engine"></i>DECODE</dt><dd class="mono">{r.decode == null ? DASH : `${fmtInt(r.decode)} tok/s`}</dd></div>
+      </dl>
+    {:else}
+      <div class="server-empty detail muted">no server data at this time</div>
+    {/if}
+  {:else}
   <div class="scroll">
     <table class="data-table">
       <thead>
@@ -263,6 +289,7 @@
       </tbody>
     </table>
   </div>
+  {/if}
   <div class="foot detail muted">
     <span>SLOTS · TTFT are router-measured</span>
     <span>RUN/WAIT · KV · PREFILL · DECODE · HIT are engine-measured</span>
@@ -275,6 +302,40 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
+  }
+  .server-readings {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    column-gap: var(--s6);
+    margin: 0;
+    padding: var(--s1) var(--s3);
+  }
+  .server-readings > div {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    min-width: 0;
+    gap: var(--s2);
+    padding: var(--s2) 0;
+  }
+  .server-readings dt {
+    color: var(--ink-3);
+    letter-spacing: 0.08em;
+  }
+  .server-readings dd {
+    margin: 0;
+    white-space: nowrap;
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+  }
+  .server-readings dd.hot {
+    color: var(--verm);
+  }
+  .server-readings dd.warm {
+    color: var(--amber);
+  }
+  .server-empty {
+    padding: var(--s3);
   }
   .scroll {
     overflow-x: auto;
@@ -398,6 +459,15 @@
     font-size: 10px;
   }
   @media (max-width: 639px) {
+    .server-readings {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: var(--s3);
+    }
+    .server-readings > div {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: var(--s1);
+    }
     .foot,
     .hint {
       display: none;

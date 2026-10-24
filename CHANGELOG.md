@@ -9,6 +9,7 @@
 
 ### Features
 
+* **dashboard:** automatically focus a one-backend deployment on its server: remove the fleet rail and duplicate aggregate chart lane, reclaim chart width, show compact server details, and omit repeated backend names; preserve fleet comparisons for multi-backend deployments and device-wide GPU telemetry in both modes
 * **dashboard:** replace the fold-sheet UI with the Capacity Survey — readings strip, Fleet Profile (KV ridges, live request bars, survey cursor), live session stack, backend detail, request feed, night/day sheets
 * **dashboard:** smooth the sheet — TTFT/prefill/decode read a 15s mean refreshed every 5s and tween over 1.6s, the KV gauge holds 5s, a continuously gliding live edge, FLIP session rows with no entrance flashes, a stable request table, eased controls, and a night/day cross-fade; reduced-motion paths snap values and zero JS row durations
 * **dashboard:** live rows lead with measured TTFT; estimated context, KV reuse, and new-token load are smaller, muted, and `~`-prefixed, with a prefill/queue note; path, session id, and age recede. The request log is collapsed by default, persisted, and keeps its spike/429 counts in the header; the live stack grows into the released height while it is collapsed

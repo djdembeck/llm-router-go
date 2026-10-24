@@ -11,15 +11,18 @@
     paused,
     stale,
     tall = false,
+    singleBackend,
   }: {
     feed: SessionsFeed | null;
     now: number;
     paused: boolean;
     stale: boolean;
     tall?: boolean;
+    singleBackend: string | null;
   } = $props();
 
   const live = $derived(feed?.live ?? []);
+  const single = $derived(singleBackend != null);
   const flipDur = calmMotion ? 0 : 220;
 </script>
 
@@ -42,14 +45,15 @@
       {@const hit = l.ctxTok > 0 ? (cachedTok / l.ctxTok) * 100 : null}
       {@const prefillRatio = l.estPrefillMs > 0 ? age / l.estPrefillMs : null}
       {@const pct = l.phase === "streaming" ? 100 : Math.min(100, (prefillRatio ?? 0) * 100)}
+      {@const rowTitle = `${single ? `${l.backend} · ` : ""}${l.path}${l.sess ? ` · ${l.sess.slice(0, 12)}` : ""}`}
       <div
         class="req"
         role="listitem"
         animate:flip={{ duration: flipDur, easing: cubicOut }}
-        title={`${l.path}${l.sess ? ` · ${l.sess.slice(0, 12)}` : ""}`}
+        title={rowTitle}
       >
         <div class="req-top">
-          <span class="backend mono">{l.backend}</span>
+          <span class="req-name mono">{single ? `REQUEST #${l.id}` : l.backend}</span>
           <span class="phase {l.phase}">
             <span class="dot"></span>{l.phase === "streaming" ? "stream" : "queued"}
           </span>
@@ -63,7 +67,7 @@
           </span>
           <span
             class="metric"
-            title="Estimated cache reuse: (ctx − new) ÷ ctx from router token estimates. The engine's measured cache-hit rate is in Backend Detail."
+            title={`Estimated cache reuse: (ctx − new) ÷ ctx from router token estimates. The engine's measured cache-hit rate is in ${single ? "Server" : "Backend"} Detail.`}
           >
             <span class="k">KV HIT</span>
             <span class="v" class:hit-low={hit != null && hit < 40}>
@@ -193,7 +197,7 @@
     gap: 6px;
     min-width: 0;
   }
-  .backend {
+  .req-name {
     font-size: 10px;
     font-weight: 400;
     color: var(--ink-2);

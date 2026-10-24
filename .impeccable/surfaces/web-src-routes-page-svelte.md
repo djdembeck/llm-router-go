@@ -17,7 +17,7 @@ OWN-WORLD: Night survey sheet — ground #10130e/#151910, sand #b9a684, chalk #e
 
 STORY: At a glance the operator sees where pressure is building, which lane is saturated, which requests are still prefilling, and how the last month looked; then scrubs any instant and reads exact values without losing the live edge.
 
-FIRST VIEWPORT: Top bar (mark, health, clock, range, pause, theme); 232 px fleet rail (readings + backend rows with KV level bars); ruled readings strip (Running, Waiting, TTFT, Prefill, Decode, KV — each selects the profile layer); two-column live band — Fleet Profile (left, ~340 px) and Live Sessions stack (right, 400 px, 6–8 rows). Live sessions visible without scrolling. Below: backend detail and request feed.
+FIRST VIEWPORT: Top bar (mark, health, clock, range, pause, theme); 232 px fleet rail (readings + backend rows with KV level bars); ruled readings strip (Running, Waiting, TTFT, Prefill, Decode, KV — each selects the profile layer); two-column live band — Fleet Profile (left, ~340 px) and Live Sessions stack (right, 400 px, 6–8 rows). Live sessions visible without scrolling. Below: backend detail and request feed. With exactly one configured backend, replace the rail with a compact server identity/status row, use the full width for Server Profile and sessions, omit the duplicate aggregate lane, and replace the comparison table with compact Server Detail. Keep all device lanes, history ranges, and source boundaries; the request log omits repeated backend names but CSV retains them. Mode follows configured count, not healthy-engine count; pause and stale feeds preserve it.
 
 FORM: Standard web ops shell; the world enters only through type, palette, density, and the Fleet Profile. seed:fa1d89619c16ec0d
 
