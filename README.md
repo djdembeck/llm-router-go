@@ -50,7 +50,7 @@ Each object in the `BACKENDS` array supports:
 - `blockOnTier0` (int): Request block threshold when King backends are saturated. `0` to disable.
 - `maxQueueDepth` (int): Max pending requests. Defaults to `2`.
 - `maxConcurrentLargePrefill` (int): Max concurrent large prefill requests. `0` to disable.
-- `largePrefillThresholdTokens` (int): Token count to trigger large prefill logic. Defaults to `8192`.
+- `largePrefillThresholdTokens` (int): Estimated prompt-token count to trigger large prefill logic. Defaults to `8192`. The estimate covers the whole conversation because the router cannot verify that a request's prefix is cached.
 
 ## Endpoints
 
@@ -74,7 +74,7 @@ The router tracks weighted GPU usage. When a Tier 0 backend is active, the route
 Each backend maintains its own request queue. Requests are routed using an Exponentially Weighted Moving Average (EWMA) of request durations to minimize latency and avoid "herd" behavior.
 
 ### Large Prefill Detection
-To prevent "head-of-line" blocking caused by massive prompt prefills, the router tracks prefill sizes and limits the number of concurrent large prefill operations per backend.
+To prevent "head-of-line" blocking caused by massive prompt prefills, the router tracks prefill sizes and limits the number of concurrent large prefill operations per backend. The size estimate covers the full prompt, including all prior turns: the router has no per-request evidence that a prefix-cache entry exists, so a long conversation with a short final turn is still gated.
 
 ## Building from Source
 
