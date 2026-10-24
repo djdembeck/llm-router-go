@@ -1706,7 +1706,10 @@ func parsePromText(body []byte) []promSample {
 			continue
 		}
 		v, err := strconv.ParseFloat(val, 64)
-		if err != nil {
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			// Non-finite values are valid in the Prometheus format, but
+			// json.Marshal refuses them — one poisoned sample would drop
+			// the whole live stream. Treat it as an unparseable line.
 			continue
 		}
 		name, labels, ok := splitPromHead(head)

@@ -679,6 +679,19 @@ not_a_number 1.2.3
 	}
 }
 
+func TestEngine_ParsePromText_NonFiniteSkipped(t *testing.T) {
+	body := []byte(`
+gpu:util_percent{gpu="0"} NaN
+gpu:util_percent{gpu="1"} +Inf
+gpu:util_percent{gpu="2"} -Inf
+gpu:util_percent{gpu="3"} 55
+`)
+	samples := parsePromText(body)
+	if len(samples) != 1 || samples[0].labels["gpu"] != "3" || samples[0].value != 55 {
+		t.Fatalf("samples = %+v, want only the finite gpu=3 sample", samples)
+	}
+}
+
 func TestEngine_ParsePromText_EscapedLabel(t *testing.T) {
 	body := []byte(`x{model_name="a\"b",engine="0"} 1
 `)
