@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+* **metrics:** retire live requests, release prefill slots, and record request outcomes even when a proxy stream aborts or the client disconnects; preserve HTTP abort behavior instead of leaving phantom sessions
+* **dashboard:** read vLLM's group-aware KV token capacity from `cache_config_info`; show unknown usage as `—` independently of known capacity in live and historical pool readings
+
+### Features
+
+* **dashboard:** automatically focus a one-backend deployment on its server: remove the fleet rail and duplicate aggregate chart lane, reclaim chart width, show compact server details, and omit repeated backend names; preserve fleet comparisons for multi-backend deployments and device-wide GPU telemetry in both modes
+* **dashboard:** replace the fold-sheet UI with the Capacity Survey — readings strip, Fleet Profile (KV ridges, live request bars, survey cursor), live session stack, backend detail, request feed, night/day sheets
+* **dashboard:** smooth the sheet — TTFT/prefill/decode read a 15s mean refreshed every 5s and tween over 1.6s, the KV gauge holds 5s, a continuously gliding live edge, FLIP session rows with no entrance flashes, a stable request table, eased controls, and a night/day cross-fade; reduced-motion paths snap values and zero JS row durations
+* **dashboard:** live rows lead with measured TTFT; estimated context, KV reuse, and new-token load are smaller, muted, and `~`-prefixed, with a prefill/queue note; path, session id, and age recede. The request log is collapsed by default, persisted, and keeps its spike/429 counts in the header; the live stack grows into the released height while it is collapsed
+* **dashboard:** audit and polish — mobile hit targets meet 44px, selected backend rows announce `aria-current`, the range has a 44px hit area, and the Fleet Profile fills its sheet instead of leaving dead paper
+* **metrics:** correct 30s arrival rates and session liveness, fix engine scrape baselines and the SGLang compute/cache prefill split, add server-side `/metrics/history` (5m–30d) and optional device telemetry via `GPU_METRICS_URL`
+
 ## [1.0.1](https://github.com/djdembeck/llm-router-go/compare/v1.0.0...v1.0.1) (2026-07-25)
 
 

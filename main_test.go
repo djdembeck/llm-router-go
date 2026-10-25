@@ -1,16 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -432,4 +441,3323 @@ func TestHandleProxyError_MidStream(t *testing.T) {
 	if rec.Body.String() != before {
 		t.Errorf("mid-stream failure must not append an error body, got %q", rec.Body.String())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics registry (live observability)
+// ---------------------------------------------------------------------------
+
+// withRouterEnv replaces the router's global state for the duration of the
+// test and restores it afterward.
+func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]int) {
+	t.Helper()
+	savedBackends := backends
+	savedSlots := slots
+	savedPrefillSlots := prefillSlots
+	savedDurations := durations
+	savedGpu := gpu
+	savedProxies := proxies
+
+	backends = list
+	slots = make(map[string]*slotManager)
+	prefillSlots = make(map[string]*slotManager)
+	durations = make(map[string]*durationTracker)
+	for _, b := range list {
+		durations[b.Name] = &durationTracker{}
+	}
+	gpu = nil
+	proxies = make(map[string]*httputil.ReverseProxy)
+	for _, b := range list {
+		if mx, ok := slotMax[b.Name]; ok && mx > 0 {
+			mq := 2
+			if q, ok := slotQueue[b.Name]; ok {
+				mq = q
+			}
+			slots[b.Name] = newSlot(int32(mx), int32(mq))
+		}
+	}
+	t.Cleanup(func() {
+		backends = savedBackends
+		slots = savedSlots
+		prefillSlots = savedPrefillSlots
+		durations = savedDurations
+		gpu = savedGpu
+		proxies = savedProxies
+	})
+}
+
+func newTestMetrics() *metricsRegistry {
+	return newMetricsRegistry()
+}
+
+func TestMetrics_RecordRequest_CounterIncrements(t *testing.T) {
+	m := newTestMetrics()
+	now := time.Now()
+	m.recordRequest("primary", requestSample{
+		T: now, Backend: "primary", Path: "/v1/chat/completions",
+		Status: 200, Stream: false, DurMs: 12.5,
+		NewTokensEst: 32, BytesIn: 100, BytesOut: 200,
+	})
+	m.recordRequest("primary", requestSample{
+		T: now, Backend: "primary", Path: "/v1/chat/completions",
+		Status: 429, DurMs: 3.2, NewTokensEst: 8, BytesIn: 50,
+	})
+	m.recordRequest("subject", requestSample{
+		T: now, Backend: "subject", Path: "/v1/completions",
+		Status: 200, NewTokensEst: 10, BytesIn: 10, BytesOut: 40,
+	})
+
+	s := m.snapshot("primary")
+	if s.ReqTotal != 2 || s.BytesInTotal != 150 || s.BytesOutTotal != 200 || s.TokEstTotal != 40 {
+		t.Errorf("primary counters = %+v, want reqTotal=2 bytesIn=150 bytesOut=200 tokEst=40", s)
+	}
+	if s.TTFTSampleCount != 0 {
+		t.Errorf("ttftSampleCount = %d, want 0 (no streaming samples)", s.TTFTSampleCount)
+	}
+	s2 := m.snapshot("subject")
+	if s2.ReqTotal != 1 || s2.TokEstTotal != 10 {
+		t.Errorf("subject counters = %+v, want reqTotal=1 tokEst=10", s2)
+	}
+	// Unknown backend: zero snapshot, not a panic or stale value.
+	if zero := m.snapshot("ghost"); zero != (backendMetricSnapshot{}) {
+		t.Errorf("unknown backend snapshot = %+v, want zero", zero)
+	}
+}
+
+func TestMetrics_TTFT_FirstByteEWMA(t *testing.T) {
+	m := newTestMetrics()
+	m.recordAccept("b", 0, 0)
+	// recordFirstByte is the only TTFT entry point: it fires at first
+	// response byte, while the request is still live.
+	m.recordFirstByte("b", 100)
+	m.recordFirstByte("b", 200)
+	// zero/negative (non-streaming or unmeasured) is ignored.
+	m.recordFirstByte("b", 0)
+
+	s := m.snapshot("b")
+	if s.TTFTSampleCount != 2 {
+		t.Fatalf("ttftSampleCount = %d, want 2", s.TTFTSampleCount)
+	}
+	// EWMA (alpha 0.3): 100, then 0.3*200 + 0.7*100 = 130.
+	if math.Abs(s.TTFTMs-130) > 1e-9 {
+		t.Errorf("ttftMs = %v, want 130", s.TTFTMs)
+	}
+	// ttftMsNow is the most recent sample — what the live readout shows.
+	if s.TTFTMsNow != 200 {
+		t.Errorf("ttftMsNow = %v, want 200", s.TTFTMsNow)
+	}
+}
+
+func TestMetrics_ComputeRates_LiveArrivalWindow(t *testing.T) {
+	m := newTestMetrics()
+
+	// 10 requests admitted in one 100ms bucket. The live rate is the
+	// trailing 30s ARRIVAL average, not a per-tick spike: 10/30 req/s.
+	for range 10 {
+		m.recordAccept("b", 100, 80)
+	}
+	m.computeRates(time.Now())
+
+	s := m.snapshot("b")
+	if math.Abs(s.ReqRate-10.0/30.0) > 1e-9 {
+		t.Errorf("reqRate = %v, want 0.3333 (10 arrivals / 30s window)", s.ReqRate)
+	}
+	if math.Abs(s.TokEstRate-800.0/30.0) > 1e-9 {
+		t.Errorf("tokEstRate = %v, want 26.6667 (800 est tokens / 30s)", s.TokEstRate)
+	}
+	if math.Abs(s.BytesRate-1000.0/30.0) > 1e-9 {
+		t.Errorf("bytesRate = %v, want 33.3333 (1000 admitted bytes / 30s)", s.BytesRate)
+	}
+
+	// A second evaluation inside the window does not decay the value.
+	m.computeRates(time.Now())
+	s = m.snapshot("b")
+	if math.Abs(s.ReqRate-10.0/30.0) > 1e-9 {
+		t.Errorf("reqRate inside the window = %v, want unchanged 0.3333", s.ReqRate)
+	}
+
+	// Completion does NOT retire demand: the window is an arrival record,
+	// so the rate stays for the full 30s.
+	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 200, BytesIn: 100, BytesOut: 200, NewTokensEst: 80, accepted: true})
+	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 200, BytesIn: 100, BytesOut: 200, NewTokensEst: 80, accepted: true})
+	m.computeRates(time.Now())
+	s = m.snapshot("b")
+	if math.Abs(s.ReqRate-10.0/30.0) > 1e-9 {
+		t.Errorf("reqRate after completions = %v, want unchanged 0.3333 (completion never subtracts)", s.ReqRate)
+	}
+
+	// Hard cutoff: once the admission bucket is older than 30s it leaves the
+	// window in one step (no decay tail).
+	m.computeRates(time.Now().Add(31 * time.Second))
+	s = m.snapshot("b")
+	if s.ReqRate != 0 || s.TokEstRate != 0 || s.BytesRate != 0 {
+		t.Errorf("rates after the 30s cutoff = %+v, want all zero", s)
+	}
+
+	// Lifetime totals count completions only.
+	if s.ReqTotal != 2 || s.BytesInTotal != 200 || s.BytesOutTotal != 400 || s.TokEstTotal != 160 {
+		t.Errorf("lifetime counters = %+v, want reqTotal=2 bytesIn=200 bytesOut=400 tokEst=160", s)
+	}
+}
+
+func TestMetrics_Rates_RejectionsDoNotInflate(t *testing.T) {
+	m := newTestMetrics()
+	// A 429 that never entered a backend has no accepted flag — it must not
+	// add to the arrival window.
+	m.recordRequest("b", requestSample{T: time.Now(), Backend: "b", Status: 429, BytesIn: 50, NewTokensEst: 8})
+	m.computeRates(time.Now())
+	s := m.snapshot("b")
+	if s.ReqRate != 0 || s.TokEstRate != 0 || s.BytesRate != 0 {
+		t.Errorf("rates after pure rejection = %+v, want all zero", s)
+	}
+	if s.ReqTotal != 1 || s.RejectedTotal != 1 {
+		t.Errorf("reqTotal/rejected = %d/%d, want 1/1", s.ReqTotal, s.RejectedTotal)
+	}
+}
+
+func TestMetrics_BurstRing_EvictionAndLimit(t *testing.T) {
+	m := newTestMetrics()
+	m.ringCap = 500
+	now := time.Now()
+	for i := range 600 {
+		m.recordRequest("b", requestSample{T: now.Add(time.Duration(i) * time.Millisecond), Backend: "b", Status: 200, NewTokensEst: i})
+	}
+	all := m.burst(1000)
+	if len(all) != 500 {
+		t.Fatalf("ring length = %d, want 500 after 600 inserts", len(all))
+	}
+	if all[0].NewTokensEst != 100 || all[499].NewTokensEst != 599 {
+		t.Errorf("ring endpoints = [%d..%d], want [100..599] (newest last, oldest evicted)", all[0].NewTokensEst, all[499].NewTokensEst)
+	}
+	last10 := m.burst(10)
+	if len(last10) != 10 || last10[0].NewTokensEst != 590 || last10[9].NewTokensEst != 599 {
+		t.Errorf("burst(10) = [%d..%d] len=%d, want [590..599] len=10", firstTok(last10), lastTok(last10), len(last10))
+	}
+}
+
+func firstTok(s []requestSample) int { return s[0].NewTokensEst }
+func lastTok(s []requestSample) int  { return s[len(s)-1].NewTokensEst }
+
+// ---------------------------------------------------------------------------
+// engine metrics: parser + scrape semantics
+// ---------------------------------------------------------------------------
+
+func TestEngine_ParsePromText(t *testing.T) {
+	body := []byte(`
+# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="m",engine="0"} 3
+vllm:num_requests_running{model_name="m",engine="1"} 2
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.4
+vllm:prompt_tokens_total{model_name="m",engine="0"} 1000
+# a comment that looks like data
+vllm:e2e_request_latency_seconds_bucket{le="+Inf"} 7
+vllm:e2e_request_latency_seconds_count 5
+vllm:e2e_request_latency_seconds_sum 12.5
+not_a_number 1.2.3
+`)
+	samples := parsePromText(body)
+	byName := map[string][]promSample{}
+	for _, s := range samples {
+		byName[s.name] = append(byName[s.name], s)
+	}
+	if len(byName["vllm:num_requests_running"]) != 2 {
+		t.Fatalf("running samples = %d, want 2 (HELP/TYPE skipped)", len(byName["vllm:num_requests_running"]))
+	}
+	if byName["vllm:num_requests_running"][0].labels["model_name"] != "m" ||
+		byName["vllm:num_requests_running"][0].labels["engine"] != "0" {
+		t.Errorf("labels = %v, want model_name=m engine=0", byName["vllm:num_requests_running"][0].labels)
+	}
+	if byName["vllm:kv_cache_usage_perc"][0].value != 0.4 {
+		t.Errorf("kv value = %v, want 0.4", byName["vllm:kv_cache_usage_perc"][0].value)
+	}
+	if byName["vllm:e2e_request_latency_seconds_sum"][0].value != 12.5 {
+		t.Errorf("hist sum = %v, want 12.5", byName["vllm:e2e_request_latency_seconds_sum"][0].value)
+	}
+	if len(byName["not_a_number"]) != 0 {
+		t.Errorf("unparseable line not skipped")
+	}
+}
+
+func TestEngine_ParsePromText_NonFiniteSkipped(t *testing.T) {
+	body := []byte(`
+gpu:util_percent{gpu="0"} NaN
+gpu:util_percent{gpu="1"} +Inf
+gpu:util_percent{gpu="2"} -Inf
+gpu:util_percent{gpu="3"} 55
+`)
+	samples := parsePromText(body)
+	if len(samples) != 1 || samples[0].labels["gpu"] != "3" || samples[0].value != 55 {
+		t.Fatalf("samples = %+v, want only the finite gpu=3 sample", samples)
+	}
+}
+
+func TestEngine_ParsePromText_EscapedLabel(t *testing.T) {
+	body := []byte(`x{model_name="a\"b",engine="0"} 1
+`)
+	samples := parsePromText(body)
+	if len(samples) != 1 || samples[0].labels["model_name"] != `a"b` {
+		t.Fatalf("escaped label = %+v, want a\"b", samples)
+	}
+}
+
+// fakeExpo serves a fixed Prometheus body for one scrape.
+func TestEngine_ScrapeVllm(t *testing.T) {
+	r := newEngineRegistry()
+	r.add("king", "http://127.0.0.1:1/metrics") // url unused; we feed the body
+	r.mu.Lock()
+	s := r.backends["king"]
+	r.mu.Unlock()
+
+	// Prime the counter baseline ~2s ago: 1000 prompt tokens.
+	key := counterKey(promSample{name: "vllm:prompt_tokens_total", labels: map[string]string{"model_name": "m", "engine": "0"}})
+	s.counters[key] = 1000
+	s.cTimes[key] = time.Now().Add(-2 * time.Second)
+
+	// Two data-parallel engines: running sums, KV takes max, one scrape
+	// interval later the counter has advanced 3000-1000=2000 tokens.
+	body := `
+vllm:num_requests_running{model_name="m",engine="0"} 3
+vllm:num_requests_running{model_name="m",engine="1"} 2
+vllm:num_requests_waiting{model_name="m",engine="0"} 1
+vllm:num_requests_waiting{model_name="m",engine="1"} 0
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.4
+vllm:kv_cache_usage_perc{model_name="m",engine="1"} 0.6
+vllm:prompt_tokens_total{model_name="m",engine="0"} 3000
+vllm:generation_tokens_total{model_name="m",engine="0"} 500
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 10
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 2
+`
+	s.scrapeBody(parsePromText([]byte(body)))
+	first := s.view
+	if first.Status != "ok" {
+		t.Fatalf("status = %q, want ok", first.Status)
+	}
+	if first.Running != 5 || first.Waiting != 1 {
+		t.Errorf("vllm gauges = running %v / waiting %v, want 5/1 (sum across engines)", first.Running, first.Waiting)
+	}
+	if first.KVPct != 60 {
+		t.Errorf("kvPct = %v, want 60 (max across engines)", first.KVPct)
+	}
+	if first.KVHeldPct != nil {
+		t.Errorf("kvHeldPct = %v, want nil (vLLM's kv_cache_usage_perc already includes cached blocks)", *first.KVHeldPct)
+	}
+	// ~2000 tokens over ~2s of real wall clock (wall-clock jitter ±1%).
+	if first.PrefillTokS < 980 || first.PrefillTokS > 1020 {
+		t.Errorf("prefillTokS = %v, want ~1000 (2000 tokens / ~2s)", first.PrefillTokS)
+	}
+	// TTFT mean needs two histogram samples: prime happened on this scrape,
+	// so the mean arrives on the next one.
+	body2 := `
+vllm:num_requests_running{model_name="m",engine="0"} 3
+vllm:num_requests_running{model_name="m",engine="1"} 2
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.6
+vllm:kv_cache_usage_perc{model_name="m",engine="1"} 0.4
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 30
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 4
+`
+	s.scrapeBody(parsePromText([]byte(body2)))
+	if got := s.view.TTFTms; got < 9900 || got > 10100 {
+		t.Errorf("ttftMs = %v, want ~10000 ((30-10)/(4-2) s)", got)
+	}
+	// Counter reset (engine restart) re-baselines to 0 instead of negative.
+	s2body := `
+vllm:prompt_tokens_total{model_name="m",engine="0"} 10
+`
+	s.scrapeBody(parsePromText([]byte(s2body)))
+	if s.view.PrefillTokS != 0 {
+		t.Errorf("prefillTokS after counter reset = %v, want 0 (re-baseline)", s.view.PrefillTokS)
+	}
+}
+
+func TestEngine_ScrapeSglang(t *testing.T) {
+	r := newEngineRegistry()
+	r.add("subject", "http://127.0.0.1:1/metrics")
+	r.mu.Lock()
+	s := r.backends["subject"]
+	r.mu.Unlock()
+
+	body := `
+# scheduler gauges: replicated per tp rank -> max
+sglang:num_running_reqs{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 4
+sglang:num_running_reqs{model_name="m",engine_type="a",tp_rank="1",pp_rank="0",moe_ep_rank="0"} 4
+sglang:num_queue_reqs{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 2
+sglang:num_queue_reqs{model_name="m",engine_type="a",tp_rank="1",pp_rank="0",moe_ep_rank="0"} 2
+sglang:token_usage{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 0.75
+sglang:token_usage{model_name="m",engine_type="a",tp_rank="1",pp_rank="0",moe_ep_rank="0"} 0.75
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_compute"} 4000
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_cache"} 2000
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="decode"} 6000
+`
+	s.scrapeBody(parsePromText([]byte(body)))
+	if s.view.Status != "ok" {
+		t.Fatalf("status = %q, want ok", s.view.Status)
+	}
+	if s.view.Running != 4 || s.view.Waiting != 2 {
+		t.Errorf("sglang gauges = %v/%v, want 4/2 (max across ranks)", s.view.Running, s.view.Waiting)
+	}
+	if s.view.KVPct != 75 {
+		t.Errorf("kvPct = %v, want 75", s.view.KVPct)
+	}
+	// First sight of a counter has no prior value: rates start at 0.
+	if s.view.PrefillTokS != 0 || s.view.PrefillCacheTokS != 0 || s.view.DecodeTokS != 0 {
+		t.Errorf("first-sight rates = %v/%v/%v, want 0/0/0 (no baseline yet)", s.view.PrefillTokS, s.view.PrefillCacheTokS, s.view.DecodeTokS)
+	}
+
+	// realtime_tokens_total by mode: prefill_compute and prefill_cache are
+	// separate fields (compute-only is the contract); decode separate.
+	body2 := `
+sglang:num_running_reqs{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 4
+sglang:token_usage{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 0.75
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_compute"} 12000
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_cache"} 6000
+sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="decode"} 18000
+`
+	time.Sleep(300 * time.Millisecond)
+	s.scrapeBody(parsePromText([]byte(body2)))
+	// Δcompute = 8000, Δcache = 4000, Δdecode = 12000 over ~0.3s.
+	if s.view.PrefillTokS < 20000 || s.view.PrefillTokS > 35000 {
+		t.Errorf("prefillTokS = %v, want ~26666/s compute-only (8000 tokens / ~0.3s)", s.view.PrefillTokS)
+	}
+	if s.view.PrefillCacheTokS < 10000 || s.view.PrefillCacheTokS > 18000 {
+		t.Errorf("prefillCacheTokS = %v, want ~13333/s (4000 cache tokens / ~0.3s)", s.view.PrefillCacheTokS)
+	}
+	if s.view.PrefillTotalTokS < 30000 || s.view.PrefillTotalTokS > 50000 {
+		t.Errorf("prefillTotalTokS = %v, want ~40000/s (compute+cache)", s.view.PrefillTotalTokS)
+	}
+	if s.view.DecodeTokS < 30000 {
+		t.Errorf("decodeTokS = %v, want ~40000/s (12000 tokens / ~0.3s)", s.view.DecodeTokS)
+	}
+}
+
+func TestEngine_EndpointOff(t *testing.T) {
+	// A 404 (SGLang without --enable-metrics) must land on status "off",
+	// not "err" — the sheet distinguishes "absent" from "unreachable".
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	r := newEngineRegistry()
+	r.add("king", srv.URL+"/metrics")
+	r.scrape("king")
+	r.mu.Lock()
+	status := r.backends["king"].status
+	r.mu.Unlock()
+	if status != "off" {
+		t.Errorf("status = %q, want off (404 endpoint)", status)
+	}
+
+	// A dead endpoint is "err".
+	r2 := newEngineRegistry()
+	r2.add("dead", "http://127.0.0.1:1/metrics")
+	r2.scrape("dead")
+	r2.mu.Lock()
+	status2 := r2.backends["dead"].status
+	r2.mu.Unlock()
+	if status2 != "err" {
+		t.Errorf("status = %q, want err (unreachable)", status2)
+	}
+}
+
+// TestEngine_EndpointOffBackoff verifies a 404 endpoint is re-probed at
+// engineOffBackoff (not once per second) and re-arms promptly: "err"
+// (unreachable) never backs off, and the first 200 after an off window
+// clears the backoff immediately.
+func TestEngine_EndpointOffBackoff(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) <= 2 { // first two probes 404, then 200
+			http.NotFound(w, r)
+		} else {
+			fmt.Fprintln(w, `sglang:num_running_reqs 3`)
+		}
+	}))
+	defer srv.Close()
+
+	r := newEngineRegistry()
+	r.add("king", srv.URL+"/metrics")
+
+	r.scrape("king") // probe 1 → 404 → status off
+	r.mu.Lock()
+	status := r.backends["king"].status
+	offNext := r.backends["king"].offNext
+	r.mu.Unlock()
+	if status != "off" {
+		t.Fatalf("status = %q, want off", status)
+	}
+	if time.Until(offNext) <= 0 || time.Until(offNext) > engineOffBackoff {
+		t.Fatalf("offNext = %v, want ~engineOffBackoff in the future", offNext)
+	}
+
+	// Immediately: inside the backoff window → probe suppressed (no 2nd hit).
+	r.scrape("king")
+	if h := atomic.LoadInt32(&hits); h != 1 {
+		t.Fatalf("hits = %d, want 1 (probe suppressed during off backoff)", h)
+	}
+
+	// Past the window → probe again → still 404 (2nd hit), off re-armed.
+	r.mu.Lock()
+	r.backends["king"].offNext = time.Now().Add(-time.Second)
+	r.mu.Unlock()
+	r.scrape("king")
+	if h := atomic.LoadInt32(&hits); h != 2 {
+		t.Fatalf("hits = %d, want 2 (probe resumed after backoff)", h)
+	}
+	r.mu.Lock()
+	status = r.backends["king"].status
+	offNext = r.backends["king"].offNext
+	r.mu.Unlock()
+	if status != "off" {
+		t.Fatalf("status = %q, want off (still 404)", status)
+	}
+	if time.Until(offNext) <= 0 {
+		t.Fatalf("offNext = %v, want re-armed after repeated 404", offNext)
+	}
+
+	// err (unreachable) is never backed off: an endpoint that was 404 but
+	// then goes down must be probed again next tick for fast recovery.
+	r.mu.Lock()
+	r.backends["king"].offNext = time.Now().Add(time.Minute)
+	r.mu.Unlock()
+	dead := newEngineRegistry()
+	dead.add("dead", "http://127.0.0.1:1/metrics")
+	dead.scrape("dead")
+	dead.scrape("dead") // must not be suppressed
+	dead.mu.Lock()
+	dstatus := dead.backends["dead"].status
+	dead.mu.Unlock()
+	if dstatus != "err" {
+		t.Errorf("dead status = %q, want err (unreachable)", dstatus)
+	}
+
+	// Probe 3 (window expired) → 200 → backoff cleared; the next scrape
+	// hits immediately.
+	r.mu.Lock()
+	r.backends["king"].offNext = time.Now().Add(-time.Second)
+	r.mu.Unlock()
+	r.scrape("king")
+	if h := atomic.LoadInt32(&hits); h != 3 {
+		t.Fatalf("hits = %d, want 3 (probe fired after backoff expiry)", h)
+	}
+	r.mu.Lock()
+	status = r.backends["king"].status
+	offNext = r.backends["king"].offNext
+	r.mu.Unlock()
+	if status != "ok" {
+		t.Fatalf("status = %q, want ok", status)
+	}
+	if !offNext.IsZero() {
+		t.Fatalf("offNext = %v, want zero after ok scrape", offNext)
+	}
+	r.scrape("king")
+	if h := atomic.LoadInt32(&hits); h != 4 {
+		t.Fatalf("hits = %d, want 4 (no backoff after recovery)", h)
+	}
+}
+
+// ptr helpers for engineView v2 optional-field assertions.
+func ptr64f(v float64) *float64 { return &v }
+func ptr64i(v int64) *int64     { return &v }
+func deref64f(p *float64, field string, t *testing.T) float64 {
+	t.Helper()
+	if p == nil {
+		t.Fatalf("%s is nil, want a value", field)
+	}
+	return *p
+}
+func deref64i(p *int64, field string, t *testing.T) int64 {
+	t.Helper()
+	if p == nil {
+		t.Fatalf("%s is nil, want a value", field)
+	}
+	return *p
+}
+func wantNear(t *testing.T, got, want float64, field string) {
+	t.Helper()
+	if got < want*0.98 || got > want*1.02 {
+		t.Errorf("%s = %v, want ~%v (±2%% wall-clock)", field, got, want)
+	}
+}
+
+// rewindBaselines shifts the counter + histogram baselines back by d, so the
+// next scrape's deltas span a known ~2s interval without a 2s test sleep
+// (same pattern as TestEngine_ScrapeVllm's prime).
+func rewindBaselines(s *engineScrape, d time.Duration) {
+	for k := range s.cTimes {
+		s.cTimes[k] = s.cTimes[k].Add(-d)
+	}
+	for _, h := range s.hists {
+		h.t = h.t.Add(-d)
+	}
+}
+
+// TestEngine_V2Vllm exercises the full vLLM v2 scrape: gauges, by-source
+// prefill split, lifetime counters, finished-reason breakdown, cache hit
+// rates, and every histogram-derived mean (latency in ms, tokens raw).
+func TestEngine_V2Vllm(t *testing.T) {
+	r := newEngineRegistry()
+	r.add("king", "http://127.0.0.1:1/metrics")
+	r.mu.Lock()
+	s := r.backends["king"]
+	r.mu.Unlock()
+
+	// Prime (one scrape ~2s of wall clock ago): baselines for counters +
+	// histograms.
+	prime := `
+vllm:prompt_tokens_total{model_name="m",engine="0"} 1000
+vllm:generation_tokens_total{model_name="m",engine="0"} 100
+vllm:prompt_tokens_by_source_total{model_name="m",engine="0",source="local_compute"} 900
+vllm:prompt_tokens_by_source_total{model_name="m",engine="0",source="local_cache_hit"} 100
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 0.78
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 10
+vllm:inter_token_latency_seconds_sum{model_name="m",engine="0"} 0.78
+vllm:inter_token_latency_seconds_count{model_name="m",engine="0"} 10
+vllm:e2e_request_latency_seconds_sum{model_name="m",engine="0"} 2.36
+vllm:e2e_request_latency_seconds_count{model_name="m",engine="0"} 10
+vllm:request_queue_time_seconds_sum{model_name="m",engine="0"} 0.78
+vllm:request_queue_time_seconds_count{model_name="m",engine="0"} 10
+vllm:request_prefill_time_seconds_sum{model_name="m",engine="0"} 1.46
+vllm:request_prefill_time_seconds_count{model_name="m",engine="0"} 10
+vllm:request_decode_time_seconds_sum{model_name="m",engine="0"} 5.24
+vllm:request_decode_time_seconds_count{model_name="m",engine="0"} 10
+vllm:request_time_per_output_token_seconds_sum{model_name="m",engine="0"} 0.044
+vllm:request_time_per_output_token_seconds_count{model_name="m",engine="0"} 20
+vllm:request_prompt_tokens_sum{model_name="m",engine="0"} 2500
+vllm:request_prompt_tokens_count{model_name="m",engine="0"} 1
+vllm:request_generation_tokens_sum{model_name="m",engine="0"} 110
+vllm:request_generation_tokens_count{model_name="m",engine="0"} 1
+`
+	s.scrapeBody(parsePromText([]byte(prime)))
+	// Rewind baselines ~2s and let the wall clock add ~0.2s more: the
+	// deltas span a known ~2.2s interval (jitter ±few %) with no 2s sleep.
+	rewindBaselines(s, 2*time.Second)
+	time.Sleep(200 * time.Millisecond)
+
+	body := `
+vllm:num_requests_running{model_name="m",engine="0"} 4
+vllm:num_requests_waiting{model_name="m",engine="0"} 2
+vllm:num_requests_waiting_by_reason{model_name="m",engine="0",reason="capacity"} 3
+vllm:num_requests_waiting_by_reason{model_name="m",engine="0",reason="deferred"} 1
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.45
+vllm:prompt_tokens_total{model_name="m",engine="0"} 3000
+vllm:generation_tokens_total{model_name="m",engine="0"} 3500
+vllm:prompt_tokens_by_source_total{model_name="m",engine="0",source="local_compute"} 2900
+vllm:prompt_tokens_by_source_total{model_name="m",engine="0",source="local_cache_hit"} 1500
+vllm:request_success_total{model_name="m",engine="0",finished_reason="stop"} 50
+vllm:request_success_total{model_name="m",engine="0",finished_reason="length"} 7
+vllm:request_success_total{model_name="m",engine="0",finished_reason="abort"} 3
+vllm:num_preemptions_total{model_name="m",engine="0"} 4
+vllm:prefix_cache_queries_total{model_name="m",engine="0"} 1000
+vllm:prefix_cache_hits_total{model_name="m",engine="0"} 791
+vllm:mm_cache_queries_total{model_name="m",engine="0"} 20
+vllm:mm_cache_hits_total{model_name="m",engine="0"} 17
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 1.78
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 20
+vllm:inter_token_latency_seconds_sum{model_name="m",engine="0"} 1.78
+vllm:inter_token_latency_seconds_count{model_name="m",engine="0"} 30
+vllm:e2e_request_latency_seconds_sum{model_name="m",engine="0"} 4.96
+vllm:e2e_request_latency_seconds_count{model_name="m",engine="0"} 20
+vllm:request_queue_time_seconds_sum{model_name="m",engine="0"} 1.78
+vllm:request_queue_time_seconds_count{model_name="m",engine="0"} 30
+vllm:request_prefill_time_seconds_sum{model_name="m",engine="0"} 2.56
+vllm:request_prefill_time_seconds_count{model_name="m",engine="0"} 30
+vllm:request_decode_time_seconds_sum{model_name="m",engine="0"} 6.84
+vllm:request_decode_time_seconds_count{model_name="m",engine="0"} 30
+vllm:request_time_per_output_token_seconds_sum{model_name="m",engine="0"} 0.164
+vllm:request_time_per_output_token_seconds_count{model_name="m",engine="0"} 30
+vllm:request_prompt_tokens_sum{model_name="m",engine="0"} 7500
+vllm:request_prompt_tokens_count{model_name="m",engine="0"} 3
+vllm:request_generation_tokens_sum{model_name="m",engine="0"} 370
+vllm:request_generation_tokens_count{model_name="m",engine="0"} 3
+`
+	s.scrapeBody(parsePromText([]byte(body)))
+	v := s.view
+
+	if v.Status != "ok" || v.Engine != "vllm" {
+		t.Fatalf("status/engine = %q/%q, want ok/vllm", v.Status, v.Engine)
+	}
+	if v.Running != 4 || v.Waiting != 2 || v.KVPct != 45 {
+		t.Errorf("core gauges = %v/%v/%v, want 4/2/45", v.Running, v.Waiting, v.KVPct)
+	}
+	// by-source prefill split over the ~2.2s window: compute 2000 tok,
+	// cache 1400 tok; decode 3400 tok.
+	wantNear(t, v.PrefillTokS, 909, "prefillTokS")
+	wantNear(t, v.PrefillCacheTokS, 636, "prefillCacheTokS")
+	wantNear(t, v.DecodeTokS, 1545, "decodeTokS")
+	// Finished-reason breakdown + lifetime.
+	if v.ReqDoneTotal != 60 {
+		t.Errorf("reqDoneTotal = %d, want 60 (Σ finished reasons)", v.ReqDoneTotal)
+	}
+	if v.FinReasons == nil || v.FinReasons["stop"] != 50 || v.FinReasons["length"] != 7 || v.FinReasons["abort"] != 3 {
+		t.Errorf("finReasons = %v, want stop=50 length=7 abort=3", v.FinReasons)
+	}
+	if got := deref64i(v.PreemptedTotal, "preemptedTotal", t); got != 4 {
+		t.Errorf("preemptedTotal = %d, want 4", got)
+	}
+	if got := deref64f(v.WaitCap, "waitCap", t); got != 3 {
+		t.Errorf("waitCap = %v, want 3", got)
+	}
+	if got := deref64f(v.WaitDefer, "waitDefer", t); got != 1 {
+		t.Errorf("waitDefer = %v, want 1", got)
+	}
+	// Cache hit rates (lifetime hits/queries) + raw totals.
+	if v.HitRate < 0.78 || v.HitRate > 0.80 {
+		t.Errorf("hitRate = %v, want ~0.791", v.HitRate)
+	}
+	if got := deref64i(v.HitQueriesTotal, "hitQueriesTotal", t); got != 1000 {
+		t.Errorf("hitQueriesTotal = %d, want 1000", got)
+	}
+	if got := deref64i(v.HitHitsTotal, "hitHitsTotal", t); got != 791 {
+		t.Errorf("hitHitsTotal = %d, want 791", got)
+	}
+	if got := deref64i(v.MmQueriesTotal, "mmQueriesTotal", t); got != 20 {
+		t.Errorf("mmQueriesTotal = %d, want 20", got)
+	}
+	if got := deref64i(v.MmHitsTotal, "mmHitsTotal", t); got != 17 {
+		t.Errorf("mmHitsTotal = %d, want 17", got)
+	}
+	if got := deref64i(v.PromptTokTotal, "promptTokTotal", t); got != 3000 {
+		t.Errorf("promptTokTotal = %d, want 3000 (latest raw counter)", got)
+	}
+	if got := deref64i(v.GenTokTotal, "genTokTotal", t); got != 3500 {
+		t.Errorf("genTokTotal = %d, want 3500", got)
+	}
+	// Latency means (ms) over the ~2.2s interval.
+	wantNear(t, v.TTFTms, 100, "ttftMs")                                // (1.78-0.78)/(20-10)
+	wantNear(t, v.ITLms, 50, "itlMs")                                   // (1.78-0.78)/(30-10)
+	wantNear(t, v.E2EMs, 260, "e2eMs")                                  // (4.96-2.36)/(20-10)
+	wantNear(t, v.QueueMs, 50, "queueMs")                               // (1.78-0.78)/(30-10)
+	wantNear(t, deref64f(v.PrefillMs, "prefillMs", t), 55, "prefillMs") // (2.56-1.46)/(30-10)
+	wantNear(t, deref64f(v.DecodeMs, "decodeMs", t), 80, "decodeMs")    // (6.84-5.24)/(30-10)
+	wantNear(t, deref64f(v.PerTokMs, "perTokMs", t), 12, "perTokMs")    // (0.164-0.044)/(30-20)
+	// Token histograms are RAW token counts, NOT ×1000.
+	wantNear(t, v.MeanPromptTok, 2500, "meanPromptTok")
+	wantNear(t, v.MeanGenTok, 130, "meanGenTok")
+	if v.MeanPromptTok > 10000 {
+		t.Errorf("meanPromptTok = %v, looks ms-converted (want token values)", v.MeanPromptTok)
+	}
+	// SGLang-only fields must be nil on vLLM.
+	if v.TTFTStreamMs != nil || v.TTFTNonStreamMs != nil {
+		t.Errorf("vllm ttft stream split = %v/%v, want nil", v.TTFTStreamMs, v.TTFTNonStreamMs)
+	}
+	if v.FullPct != nil || v.SwaPct != nil || v.MambaPct != nil {
+		t.Errorf("vllm pool pct = %v/%v/%v, want nil", v.FullPct, v.SwaPct, v.MambaPct)
+	}
+	if v.AbortedTotal != nil || v.StreamDoneTotal != nil || v.NonStreamDoneTotal != nil {
+		t.Errorf("vllm sglang counters non-nil: %v/%v/%v", v.AbortedTotal, v.StreamDoneTotal, v.NonStreamDoneTotal)
+	}
+	if v.Retracted != nil || v.RetractedTokS != nil {
+		t.Errorf("vllm retracted = %v/%v, want nil", v.Retracted, v.RetractedTokS)
+	}
+	if v.KVMemGB != nil || v.SLOCap != nil || v.CTXLen != nil {
+		t.Errorf("vllm mem/slo/ctx non-nil: %v/%v/%v", v.KVMemGB, v.SLOCap, v.CTXLen)
+	}
+}
+
+// TestEngine_V2Sglang exercises the full SGLang v2 scrape: pool gauges (MAX
+// across ranks), token pool stats, retraction, aborted/streaming splits,
+// is_streaming-split TTFT, and raw token histogram means.
+func TestEngine_V2Sglang(t *testing.T) {
+	r := newEngineRegistry()
+	r.add("subject", "http://127.0.0.1:1/metrics")
+	r.mu.Lock()
+	s := r.backends["subject"]
+	r.mu.Unlock()
+
+	// Prime ~2s ago (rank 0 only is enough to baseline the metrics that
+	// appear on both ranks; rank 1 baselines on this scrape's first sight).
+	prime := `
+sglang:num_retracted_input_tokens_total{tp_rank="0"} 100
+sglang:realtime_tokens_total{tp_rank="0",mode="prefill_compute"} 2100
+sglang:realtime_tokens_total{tp_rank="1",mode="prefill_compute"} 2100
+sglang:realtime_tokens_total{tp_rank="0",mode="prefill_cache"} 500
+sglang:realtime_tokens_total{tp_rank="1",mode="prefill_cache"} 500
+sglang:realtime_tokens_total{tp_rank="0",mode="decode"} 1000
+sglang:realtime_tokens_total{tp_rank="1",mode="decode"} 1000
+sglang:time_to_first_token_seconds_sum{is_streaming="true"} 0.78
+sglang:time_to_first_token_seconds_count{is_streaming="true"} 1
+sglang:time_to_first_token_seconds_sum{is_streaming="false"} 0.45
+sglang:time_to_first_token_seconds_count{is_streaming="false"} 1
+sglang:inter_token_latency_seconds_sum 1.44
+sglang:inter_token_latency_seconds_count 20
+sglang:e2e_request_latency_seconds_sum 2.36
+sglang:e2e_request_latency_seconds_count 10
+sglang:queue_time_seconds_sum 0.78
+sglang:queue_time_seconds_count 10
+sglang:prompt_tokens_histogram_sum 1722
+sglang:prompt_tokens_histogram_count 1
+sglang:generation_tokens_histogram_sum 100
+sglang:generation_tokens_histogram_count 1
+`
+	s.scrapeBody(parsePromText([]byte(prime)))
+	// Same ~2.2s window as the vLLM test (rewind 2s + 200ms of wall clock).
+	rewindBaselines(s, 2*time.Second)
+	time.Sleep(200 * time.Millisecond)
+
+	body := `
+sglang:num_running_reqs{tp_rank="0"} 8
+sglang:num_running_reqs{tp_rank="1"} 8
+sglang:num_queue_reqs{tp_rank="0"} 3
+sglang:num_queue_reqs{tp_rank="1"} 3
+sglang:token_usage{tp_rank="0"} 0.7
+sglang:token_usage{tp_rank="1"} 0.7
+sglang:full_token_usage{tp_rank="0"} 0.6
+sglang:swa_token_usage{tp_rank="0"} 0.25
+sglang:mamba_usage{tp_rank="0"} 0.1
+sglang:num_used_tokens{tp_rank="0"} 120000
+sglang:max_total_num_tokens{tp_rank="0"} 160000
+sglang:kv_available_tokens{tp_rank="0"} 20000
+sglang:kv_evictable_tokens{tp_rank="0"} 5000
+sglang:mamba_used_tokens{tp_rank="0"} 1000
+sglang:mamba_available_tokens{tp_rank="0"} 3000
+sglang:mamba_evictable_tokens{tp_rank="0"} 500
+sglang:num_retracted_reqs{tp_rank="0"} 2
+sglang:cache_hit_rate{tp_rank="0"} 0.42
+sglang:max_running_requests_under_SLO{tp_rank="0"} 64
+sglang:context_len{tp_rank="0"} 131072
+sglang:kv_cache_memory_usage_gb{tp_rank="0"} 30.5
+sglang:weight_memory_usage_gb{tp_rank="0"} 20.2
+sglang:hicache_host_used_tokens{tp_rank="0"} 4000
+sglang:hicache_host_total_tokens{tp_rank="0"} 8000
+sglang:num_retracted_input_tokens_total{tp_rank="0"} 500
+sglang:num_aborted_requests_total{tp_rank="0"} 11
+sglang:num_requests_total{is_streaming="true",tp_rank="0"} 300
+sglang:num_requests_total{is_streaming="false",tp_rank="0"} 200
+sglang:prompt_tokens_total{is_streaming="true",tp_rank="0"} 5000
+sglang:prompt_tokens_total{is_streaming="false",tp_rank="0"} 5000
+sglang:generation_tokens_total{is_streaming="true",tp_rank="0"} 3000
+sglang:generation_tokens_total{is_streaming="false",tp_rank="0"} 3000
+sglang:realtime_tokens_total{tp_rank="0",mode="prefill_compute"} 4400
+sglang:realtime_tokens_total{tp_rank="1",mode="prefill_compute"} 4400
+sglang:realtime_tokens_total{tp_rank="0",mode="prefill_cache"} 2100
+sglang:realtime_tokens_total{tp_rank="1",mode="prefill_cache"} 2100
+sglang:realtime_tokens_total{tp_rank="0",mode="decode"} 9000
+sglang:realtime_tokens_total{tp_rank="1",mode="decode"} 9000
+sglang:time_to_first_token_seconds_sum{is_streaming="true"} 1.78
+sglang:time_to_first_token_seconds_count{is_streaming="true"} 2
+sglang:time_to_first_token_seconds_sum{is_streaming="false"} 0.75
+sglang:time_to_first_token_seconds_count{is_streaming="false"} 3
+sglang:inter_token_latency_seconds_sum 6.24
+sglang:inter_token_latency_seconds_count 40
+sglang:e2e_request_latency_seconds_sum 4.96
+sglang:e2e_request_latency_seconds_count 20
+sglang:queue_time_seconds_sum 1.78
+sglang:queue_time_seconds_count 30
+sglang:prompt_tokens_histogram_sum 4667
+sglang:prompt_tokens_histogram_count 4
+sglang:generation_tokens_histogram_sum 280
+sglang:generation_tokens_histogram_count 3
+`
+	s.scrapeBody(parsePromText([]byte(body)))
+	v := s.view
+
+	if v.Status != "ok" || v.Engine != "sglang" {
+		t.Fatalf("status/engine = %q/%q, want ok/sglang", v.Status, v.Engine)
+	}
+	if v.Running != 8 || v.Waiting != 3 || v.KVPct != 70 {
+		t.Errorf("core gauges = %v/%v/%v, want 8/3/70 (max across ranks)", v.Running, v.Waiting, v.KVPct)
+	}
+	// Pool pcts (×100).
+	wantNear(t, deref64f(v.FullPct, "fullPct", t), 60, "fullPct")
+	wantNear(t, deref64f(v.SwaPct, "swaPct", t), 25, "swaPct")
+	wantNear(t, deref64f(v.MambaPct, "mambaPct", t), 10, "mambaPct")
+	// Pool token stats (MAX across ranks).
+	wantNear(t, deref64f(v.KVUsedTok, "kvUsedTok", t), 120000, "kvUsedTok")
+	wantNear(t, deref64f(v.KVCapTok, "kvCapTok", t), 160000, "kvCapTok")
+	wantNear(t, deref64f(v.KVFreeTok, "kvFreeTok", t), 20000, "kvFreeTok")
+	wantNear(t, deref64f(v.KVEvictTok, "kvEvictTok", t), 5000, "kvEvictTok")
+	// Held (prefix-cached) share of the hand-out pool: 100·5000/(20000+5000).
+	wantNear(t, deref64f(v.KVHeldPct, "kvHeldPct", t), 20, "kvHeldPct")
+	wantNear(t, deref64f(v.MambaUsedTok, "mambaUsedTok", t), 1000, "mambaUsedTok")
+	wantNear(t, deref64f(v.MambaCapTok, "mambaCapTok", t), 4500, "mambaCapTok") // used+avail+evict
+	wantNear(t, deref64f(v.HiCacheHostUsedTok, "hicacheHostUsedTok", t), 4000, "hicacheHostUsedTok")
+	wantNear(t, deref64f(v.HiCacheHostCapTok, "hicacheHostCapTok", t), 8000, "hicacheHostCapTok")
+	// Retraction.
+	wantNear(t, deref64f(v.Retracted, "retracted", t), 2, "retracted")
+	wantNear(t, deref64f(v.RetractedTokS, "retractedTokS", t), 182, "retractedTokS") // (500-100)/~2.2s
+	if got := deref64i(v.AbortedTotal, "abortedTotal", t); got != 11 {
+		t.Errorf("abortedTotal = %d, want 11", got)
+	}
+	// Streaming splits + lifetime sums (both is_streaming summed).
+	if got := deref64i(v.StreamDoneTotal, "streamDoneTotal", t); got != 300 {
+		t.Errorf("streamDoneTotal = %d, want 300", got)
+	}
+	if got := deref64i(v.NonStreamDoneTotal, "nonStreamDoneTotal", t); got != 200 {
+		t.Errorf("nonStreamDoneTotal = %d, want 200", got)
+	}
+	if v.ReqDoneTotal != 500 {
+		t.Errorf("reqDoneTotal = %d, want 500 (stream+nonStream)", v.ReqDoneTotal)
+	}
+	if got := deref64i(v.PromptTokTotal, "promptTokTotal", t); got != 10000 {
+		t.Errorf("promptTokTotal = %d, want 10000 (Σ is_streaming)", got)
+	}
+	if got := deref64i(v.GenTokTotal, "genTokTotal", t); got != 6000 {
+		t.Errorf("genTokTotal = %d, want 6000", got)
+	}
+	if v.PreemptedTotal != nil {
+		t.Errorf("preemptedTotal = %v, want nil (vLLM-only)", v.PreemptedTotal)
+	}
+	if v.FinReasons != nil {
+		t.Errorf("finReasons = %v, want nil (vLLM-only)", v.FinReasons)
+	}
+	// Hit rate gauge (fraction).
+	if v.HitRate < 0.41 || v.HitRate > 0.43 {
+		t.Errorf("hitRate = %v, want ~0.42", v.HitRate)
+	}
+	// Rates over the ~2.2s interval: compute = (4400-2100)×2 = 4600 tok;
+	// cache = (2100-500)×2 = 3200 tok; decode = (9000-1000)×2 = 16000 tok.
+	wantNear(t, v.PrefillTokS, 2091, "prefillTokS")           // 4600/2.2
+	wantNear(t, v.PrefillCacheTokS, 1455, "prefillCacheTokS") // 3200/2.2
+	wantNear(t, v.PrefillTotalTokS, 3545, "prefillTotalTokS") // 7800/2.2
+	wantNear(t, v.DecodeTokS, 7273, "decodeTokS")             // 16000/2.2
+	// is_streaming-split TTFT means must be distinct; blended is a mix.
+	stream := deref64f(v.TTFTStreamMs, "ttftStreamMs", t)
+	nonStream := deref64f(v.TTFTNonStreamMs, "ttftNonStreamMs", t)
+	wantNear(t, stream, 1000, "ttftStreamMs")      // (1.78-0.78)/(2-1) s
+	wantNear(t, nonStream, 150, "ttftNonStreamMs") // (0.75-0.45)/(3-1) s
+	if math.Abs(stream-nonStream) < 1 {
+		t.Errorf("ttft stream/nonstream = %v/%v, want distinct per-label means", stream, nonStream)
+	}
+	wantNear(t, v.TTFTms, 433, "ttftMs (blended)") // (2.53-1.23)/(5-2) s
+	wantNear(t, v.ITLms, 240, "itlMs")             // (6.24-1.44)/(40-20) s
+	wantNear(t, v.E2EMs, 260, "e2eMs")             // (4.96-2.36)/(20-10) s
+	wantNear(t, v.QueueMs, 50, "queueMs")          // (1.78-0.78)/(30-10) s
+	// Raw token histogram means (NOT ms-converted).
+	wantNear(t, v.MeanPromptTok, 981.67, "meanPromptTok") // (4667-1722)/(4-1)
+	wantNear(t, v.MeanGenTok, 90, "meanGenTok")           // (280-100)/(3-1)
+	// Capacity + memory.
+	wantNear(t, deref64f(v.SLOCap, "sloCap", t), 64, "sloCap")
+	wantNear(t, deref64f(v.CTXLen, "ctxLen", t), 131072, "ctxLen")
+	wantNear(t, deref64f(v.KVMemGB, "kvMemGB", t), 30.5, "kvMemGB")
+	wantNear(t, deref64f(v.WeightMemGB, "weightMemGB", t), 20.2, "weightMemGB")
+	// vLLM-only fields must be nil on SGLang.
+	if v.WaitCap != nil || v.WaitDefer != nil {
+		t.Errorf("sglang waitCap/waitDefer = %v/%v, want nil", v.WaitCap, v.WaitDefer)
+	}
+	if v.PrefillMs != nil || v.DecodeMs != nil || v.PerTokMs != nil {
+		t.Errorf("sglang per-stage ms = %v/%v/%v, want nil (vLLM-only)", v.PrefillMs, v.DecodeMs, v.PerTokMs)
+	}
+	if v.HitQueriesTotal != nil || v.MmQueriesTotal != nil {
+		t.Errorf("sglang cache totals non-nil: %v/%v", v.HitQueriesTotal, v.MmQueriesTotal)
+	}
+}
+
+// frame mirrors the live metrics contract frame (field names, not types).
+type frame struct {
+	T        int64                  `json:"t"`
+	Backends []frame_backends_entry `json:"backends"`
+	GPU      struct {
+		Used    int  `json:"used"`
+		Budget  int  `json:"budget"`
+		Waiting int  `json:"waiting"`
+		Active  bool `json:"active"`
+	} `json:"gpu"`
+	Tier0Inflight int32 `json:"tier0Inflight"`
+	Totals        struct {
+		InFlight      int32   `json:"inFlight"`
+		Waiting       int32   `json:"waiting"`
+		ReqRate       float64 `json:"reqRate"`
+		BytesRate     float64 `json:"bytesRate"`
+		TokEstRate    float64 `json:"tokEstRate"`
+		ReqTotal      int64   `json:"reqTotal"`
+		BytesInTotal  int64   `json:"bytesInTotal"`
+		BytesOutTotal int64   `json:"bytesOutTotal"`
+		TokEstTotal   int64   `json:"tokEstTotal"`
+	} `json:"totals"`
+}
+
+type frame_backend = frame_backends_entry
+
+// frame_backends_entry mirrors one entry of the frame's backends[] array.
+// frame.Backends is typed as []frame_backends_entry so frameBackend can
+// return pointers into it.
+type frame_backends_entry struct {
+	Name            string  `json:"name"`
+	URL             string  `json:"url"`
+	Tier            int     `json:"tier"`
+	InFlight        int32   `json:"inFlight"`
+	MaxConcurrent   int32   `json:"maxConcurrent"`
+	Waiting         int32   `json:"waiting"`
+	MaxQueueDepth   int32   `json:"maxQueueDepth"`
+	PrefillInFlight int32   `json:"prefillInFlight"`
+	PrefillWaiting  int32   `json:"prefillWaiting"`
+	PrefillMax      int32   `json:"prefillMax"`
+	AvgDurationS    float64 `json:"avgDurationS"`
+	EWMAms          float64 `json:"ewmaMs"`
+	TTFTms          float64 `json:"ttftMs"`
+	TTFTSampleCount int     `json:"ttftSampleCount"`
+	TTFTMsNow       float64 `json:"ttftMsNow"`
+	ReqRate         float64 `json:"reqRate"`
+	BytesRate       float64 `json:"bytesRate"`
+	TokEstRate      float64 `json:"tokEstRate"`
+	ReqTotal        int64   `json:"reqTotal"`
+	BytesInTotal    int64   `json:"bytesInTotal"`
+	BytesOutTotal   int64   `json:"bytesOutTotal"`
+	TokEstTotal     int64   `json:"tokEstTotal"`
+	Engine          struct {
+		Status             string           `json:"status"`
+		Engine             string           `json:"engine"`
+		Running            float64          `json:"running"`
+		Waiting            float64          `json:"waiting"`
+		KVPct              float64          `json:"kvPct"`
+		HitRate            float64          `json:"hitRate"`
+		PrefillTokS        float64          `json:"prefillTokS"`
+		PrefillCacheTokS   float64          `json:"prefillCacheTokS"`
+		DecodeTokS         float64          `json:"decodeTokS"`
+		TTFTms             float64          `json:"ttftMs"`
+		ITLms              float64          `json:"itlMs"`
+		E2EMs              float64          `json:"e2eMs"`
+		QueueMs            float64          `json:"queueMs"`
+		PrefillMs          *float64         `json:"prefillMs"`
+		DecodeMs           *float64         `json:"decodeMs"`
+		PerTokMs           *float64         `json:"perTokMs"`
+		MeanPromptTok      float64          `json:"meanPromptTok"`
+		MeanGenTok         float64          `json:"meanGenTok"`
+		WaitCap            *float64         `json:"waitCap"`
+		WaitDefer          *float64         `json:"waitDefer"`
+		Retracted          *float64         `json:"retracted"`
+		RetractedTokS      *float64         `json:"retractedTokS"`
+		FullPct            *float64         `json:"fullPct"`
+		SwaPct             *float64         `json:"swaPct"`
+		MambaPct           *float64         `json:"mambaPct"`
+		KVUsedTok          *float64         `json:"kvUsedTok"`
+		KVCapTok           *float64         `json:"kvCapTok"`
+		KVFreeTok          *float64         `json:"kvFreeTok"`
+		KVEvictTok         *float64         `json:"kvEvictTok"`
+		MambaUsedTok       *float64         `json:"mambaUsedTok"`
+		MambaCapTok        *float64         `json:"mambaCapTok"`
+		HiCacheHostUsedTok *float64         `json:"hicacheHostUsedTok"`
+		HiCacheHostCapTok  *float64         `json:"hicacheHostCapTok"`
+		TTFTStreamMs       *float64         `json:"ttftStreamMs"`
+		TTFTNonStreamMs    *float64         `json:"ttftNonStreamMs"`
+		KVMemGB            *float64         `json:"kvMemGB"`
+		WeightMemGB        *float64         `json:"weightMemGB"`
+		SLOCap             *float64         `json:"sloCap"`
+		CTXLen             *float64         `json:"ctxLen"`
+		PreemptedTotal     *int64           `json:"preemptedTotal"`
+		AbortedTotal       *int64           `json:"abortedTotal"`
+		StreamDoneTotal    *int64           `json:"streamDoneTotal"`
+		NonStreamDoneTotal *int64           `json:"nonStreamDoneTotal"`
+		PromptTokTotal     *int64           `json:"promptTokTotal"`
+		GenTokTotal        *int64           `json:"genTokTotal"`
+		HitQueriesTotal    *int64           `json:"hitQueriesTotal"`
+		HitHitsTotal       *int64           `json:"hitHitsTotal"`
+		MmQueriesTotal     *int64           `json:"mmQueriesTotal"`
+		MmHitsTotal        *int64           `json:"mmHitsTotal"`
+		ReqDoneTotal       int64            `json:"reqDoneTotal"`
+		FinReasons         map[string]int64 `json:"finReasons"`
+	} `json:"engine"`
+}
+
+func frameBackend(t *testing.T, fr *frame, name string) *frame_backend {
+	t.Helper()
+	for i := range fr.Backends {
+		if fr.Backends[i].Name == name {
+			return &fr.Backends[i]
+		}
+	}
+	t.Fatalf("backend %q not in frame", name)
+	return nil
+}
+
+// sseFrames reads data frames off an SSE response one at a time.
+func sseFrames(t *testing.T, resp *http.Response) *frameReader {
+	t.Helper()
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	return &frameReader{t: t, resp: resp, sc: sc}
+}
+
+type frameReader struct {
+	t    *testing.T
+	resp *http.Response
+	sc   *bufio.Scanner
+}
+
+// nextFrame returns the next decoded SSE data frame.
+func (r *frameReader) nextFrame() *frame {
+	for r.sc.Scan() {
+		line := r.sc.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		f := &frame{}
+		if err := json.Unmarshal([]byte(line[len("data: "):]), f); err != nil {
+			r.t.Fatalf("bad SSE frame %q: %v", line, err)
+		}
+		return f
+	}
+	r.t.Fatal("SSE stream ended without a data frame")
+	return nil
+}
+
+// waitFor polls frames until pred matches or the deadline passes.
+func (r *frameReader) waitFor(deadline time.Time, pred func(*frame) bool) *frame {
+	for {
+		f := r.nextFrame()
+		if pred(f) {
+			return f
+		}
+		if time.Now().After(deadline) {
+			r.t.Fatalf("timed out waiting for frame; last: %+v", f)
+		}
+	}
+}
+
+// close releases the SSE response.
+func (r *frameReader) close() {
+	r.resp.Body.Close()
+}
+
+// TestMetricsStream_LiveSnapshot proxies a held-in-flight streaming request
+// and a 429 rejection through the real mux against a fake upstream, then
+// asserts the SSE frame carries the contract's top-level keys and live
+// values (inFlight, ttftSampleCount>0, gpu.active, tier0Inflight, totals).
+//
+// Sequence (deterministic via held fake responses):
+//  1. stream req in-flight on "subject" -> assert inFlight/limits frame
+//  2. release stream -> it completes; assert ttftSampleCount>0, tokEstTotal
+//  3. king req held in-flight -> assert gpu.active + tier0Inflight
+//  4. subject req while king busy -> 429 blocked-by-tier0
+//  5. release king; burst feed contains streaming-200 + 429 samples
+func TestMetricsStream_LiveSnapshot(t *testing.T) {
+	withRouterEnv(t,
+		[]Backend{
+			{Name: "subject", URL: "http://127.0.0.1:1", Tier: 1, MaxConcurrent: 2, BlockOnTier0: 1},
+			{Name: "king", URL: "http://127.0.0.1:1", Tier: 0, MaxConcurrent: 5},
+		},
+		map[string]int{"subject": 2, "king": 5},
+		map[string]int{"subject": 2, "king": 4})
+	// A configured GPU budget so the frame's gpu{} carries a real budget;
+	// gpu.active must flip on when king (tier 0) goes in-flight.
+	gpu = &gpuBudget{max: 4}
+	gpu.cond = sync.NewCond(&gpu.mu)
+	t.Cleanup(func() { gpu = nil })
+
+	// holdStream / holdKing pin the two proxied requests in-flight until the
+	// test closes them, making the frame-state -> 429 sequence deterministic
+	// instead of a sleep race. Each hold also unblocks on client disconnect
+	// so a test failure can't hang httptest.Server.Close.
+	holdStream := make(chan struct{})
+	holdKing := make(chan struct{})
+	unblock := func(r *http.Request, ch <-chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		case <-r.Context().Done():
+			return false
+		}
+	}
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req parsedBody
+		json.NewDecoder(r.Body).Decode(&req)
+		if req.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			fl, _ := w.(http.Flusher)
+			time.Sleep(150 * time.Millisecond) // deliberate first-byte delay -> measurable TTFT
+			fmt.Fprintf(w, "data: chunk0\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			// Hold the stream in-flight until the test closes holdStream:
+			// guarantees an SSE frame is observable while subject.inFlight>=1.
+			if !unblock(r, holdStream) {
+				return
+			}
+			for i := range 2 {
+				fmt.Fprintf(w, "data: chunk%d\n\n", i+1)
+				if fl != nil {
+					fl.Flush()
+				}
+				time.Sleep(30 * time.Millisecond)
+			}
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		if !unblock(r, holdKing) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"cmpl-1"}`)
+	}))
+	defer fake.Close()
+	proxies["subject"] = newTestProxy(fake.URL)
+	proxies["king"] = newTestProxy(fake.URL)
+
+	// Reset the shared registry so assertions see only this test's traffic.
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+
+	ext := httptest.NewServer(buildMux())
+	defer ext.Close()
+	msrv := httptest.NewServer(buildMetricsMux())
+	defer msrv.Close()
+	srv := ext
+
+	// 1. Slow streaming request on "subject": first byte lands after ~150ms.
+	streamDone := make(chan int, 1)
+	go func() {
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"subject","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+		if err != nil {
+			streamDone <- 599
+			return
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		streamDone <- resp.StatusCode
+	}()
+
+	// 2. Open the SSE feed (200ms interval = clamped floor).
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", msrv.URL+"/metrics/stream?interval=200ms", nil)
+	if err != nil {
+		t.Fatalf("SSE request build: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("SSE request: %v", err)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", cc)
+	}
+	if ba := resp.Header.Get("X-Accel-Buffering"); ba != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want no", ba)
+	}
+	fr := sseFrames(t, resp)
+	defer fr.close()
+	deadline := time.Now().Add(10 * time.Second)
+
+	// 3a. Frame while the streaming request is in flight: the streaming
+	// request is in-flight, the limits match the config, and prefill is
+	// absent (all zero).
+	f := fr.waitFor(deadline, func(f *frame) bool {
+		s := frameBackend(t, f, "subject")
+		return len(f.Backends) == 2 && s.InFlight >= 1
+	})
+	subj := frameBackend(t, f, "subject")
+	king := frameBackend(t, f, "king")
+	if f.T <= 0 {
+		t.Errorf("t = %d, want epoch ms > 0", f.T)
+	}
+	if subj.Tier != 1 || king.Tier != 0 {
+		t.Errorf("tiers: subject=%d king=%d, want 1/0", subj.Tier, king.Tier)
+	}
+	if subj.MaxConcurrent != 2 || subj.MaxQueueDepth != 2 {
+		t.Errorf("subject limits = %d/%d, want 2/2", subj.MaxConcurrent, subj.MaxQueueDepth)
+	}
+	if subj.PrefillMax != 0 || subj.PrefillInFlight != 0 || subj.PrefillWaiting != 0 {
+		t.Errorf("subject prefill = %+v, want all 0 (no prefill limit)", subj)
+	}
+	if king.MaxConcurrent != 5 {
+		t.Errorf("king.maxConcurrent = %d, want 5", king.MaxConcurrent)
+	}
+
+	// Release the stream: it now completes, and its sample (TTFT, tokEst,
+	// bytesOut) lands in the counters and burst ring.
+	close(holdStream)
+
+	// 3b. Frame after the stream completes: TTFT sampled from the deliberate
+	// 150ms first-byte delay, token estimate and req counter recorded.
+	wantTok := estimateNewTokens(&parsedBody{
+		Messages: []rawMessage{{Content: json.RawMessage(`"hello"`)}}})
+	if wantTok == 0 {
+		t.Fatal("test fixture must yield a nonzero token estimate")
+	}
+	fDone := fr.waitFor(deadline, func(f *frame) bool {
+		s := frameBackend(t, f, "subject")
+		// Wait for completion, not just the first byte: TTFT lands at first
+		// byte while reqTotal/tokEst land at finish. Waiting only on TTFT
+		// can observe the pre-finish frame and race the counters.
+		return s.ReqTotal >= 1 && s.TTFTSampleCount >= 1
+	})
+	subj = frameBackend(t, fDone, "subject")
+	if subj.ReqTotal < 1 {
+		t.Errorf("subject.reqTotal = %d, want >= 1 (streaming request admitted)", subj.ReqTotal)
+	}
+	if subj.TTFTSampleCount < 1 || subj.TTFTms < 50 {
+		t.Errorf("subject ttft = %v/%d, want >= 50ms with 1 sample (150ms first-byte delay)", subj.TTFTms, subj.TTFTSampleCount)
+	}
+	// TTFT is live: the first-byte sample appears in the frame as soon as
+	// the head byte arrives — before the stream completes.
+	if subj.TTFTMsNow < 50 {
+		t.Errorf("subject.ttftMsNow = %v, want >= 50 (recorded at first byte, not completion)", subj.TTFTMsNow)
+	}
+	if subj.TokEstTotal != int64(wantTok) {
+		t.Errorf("subject.tokEstTotal = %d, want %d (estimate of the test body)", subj.TokEstTotal, wantTok)
+	}
+	if fDone.Totals.ReqTotal < 1 {
+		t.Errorf("totals.reqTotal = %d, want >= 1", fDone.Totals.ReqTotal)
+	}
+
+	// 4. 429 while "king" is busy: tier-1 subject is blocked by tier-0,
+	// and gpu.active reflects the tier-0 in-flight request.
+	kingBusy := make(chan struct{})
+	go func() {
+		resp, err := http.Post(srv.URL+"/v1/completions?model=king", "application/json",
+			strings.NewReader(`{"model":"king","prompt":"slow"}`))
+		if err != nil {
+			close(kingBusy)
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		close(kingBusy)
+	}()
+	fKing := fr.waitFor(deadline, func(f *frame) bool {
+		return f.Tier0Inflight >= 1 && f.GPU.Active
+	})
+	if fKing.Tier0Inflight < 1 {
+		t.Errorf("tier0Inflight = %d, want >= 1 (king in-flight)", fKing.Tier0Inflight)
+	}
+	if !fKing.GPU.Active {
+		t.Errorf("gpu.active = false, want true (tier-0 in-flight > 0)")
+	}
+	if fKing.Totals.InFlight < 1 {
+		t.Errorf("totals.inFlight = %d, want >= 1", fKing.Totals.InFlight)
+	}
+
+	resp2, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"subject","messages":[{"role":"user","content":"now"}]}`))
+	if err != nil {
+		t.Fatalf("blocked request: %v", err)
+	}
+	io.Copy(io.Discard, resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != 429 {
+		t.Errorf("blocked subject = %d, want 429 (blocked-by-tier0)", resp2.StatusCode)
+	}
+	if reason := resp2.Header.Get("X-Router-Reason"); reason != "blocked-by-tier0" {
+		t.Errorf("X-Router-Reason = %q, want blocked-by-tier0", reason)
+	}
+	if status := <-streamDone; status != 200 {
+		t.Errorf("streaming request status = %d, want 200", status)
+	}
+	// The 429 rejection sample is recorded by the handler BEFORE it writes the
+	// response, so it is already in the ring by the time we read it here.
+	// Release king's hold now: its 200 completion sample lands after the 429,
+	// so the rejection is NOT the newest — but the burst assertion below only
+	// requires the 429 be present, not newest. (See step 5.)
+	close(holdKing)
+	<-kingBusy
+
+	// 5. Burst: the 429 rejection must be in the ring with queue-wait dur.
+	burstResp, err := http.Get(msrv.URL + "/metrics/burst")
+	if err != nil {
+		t.Fatalf("burst request: %v", err)
+	}
+	defer burstResp.Body.Close()
+	var burst struct {
+		Requests []burstReq `json:"requests"`
+	}
+	if err := json.NewDecoder(burstResp.Body).Decode(&burst); err != nil {
+		t.Fatalf("burst decode: %v", err)
+	}
+	var rej *burstReq
+	var streamed bool
+	for i := range burst.Requests {
+		rq := &burst.Requests[i]
+		if rq.Status == 429 {
+			rej = rq
+		}
+		if rq.Status == 200 && rq.Stream {
+			streamed = true
+			if rq.TTFTms < 50 || rq.BytesOut <= 0 {
+				t.Errorf("streaming sample ttft=%v bytesOut=%d, want ttft>=50ms and bytesOut>0", rq.TTFTms, rq.BytesOut)
+			}
+		}
+	}
+	if rej == nil {
+		t.Fatalf("no 429 rejection sample in burst: %+v", burst.Requests)
+	}
+	if rej.Backend != "subject" || rej.TTFTms != 0 || rej.BytesOut != 0 {
+		t.Errorf("rejection sample = %+v, want backend=subject ttftMs=0 bytesOut=0", rej)
+	}
+	if !streamed {
+		t.Errorf("no streaming 200 sample in burst: %+v", burst.Requests)
+	}
+	// Deterministic ring order (newest last): [streaming 200, 429, king 200].
+	// The 429 is the newest *rejection* (nothing after it is a 4xx/5xx), and
+	// the newest overall entry is the king's 200 completion (released last).
+	var newestRejectStatus int
+	for _, rq := range burst.Requests {
+		if rq.Status >= 400 {
+			newestRejectStatus = rq.Status
+		}
+	}
+	if newestRejectStatus != 429 {
+		t.Errorf("newest rejection in burst = %d, want 429", newestRejectStatus)
+	}
+	last := burst.Requests[len(burst.Requests)-1]
+	if last.Status != 200 {
+		t.Errorf("newest burst entry = %d, want 200 (king completion)", last.Status)
+	}
+}
+
+// newTestProxy builds a reverse proxy (mirroring main()'s construction) for
+// tests, pointing at an arbitrary upstream URL.
+func newTestProxy(upstream string) *httputil.ReverseProxy {
+	u, err := url.Parse(upstream)
+	if err != nil {
+		panic(err)
+	}
+	p := httputil.NewSingleHostReverseProxy(u)
+	p.FlushInterval = -1
+	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		handleProxyError(w, r, err, "test")
+	}
+	return p
+}
+
+// burstReq mirrors one entry of the /metrics/burst response.
+type burstReq struct {
+	T            int64   `json:"t"`
+	Backend      string  `json:"backend"`
+	Path         string  `json:"path"`
+	Status       int     `json:"status"`
+	Stream       bool    `json:"stream"`
+	DurMs        float64 `json:"durMs"`
+	TTFTms       float64 `json:"ttftMs"`
+	NewTokensEst int     `json:"newTokensEst"`
+	BytesIn      int64   `json:"bytesIn"`
+	BytesOut     int64   `json:"bytesOut"`
+}
+
+// TestMetricsStream_RouteShadowing verifies the proxy moved to /v1/ and that
+// /v1/models + /metrics/stream are distinct, unshadowed routes.
+func TestMetricsStream_RouteShadowing(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"object":"list","data":[{"id":"m1","object":"model","owned_by":"vllm"}]}`)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"id":"proxied"}`)
+		}
+	}))
+	defer fake.Close()
+
+	withRouterEnv(t, []Backend{{Name: "m1", URL: fake.URL, Tier: 0}}, nil, nil)
+	proxies["m1"] = newTestProxy(fake.URL)
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+
+	srv := httptest.NewServer(buildMux())
+	defer srv.Close()
+	msrv := httptest.NewServer(buildMetricsMux())
+	defer msrv.Close()
+
+	// /v1/models serves the merged catalog, not the proxy.
+	resp, err := http.Get(srv.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	var models struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
+		t.Fatalf("models decode: %v", err)
+	}
+	resp.Body.Close()
+	if models.Object != "list" || len(models.Data) != 1 || models.Data[0].ID != "m1" {
+		t.Errorf("models = %+v, want list with m1", models)
+	}
+
+	// /v1/... still proxies.
+	resp2, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"m1","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	var proxied struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&proxied); err != nil {
+		t.Fatalf("proxy decode: %v", err)
+	}
+	resp2.Body.Close()
+	if proxied.ID != "proxied" {
+		t.Errorf("proxied = %+v, want id=proxied", proxied)
+	}
+
+	// /metrics/stream serves SSE on the management mux — and the external
+	// listener no longer exposes it (session data left the public surface).
+	sctx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer scancel()
+	req, err := http.NewRequestWithContext(sctx, "GET", msrv.URL+"/metrics/stream", nil)
+	if err != nil {
+		t.Fatalf("stream request build: %v", err)
+	}
+	resp3, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	if resp3.StatusCode != 200 || resp3.Header.Get("Content-Type") != "text/event-stream" {
+		t.Errorf("stream status/content-type = %d/%q, want 200/text-event-stream", resp3.StatusCode, resp3.Header.Get("Content-Type"))
+	}
+	resp3.Body.Close()
+
+	extResp, err := http.Get(srv.URL + "/metrics/stream")
+	if err != nil {
+		t.Fatalf("external stream request: %v", err)
+	}
+	extResp.Body.Close()
+	if extResp.StatusCode != http.StatusNotFound {
+		t.Errorf("external /metrics/stream = %d, want 404 (management-only route)", extResp.StatusCode)
+	}
+}
+
+func TestHandleBurst_LimitClamp(t *testing.T) {
+	m := newTestMetrics()
+	now := time.Now()
+	for i := range 30 {
+		m.recordRequest("b", requestSample{T: now, Backend: "b", Status: 200, NewTokensEst: i})
+	}
+	saveMetrics := metrics
+	metrics = m
+	t.Cleanup(func() { metrics = saveMetrics })
+
+	srv := httptest.NewServer(buildMetricsMux())
+	defer srv.Close()
+
+	// limit=5 returns exactly 5, newest last.
+	resp, err := http.Get(srv.URL + "/metrics/burst?limit=5")
+	if err != nil {
+		t.Fatalf("burst: %v", err)
+	}
+	var burst struct {
+		Requests []struct {
+			NewTokensEst int `json:"newTokensEst"`
+		} `json:"requests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&burst); err != nil {
+		t.Fatalf("burst decode: %v", err)
+	}
+	resp.Body.Close()
+	if len(burst.Requests) != 5 || burst.Requests[0].NewTokensEst != 25 || burst.Requests[4].NewTokensEst != 29 {
+		t.Errorf("burst?limit=5 = %d entries [%d..%d], want 5 [25..29]",
+			len(burst.Requests), firstTokInt(burst), lastTokInt(burst))
+	}
+
+	// limit over the max is clamped to 1000 (ring has only 30, so 30 back).
+	resp2, err := http.Get(srv.URL + "/metrics/burst?limit=5000")
+	if err != nil {
+		t.Fatalf("burst: %v", err)
+	}
+	var burst2 struct {
+		Requests []struct {
+			NewTokensEst int `json:"newTokensEst"`
+		} `json:"requests"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&burst2); err != nil {
+		t.Fatalf("burst decode: %v", err)
+	}
+	resp2.Body.Close()
+	if len(burst2.Requests) != 30 {
+		t.Errorf("burst?limit=5000 = %d entries, want 30 (clamped)", len(burst2.Requests))
+	}
+}
+
+func firstTokInt(b struct {
+	Requests []struct {
+		NewTokensEst int `json:"newTokensEst"`
+	} `json:"requests"`
+}) int {
+	return b.Requests[0].NewTokensEst
+}
+
+func lastTokInt(b struct {
+	Requests []struct {
+		NewTokensEst int `json:"newTokensEst"`
+	} `json:"requests"`
+}) int {
+	return b.Requests[len(b.Requests)-1].NewTokensEst
+}
+
+// ---------------------------------------------------------------------------
+// Sessions (live stack + conversation view)
+// ---------------------------------------------------------------------------
+
+var hex12 = regexp.MustCompile(`^[0-9a-f]{12}$`)
+
+func sessById(t *testing.T, f sessionsFeed, id string) *sessFrame {
+	t.Helper()
+	for i := range f.Sessions {
+		if f.Sessions[i].ID == id {
+			return &f.Sessions[i]
+		}
+	}
+	t.Fatalf("session %q not in feed: %+v", id, f.Sessions)
+	return nil
+}
+
+func TestSessions_Grouping(t *testing.T) {
+	// Same conversation prefix, different last message → same key.
+	a := &parsedBody{Messages: []rawMessage{
+		{Content: json.RawMessage(`"hi"`)},
+		{Content: json.RawMessage(`"what is up"`)},
+	}}
+	b := &parsedBody{Messages: []rawMessage{
+		{Content: json.RawMessage(`"hi"`)},
+		{Content: json.RawMessage(`"completely different question"`)},
+	}}
+	ka, kb := sessionKeyFor(a), sessionKeyFor(b)
+	if ka == "" || !hex12.MatchString(ka) {
+		t.Fatalf("key = %q, want 12-hex", ka)
+	}
+	if ka != kb {
+		t.Errorf("keys differ for same prefix: %q vs %q", ka, kb)
+	}
+	// Different first message → different key.
+	c := &parsedBody{Messages: []rawMessage{
+		{Content: json.RawMessage(`"hello there"`)},
+		{Content: json.RawMessage(`"what is up"`)},
+	}}
+	if kc := sessionKeyFor(c); kc == ka {
+		t.Errorf("different first message produced same key %q", kc)
+	}
+	// Single message uses itself as the prefix.
+	d := &parsedBody{Messages: []rawMessage{{Content: json.RawMessage(`"hi"`)}}}
+	// Per the identity rule (prefix = all-but-last, single message uses
+	// itself), a one-message chat "hi" and the FIRST turn of a 2-turn chat
+	// "hi" share the same prefix → same key. The fork happens at turn 2.
+	if kd := sessionKeyFor(d); kd != ka {
+		t.Errorf("single-message prefix key = %q, want same as 2-turn first-turn key %q", kd, ka)
+	}
+	// Turn 2 of that chat forks a NEW session: prefix is now both messages.
+	e2 := &parsedBody{Messages: []rawMessage{
+		{Content: json.RawMessage(`"hi"`)},
+		{Content: json.RawMessage(`"second"`)},
+		{Content: json.RawMessage(`"third"`)},
+	}}
+	if k2 := sessionKeyFor(e2); k2 == ka {
+		t.Errorf("3-turn prefix collided with 1-turn key: %q", k2)
+	}
+	// Completions (prompt only, no messages) → no session.
+	e := &parsedBody{Prompt: json.RawMessage(`"write a poem"`)}
+	if ke := sessionKeyFor(e); ke != "" {
+		t.Errorf("completions key = %q, want empty (no session)", ke)
+	}
+}
+
+func TestSessions_LiveFinishFlow(t *testing.T) {
+	r := newSessionRegistry()
+
+	id := r.start("b1", "/v1/chat/completions", true, "abcdef012345", 100, 40)
+	f := r.feed()
+	if len(f.Live) != 1 {
+		t.Fatalf("live = %d, want 1", len(f.Live))
+	}
+	l := f.Live[0]
+	if l.ID != id || l.Sess != "abcdef012345" || l.Backend != "b1" ||
+		l.Path != "/v1/chat/completions" || !l.Stream || l.Phase != "admitted" ||
+		l.CtxTok != 100 || l.NewTok != 40 {
+		t.Errorf("live entry = %+v, want admitted stream req", l)
+	}
+	if s := sessById(t, f, "abcdef012345"); s.LiveN != 1 || !s.Active || s.N != 0 {
+		t.Errorf("session while live = %+v, want liveN=1 active n=0", s)
+	}
+
+	r.firstByte(id)
+	f = r.feed()
+	if len(f.Live) != 1 || f.Live[0].Phase != "streaming" {
+		t.Fatalf("phase after firstByte = %q, want streaming", f.Live[0].Phase)
+	}
+
+	// finish: 200 streaming, dur 2000ms, ttft 150ms, 800 bytes out.
+	r.finish(id, 200, 2000, 150, 800)
+	f = r.feed()
+	if len(f.Live) != 0 {
+		t.Fatalf("live after finish = %d, want 0", len(f.Live))
+	}
+	s := sessById(t, f, "abcdef012345")
+	if s.N != 1 || s.LiveN != 0 || s.LastStatus != 200 {
+		t.Errorf("session after finish = %+v, want n=1 liveN=0 status=200", s)
+	}
+	if s.CtxTok != 100 || s.NewTok != 40 || s.CachedTok != 60 {
+		t.Errorf("tokens = ctx %d new %d cached %d, want 100/40/60", s.CtxTok, s.NewTok, s.CachedTok)
+	}
+	if s.TokOutTotal != 200 { // 800 bytes / 4
+		t.Errorf("tokOutTotal = %d, want 200", s.TokOutTotal)
+	}
+	if math.Abs(s.AvgTTFTMs-150) > 0.001 {
+		t.Errorf("avgTTFTMs = %v, want 150", s.AvgTTFTMs)
+	}
+	if math.Abs(s.TotalDurS-2) > 0.001 {
+		t.Errorf("totalDurS = %v, want 2", s.TotalDurS)
+	}
+	if s.Reqs == nil || len(s.Reqs) != 1 {
+		t.Fatalf("reqs = %+v, want 1 entry (active+recent+top20)", s.Reqs)
+	}
+	q := s.Reqs[0]
+	if q.Status != 200 || !q.Stream || q.CtxTok != 100 || q.NewTok != 40 ||
+		q.CachedTok != 60 || q.TokOut != 200 {
+		t.Errorf("req = %+v, want 200 stream ctx100/new40/cached60/tokOut200", q)
+	}
+	if math.Abs(q.DurMs-2000) > 0.001 || math.Abs(q.TTFTms-150) > 0.001 {
+		t.Errorf("req dur/ttft = %v/%v, want 2000/150", q.DurMs, q.TTFTms)
+	}
+	if math.Abs(q.TokS-100) > 0.001 {
+		t.Errorf("req tokS = %v, want 100 (200 tok / 2s)", q.TokS)
+	}
+
+	// A rejection for the same conversation: n=2, 429 in reqs (oldest first).
+	r.finishRejection("b1", "/v1/chat/completions", "abcdef012345", 100, 40, 429, 12.5)
+	f = r.feed()
+	s = sessById(t, f, "abcdef012345")
+	if s.N != 2 {
+		t.Fatalf("n after rejection = %d, want 2", s.N)
+	}
+	if len(s.Reqs) != 2 || s.Reqs[0].Status != 200 || s.Reqs[1].Status != 429 {
+		t.Errorf("reqs order = %+v, want [200, 429] oldest first", s.Reqs)
+	}
+	if s.LastStatus != 429 {
+		t.Errorf("lastStatus = %d, want 429 (rejection is latest)", s.LastStatus)
+	}
+	// The streaming-only TTFT avg must not be polluted by the rejection.
+	if math.Abs(s.AvgTTFTMs-150) > 0.001 {
+		t.Errorf("avgTTFTMs = %v, want 150 (rejection has no ttft)", s.AvgTTFTMs)
+	}
+
+	// A second request under the SAME key → same session id, n=3.
+	id2 := r.start("b1", "/v1/chat/completions", true, "abcdef012345", 130, 20)
+	f = r.feed()
+	s = sessById(t, f, "abcdef012345")
+	if s.LiveN != 1 {
+		t.Errorf("liveN after 2nd start = %d, want 1", s.LiveN)
+	}
+	// ctx/newTok track the LATEST request.
+	if s.CtxTok != 130 || s.NewTok != 20 {
+		t.Errorf("ctx/new = %d/%d, want 130/20 (latest request)", s.CtxTok, s.NewTok)
+	}
+	r.finish(id2, 200, 1000, 0, 400) // non-stream ttft 0 → avg unchanged
+
+	// A different key → a NEW session.
+	other := "999999999999"
+	r.finishRejection("b1", "/v1/chat/completions", other, 50, 10, 429, 1)
+	f = r.feed()
+	if len(f.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want 2 (distinct keys)", len(f.Sessions))
+	}
+	o := sessById(t, f, other)
+	if o.N != 1 || o.Backend != "b1" {
+		t.Errorf("other session = %+v, want n=1 b1", o)
+	}
+
+	// Non-chat requests: sess "" — never in the session list.
+	nc := r.start("b1", "/v1/completions", false, "", 7, 3)
+	r.finish(nc, 200, 500, 0, 100)
+	f = r.feed()
+	if len(f.Sessions) != 2 {
+		t.Errorf("sessions after non-chat = %d, want 2 (non-chat excluded)", len(f.Sessions))
+	}
+}
+
+func TestSessions_PrefillProgress(t *testing.T) {
+	r := newSessionRegistry()
+
+	// newTok=20000 at the default 10000 tok/s → estPrefillMs = 2000.
+	id := r.start("b1", "/v1/chat/completions", true, "abcdef012345", 500, 20000)
+	f := r.feed()
+	if len(f.Live) != 1 {
+		t.Fatalf("live = %d, want 1", len(f.Live))
+	}
+	l := f.Live[0]
+	if l.Phase != "admitted" || l.StreamMs != 0 {
+		t.Errorf("admitted = phase %q streamMs %d, want admitted/0", l.Phase, l.StreamMs)
+	}
+	if l.EstPrefillMs < 1999 || l.EstPrefillMs > 2001 {
+		t.Errorf("estPrefillMs = %d, want 2000±1", l.EstPrefillMs)
+	}
+
+	// first byte: phase flips and streamMs becomes the wall timestamp.
+	r.firstByte(id)
+	f = r.feed()
+	l = f.Live[0]
+	if l.Phase != "streaming" {
+		t.Fatalf("phase after firstByte = %q, want streaming", l.Phase)
+	}
+	if l.StreamMs < l.StartMs || l.StreamMs > time.Now().UnixMilli() {
+		t.Errorf("streamMs = %d, want within [startMs %d, now]", l.StreamMs, l.StartMs)
+	}
+
+	// Non-streaming requests get no estimate (their first byte marks
+	// generation end, not prefill end).
+	ns := r.start("b1", "/v1/chat/completions", false, "", 100, 20000)
+	f = r.feed()
+	var nsFrame *sessLiveFrame
+	for i := range f.Live {
+		if f.Live[i].ID == ns {
+			nsFrame = &f.Live[i]
+		}
+	}
+	if nsFrame == nil {
+		t.Fatalf("non-streaming live entry missing")
+	}
+	if nsFrame.EstPrefillMs != 0 {
+		t.Errorf("non-streaming estPrefillMs = %d, want 0", nsFrame.EstPrefillMs)
+	}
+}
+
+func TestSessions_Caps(t *testing.T) {
+	r := newSessionRegistry()
+	// 105 starts: live ordering must be startMs ascending (oldest on top)
+	// and the feed must respect the 256 cap (all 105 fit here).
+	ids := make([]uint64, 0, 105)
+	for range 105 {
+		ids = append(ids, r.start("b1", "/v1/chat/completions", false, "", 1, 1))
+	}
+	f := r.feed()
+	if len(f.Live) != 105 {
+		t.Fatalf("live = %d, want 105 (under the 256 feed cap)", len(f.Live))
+	}
+	for i := 1; i < len(f.Live); i++ {
+		if f.Live[i].StartMs < f.Live[i-1].StartMs {
+			t.Fatalf("live not startMs ASC at %d: %d < %d", i, f.Live[i].StartMs, f.Live[i-1].StartMs)
+		}
+	}
+	if f.Live[0].ID != ids[0] {
+		t.Errorf("oldest on top: live[0].ID = %d, want %d", f.Live[0].ID, ids[0])
+	}
+
+	// reqs-inclusion rule: 3 sessions, only the active/recent one carries
+	// non-nil reqs. S3 completed long ago (its lastMs is old, no live).
+	k3 := "c33c33c33c33"
+	id3 := r.start("b1", "/v1/chat/completions", true, k3, 10, 5)
+	r.finish(id3, 200, 100, 50, 200)
+	// Backdate S3 well past the 60s reqs window.
+	r.mu.Lock()
+	r.sessions[k3].LastMs = time.Now().Add(-10 * time.Minute).UnixMilli()
+	r.mu.Unlock()
+
+	k1 := "c11c11c11c11"
+	id1 := r.start("b1", "/v1/chat/completions", true, k1, 10, 5)
+	r.finish(id1, 200, 100, 50, 200) // recent → reqs included
+	time.Sleep(10 * time.Millisecond)
+	k2 := "c22c22c22c22"
+	id2 := r.start("b1", "/v1/chat/completions", true, k2, 10, 5) // stays live
+	_ = id2
+	id2b := r.start("b1", "/v1/chat/completions", true, k2, 10, 5)
+	// S2 has a completed req (recent lastMs, newer than S1) AND a live
+	// request → active and most recent → sorts first.
+	r.finish(id2b, 200, 100, 50, 200)
+
+	f = r.feed()
+	s1 := sessById(t, f, k1)
+	s2 := sessById(t, f, k2)
+	s3 := sessById(t, f, k3)
+	if s1.Reqs == nil {
+		t.Errorf("s1 reqs = nil, want non-nil (recent, within 60s)")
+	}
+	if s2.Reqs == nil {
+		t.Errorf("s2 reqs = nil, want non-nil (live request present)")
+	}
+	if s3.Reqs != nil {
+		t.Errorf("s3 reqs = %+v, want nil (lastMs older than 60s window)", s3.Reqs)
+	}
+	// Sort: active (s2, liveN>0) first, then by lastMs desc.
+	if f.Sessions[0].ID != k2 {
+		t.Errorf("sessions[0] = %s, want %s (active first)", f.Sessions[0].ID, k2)
+	}
+	if f.Sessions[1].ID != k1 {
+		t.Errorf("sessions[1] = %s, want %s (most recent lastMs)", f.Sessions[1].ID, k1)
+	}
+	if f.Sessions[2].ID != k3 {
+		t.Errorf("sessions[2] = %s, want %s (least recent)", f.Sessions[2].ID, k3)
+	}
+	if !s2.Active || !s1.Active || s3.Active {
+		t.Errorf("active flags: s2=%v s1=%v s3=%v, want true/true/false", s2.Active, s1.Active, s3.Active)
+	}
+	if s2.LiveN != 1 {
+		t.Errorf("s2 liveN = %d, want 1 (id2 still in-flight)", s2.LiveN)
+	}
+	// Live stack: 105 + id2 (id3/id1/id2b all finished). Ordering ASC.
+	if len(f.Live) != 106 {
+		t.Fatalf("live = %d, want 106", len(f.Live))
+	}
+	for i := 1; i < len(f.Live); i++ {
+		if f.Live[i].StartMs < f.Live[i-1].StartMs {
+			t.Fatalf("live not startMs ASC at %d", i)
+		}
+	}
+}
+
+func TestSessions_FeedJSON(t *testing.T) {
+	r := newSessionRegistry()
+	saveSessions := sessions
+	sessions = r
+	t.Cleanup(func() { sessions = saveSessions })
+
+	srv := httptest.NewServer(buildMetricsMux())
+	defer srv.Close()
+
+	// A chat request (12-hex session) and a non-chat request (sess "").
+	a := &parsedBody{Messages: []rawMessage{{Content: json.RawMessage(`"ping"`)}}}
+	ka := sessionKeyFor(a)
+	idA := sessions.start("b1", "/v1/chat/completions", true, ka, 200, 50)
+	idB := sessions.start("b1", "/v1/completions", false, "", 10, 5)
+	_ = idB
+	time.Sleep(10 * time.Millisecond)
+	sessions.firstByte(idA)
+
+	resp, err := http.Get(srv.URL + "/metrics/sessions")
+	if err != nil {
+		t.Fatalf("sessions request: %v", err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var out struct {
+		T    int64 `json:"t"`
+		Live []struct {
+			ID      uint64 `json:"id"`
+			Sess    string `json:"sess"`
+			Backend string `json:"backend"`
+			Path    string `json:"path"`
+			Stream  bool   `json:"stream"`
+			Phase   string `json:"phase"`
+			StartMs int64  `json:"startMs"`
+			CtxTok  int    `json:"ctxTok"`
+			NewTok  int    `json:"newTok"`
+		} `json:"live"`
+		Sessions []struct {
+			ID          string  `json:"id"`
+			Backend     string  `json:"backend"`
+			N           int     `json:"n"`
+			FirstMs     int64   `json:"firstMs"`
+			LastMs      int64   `json:"lastMs"`
+			Active      bool    `json:"active"`
+			LiveN       int     `json:"liveN"`
+			CtxTok      int     `json:"ctxTok"`
+			NewTok      int     `json:"newTok"`
+			CachedTok   int     `json:"cachedTok"`
+			AvgTTFTMs   float64 `json:"avgTTFTMs"`
+			TotalDurS   float64 `json:"totalDurS"`
+			TokOutTotal int64   `json:"tokOutTotal"`
+			LastStatus  int     `json:"lastStatus"`
+			Reqs        []struct {
+				TMs       int64   `json:"tMs"`
+				Status    int     `json:"status"`
+				Stream    bool    `json:"stream"`
+				DurMs     float64 `json:"durMs"`
+				TTFTms    float64 `json:"ttftMs"`
+				CtxTok    int     `json:"ctxTok"`
+				NewTok    int     `json:"newTok"`
+				CachedTok int     `json:"cachedTok"`
+				TokOut    int     `json:"tokOut"`
+				TokS      float64 `json:"tokS"`
+			} `json:"reqs"`
+		} `json:"sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("sessions decode: %v", err)
+	}
+	if d := time.Now().UnixMilli() - out.T; d < 0 || d > 5000 {
+		t.Errorf("t = %d, want near now (%d)", out.T, time.Now().UnixMilli())
+	}
+	if len(out.Live) != 2 {
+		t.Fatalf("live = %d, want 2", len(out.Live))
+	}
+	// live sorted startMs ASC.
+	if out.Live[0].StartMs > out.Live[1].StartMs {
+		t.Errorf("live order = %d then %d, want ASC", out.Live[0].StartMs, out.Live[1].StartMs)
+	}
+	// Chat session: 12-hex id, streaming phase after firstByte, est tokens.
+	chatIdx, nonChatIdx := -1, -1
+	for i := range out.Live {
+		switch out.Live[i].Sess {
+		case ka:
+			chatIdx = i
+		case "":
+			nonChatIdx = i
+		}
+	}
+	if chatIdx < 0 || nonChatIdx < 0 {
+		t.Fatalf("live entries missing chat/non-chat; got %+v", out.Live)
+	}
+	chat, nonChat := out.Live[chatIdx], out.Live[nonChatIdx]
+	if !hex12.MatchString(chat.Sess) {
+		t.Errorf("chat sess = %q, want 12-hex", chat.Sess)
+	}
+	if chat.Phase != "streaming" {
+		t.Errorf("chat phase = %q, want streaming (firstByte fired)", chat.Phase)
+	}
+	if chat.CtxTok != 200 {
+		t.Errorf("chat ctxTok = %d, want 200", chat.CtxTok)
+	}
+	if nonChat.Sess != "" {
+		t.Errorf("non-chat sess = %q, want empty", nonChat.Sess)
+	}
+	// sessions: only the chat one (non-chat never creates a session).
+	if len(out.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1 (non-chat excluded)", len(out.Sessions))
+	}
+	sj := out.Sessions[0]
+	if sj.ID != ka || !sj.Active || sj.LiveN != 1 {
+		t.Errorf("session = %+v, want id=%s active liveN=1", sj, ka)
+	}
+	if sj.CtxTok != 200 || sj.NewTok != 50 || sj.CachedTok != 150 {
+		t.Errorf("session tokens = %d/%d/%d, want 200/50/150", sj.CtxTok, sj.NewTok, sj.CachedTok)
+	}
+	// A live session has no completed reqs yet: reqs is an empty slice (the
+	// session is active+recent+top20) — but N=0 means nothing was appended,
+	// so the ring is empty and the JSON is [] not null.
+	if sj.Reqs == nil {
+		t.Errorf("session reqs = null, want [] (active+recent, no completions yet)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// history store, device telemetry, fleet aggregation
+// ---------------------------------------------------------------------------
+
+func TestHistory_RangeTable(t *testing.T) {
+	want := map[string]struct {
+		dur  time.Duration
+		step time.Duration
+	}{
+		"5m":  {5 * time.Minute, time.Second},
+		"1h":  {time.Hour, 5 * time.Second},
+		"6h":  {6 * time.Hour, time.Minute},
+		"24h": {24 * time.Hour, 2 * time.Minute},
+		"7d":  {7 * 24 * time.Hour, 15 * time.Minute},
+		"30d": {30 * 24 * time.Hour, time.Hour},
+	}
+	for name, w := range want {
+		r, ok := historyRanges[name]
+		if !ok {
+			t.Fatalf("missing range %q", name)
+		}
+		if r.Dur != w.dur || r.Step != w.step {
+			t.Errorf("%s = %v/%v, want %v/%v", name, r.Dur, r.Step, w.dur, w.step)
+		}
+		if n := int(r.Dur / r.Step); n > 720 {
+			t.Errorf("%s has %d points, want ≤720", name, n)
+		}
+	}
+}
+
+func TestHistory_BuildSeriesBuckets(t *testing.T) {
+	from := int64(1_000_000)
+	const step = int64(5000)
+	pts := []historyPoint{}
+	mk := func(t int64, inFlight, kv float64) historyPoint {
+		var p historyPoint
+		p.T = t
+		hpSet(&p, hiInFlight, inFlight)
+		hpSet(&p, hiKVPct, kv)
+		hpSet(&p, hiKVMax, kv)
+		return p
+	}
+	pts = append(pts, mk(from, 1, 10))
+	pts = append(pts, mk(from+1000, 3, 90))
+	pts = append(pts, mk(from+5000, 5, 50))
+	pts = append(pts, mk(from+20000, 9, 99)) // outside the 3 buckets
+
+	out := buildHistSeries("b", pts, from, step, 3)
+	if len(out.T) != 3 || out.T[0] != from || out.T[1] != from+step || out.T[2] != from+2*step {
+		t.Fatalf("grid = %v, want from+i*step", out.T)
+	}
+	in := out.Series["inFlight"]
+	if in[0] == nil || math.Abs(*in[0]-2) > 1e-9 {
+		t.Errorf("bucket0 inFlight = %v, want avg 2", in[0])
+	}
+	if in[1] == nil || *in[1] != 5 {
+		t.Errorf("bucket1 inFlight = %v, want 5", in[1])
+	}
+	if in[2] != nil {
+		t.Errorf("empty bucket = %v, want null", *in[2])
+	}
+	kv := out.Series["kvMax"]
+	if kv[0] == nil || *kv[0] != 90 {
+		t.Errorf("bucket0 kvMax = %v, want max 90 (not avg 50)", kv[0])
+	}
+	kvp := out.Series["kvPct"]
+	if kvp[0] == nil || math.Abs(*kvp[0]-50) > 1e-9 {
+		t.Errorf("bucket0 kvPct = %v, want avg 50", kvp[0])
+	}
+}
+
+func TestHistory_SnapshotRoundTrip(t *testing.T) {
+	path := t.TempDir() + "/history.gob"
+	h := newHistoryStore()
+	h.configure(path)
+	now := time.Now().UnixMilli()
+	var p historyPoint
+	p.T = now - 2000
+	hpSet(&p, hiInFlight, 7)
+	hpSet(&p, hiKVPct, 42)
+	s := newSeriesHistory()
+	s.add(p, now-2000)
+	h.backends["b"] = s
+	fp := p
+	h.fleet.add(fp, now-2000)
+	var gp gpuPoint
+	gp.T = now - 2000
+	gp.V[guUtil] = 88
+	gp.Flags = 1 << guUtil
+	gs := newGPUSeries()
+	gs.add(gp, now-2000)
+	h.gpus["GPU-1"] = gs
+	h.save()
+
+	h2 := newHistoryStore()
+	h2.configure(path)
+	if got := len(h2.backends["b"].raw.ordered()); got != 1 {
+		t.Fatalf("loaded backend raw points = %d, want 1", got)
+	}
+	if got := len(h2.fleet.raw.ordered()); got != 1 {
+		t.Fatalf("loaded fleet raw points = %d, want 1", got)
+	}
+	if got := len(h2.gpus["GPU-1"].raw.ordered()); got != 1 {
+		t.Fatalf("loaded gpu raw points = %d, want 1", got)
+	}
+}
+
+func TestHistory_QueryDenseArrays(t *testing.T) {
+	h := newHistoryStore()
+	now := time.Now().UnixMilli()
+	for i := 0; i < 5; i++ {
+		var p historyPoint
+		p.T = now - int64(i)*1000
+		hpSet(&p, hiInFlight, float64(i))
+		s, ok := h.backends["b"]
+		if !ok {
+			s = newSeriesHistory()
+			h.backends["b"] = s
+		}
+		s.add(p, p.T)
+	}
+	// The 5m window's final bucket is [floor(now,1s)-1s, floor(now,1s)):
+	// it is the previous, not the current, second, so the seeded points
+	// (now-0..3s) land in the excluded top second and the final bucket can
+	// be empty. Seed a point in the final bucket directly.
+	var lp historyPoint
+	lp.T = now/1000*1000 - 500
+	hpSet(&lp, hiInFlight, 3.5)
+	if s, ok := h.backends["b"]; ok {
+		s.add(lp, lp.T)
+	}
+	resp := h.query("5m", []string{"b"})
+	if resp.StepMs != 1000 || len(resp.Backends) != 1 {
+		t.Fatalf("response = step %d backends %d, want 1000/1", resp.StepMs, len(resp.Backends))
+	}
+	if len(resp.Backends[0].T) != 300 {
+		t.Fatalf("points = %d, want 300 (5m/1s)", len(resp.Backends[0].T))
+	}
+	arr := resp.Backends[0].Series["inFlight"]
+	if len(arr) != 300 {
+		t.Fatalf("inFlight array = %d, want 300", len(arr))
+	}
+	last := arr[len(arr)-1]
+	if last == nil {
+		t.Fatalf("last bucket is null, want a sampled value")
+	}
+	if resp.TTFT.N != 0 || resp.TTFT.P50 != 0 {
+		t.Errorf("ttft summary = %+v, want empty (no router samples)", resp.TTFT)
+	}
+}
+
+func TestHistory_ConcurrentQueryAndSample(t *testing.T) {
+	h := newHistoryStore()
+	now := time.Now().UnixMilli()
+	s := newSeriesHistory()
+	h.backends["b"] = s
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var p historyPoint
+			p.T = now - int64(i)*1000
+			hpSet(&p, hiInFlight, float64(i))
+			h.mu.Lock()
+			s.add(p, p.T)
+			h.mu.Unlock()
+		}(i)
+	}
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = h.query("5m", []string{"b"})
+		}()
+	}
+	wg.Wait()
+}
+
+func TestGPU_ParseDevices(t *testing.T) {
+	body := `
+DCGM_FI_DEV_GPU_UTIL{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 87
+DCGM_FI_DEV_FB_USED{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 61000
+DCGM_FI_DEV_FB_FREE{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 20000
+DCGM_FI_DEV_GPU_TEMP{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 71
+DCGM_FI_DEV_POWER_USAGE{Hostname="h1",gpu="0",UUID="GPU-aaa",modelName="H100"} 402.5
+nvidia_smi_utilization_gpu_ratio{gpu="1",name="A100",uuid="GPU-bbb"} 0.5
+nvidia_smi_memory_used_bytes{gpu="1",name="A100",uuid="GPU-bbb"} 1073741824
+nvidia_smi_memory_total_bytes{gpu="1",name="A100",uuid="GPU-bbb"} 2147483648
+`
+	out := parseGPUDevices(parsePromText([]byte(body)))
+	if len(out) != 2 {
+		t.Fatalf("devices = %d, want 2", len(out))
+	}
+	byKey := map[string]gpuDeviceFrame{}
+	for _, d := range out {
+		byKey[d.Key] = d
+	}
+	d := byKey["GPU-aaa"]
+	if d.UtilPct != 87 || d.MemUsedMB != 61000 || d.MemTotalMB != 81000 || d.TempC == nil || *d.TempC != 71 || d.PowerW == nil || *d.PowerW != 402.5 {
+		t.Errorf("dcgm device = %+v, want util 87, mem 61000/81000 (used+free), temp 71, power 402.5", d)
+	}
+	n := byKey["GPU-bbb"]
+	if n.UtilPct != 50 || n.MemUsedMB != 1024 || n.MemTotalMB != 2048 {
+		t.Errorf("nvidia device = %+v, want util 50, mem 1024/2048 MiB", n)
+	}
+}
+
+func TestGPU_ParseDevices_FiniteOverflowGuarded(t *testing.T) {
+	// Finite samples that make derived values non-finite: a ratio that
+	// overflows the *100 scale, and used+free that overflows a derived
+	// total. Neither may reach json.Marshal as Inf/NaN.
+	body := `
+nvidia_smi_utilization_gpu_ratio{gpu="9",name="Over",uuid="GPU-ovf"} 1.7e308
+DCGM_FI_DEV_FB_USED{gpu="8",name="Big",UUID="GPU-big"} 1.7e308
+DCGM_FI_DEV_FB_FREE{gpu="8",name="Big",UUID="GPU-big"} 1.7e308
+DCGM_FI_DEV_GPU_UTIL{gpu="7",name="Ok",UUID="GPU-ok"} 42
+`
+	out := parseGPUDevices(parsePromText([]byte(body)))
+	byKey := map[string]gpuDeviceFrame{}
+	for _, d := range out {
+		byKey[d.Key] = d
+	}
+	if _, ok := byKey["GPU-ovf"]; ok {
+		t.Errorf("overflowing ratio device present: %+v, want dropped", byKey["GPU-ovf"])
+	}
+	b, ok := byKey["GPU-big"]
+	if !ok {
+		t.Fatalf("big-mem device missing: %+v", out)
+	}
+	if math.IsInf(b.MemTotalMB, 0) || math.IsNaN(b.MemTotalMB) {
+		t.Errorf("derived MemTotalMB = %v, want finite 0 (overflow guarded)", b.MemTotalMB)
+	}
+	if b.MemTotalMB != 0 {
+		t.Errorf("MemTotalMB = %v, want 0 (no TOTAL sample, overflowed fallback)", b.MemTotalMB)
+	}
+	k, ok := byKey["GPU-ok"]
+	if !ok || k.UtilPct != 42 {
+		t.Errorf("ok device = %+v, want util 42", k)
+	}
+}
+
+func TestFleetAggregates_GatesNonOKEngines(t *testing.T) {
+	f := metricsFrame{Backends: []backendFrame{
+		{TTFTms: 100, TTFTSampleCount: 10, Engine: engineView{
+			Status: "ok", Running: 2, Waiting: 1, PrefillTokS: 10, PrefillCacheTokS: 4,
+			DecodeTokS: 20, KVPct: 80, HitRate: 0.5,
+		}},
+		{TTFTms: 900, TTFTSampleCount: 30, Engine: engineView{
+			Status: "err", Running: 99, Waiting: 99, PrefillTokS: 99,
+			DecodeTokS: 99, KVPct: 99, HitRate: 0.9,
+		}},
+	}}
+	applyFleetAggregates(&f)
+	tt := f.Totals
+	if tt.EngineOK != 1 || tt.EngineRunning != 2 || tt.EngineWaiting != 1 {
+		t.Errorf("engine sums = ok %d running %v waiting %v, want 1/2/1 (err excluded)", tt.EngineOK, tt.EngineRunning, tt.EngineWaiting)
+	}
+	if tt.PrefillTokS != 10 || tt.PrefillCacheTokS != 4 || tt.DecodeTokS != 20 {
+		t.Errorf("token sums = %+v, want 10/4/20", tt)
+	}
+	if tt.KVPeak != 80 {
+		t.Errorf("kvPeak = %v, want 80 (err excluded)", tt.KVPeak)
+	}
+	if math.Abs(tt.TTFTMs-700) > 1e-9 || tt.TTFTSampleCount != 40 {
+		t.Errorf("ttft = %v n=%d, want 700/40 (sample-weighted)", tt.TTFTMs, tt.TTFTSampleCount)
+	}
+	if math.Abs(tt.HitRate-0.5) > 1e-9 {
+		t.Errorf("hitRate = %v, want 0.5", tt.HitRate)
+	}
+}
+
+func TestEngine_HistogramDisappears(t *testing.T) {
+	s := &engineScrape{counters: map[string]float64{}, cTimes: map[string]time.Time{}, hists: map[string]*histState{}}
+	base := `
+vllm:num_requests_running{model_name="m",engine="0"} 1
+vllm:time_to_first_token_seconds_sum{model_name="m"} 1.0
+vllm:time_to_first_token_seconds_count{model_name="m"} 2
+`
+	s.scrapeBody(parsePromText([]byte(base)))
+	next := `
+vllm:num_requests_running{model_name="m",engine="0"} 1
+vllm:time_to_first_token_seconds_sum{model_name="m"} 1.6
+vllm:time_to_first_token_seconds_count{model_name="m"} 4
+`
+	rewindBaselines(s, 2*time.Second)
+	s.scrapeBody(parsePromText([]byte(next)))
+	if s.view.TTFTSamples == 0 || s.view.TTFTms == 0 {
+		t.Fatalf("after delta: ttft=%v samples=%d, want a mean and count", s.view.TTFTms, s.view.TTFTSamples)
+	}
+	gone := `
+vllm:num_requests_running{model_name="m",engine="0"} 1
+`
+	s.scrapeBody(parsePromText([]byte(gone)))
+	if s.view.TTFTSamples != 0 || s.view.TTFTms != 0 {
+		t.Errorf("after histogram disappearance: ttft=%v samples=%d, want 0/0 (not a stale mean)", s.view.TTFTms, s.view.TTFTSamples)
+	}
+}
+
+func TestEngine_RecoveryBaselineOnly(t *testing.T) {
+	s := &engineScrape{counters: map[string]float64{}, cTimes: map[string]time.Time{}, hists: map[string]*histState{}}
+	body := func(v float64) []byte {
+		return []byte(fmt.Sprintf("vllm:prompt_tokens_total{model_name=\"m\"} %v\n", v))
+	}
+	s.scrapeBody(parsePromText(body(100)))
+	rewindBaselines(s, 2*time.Second)
+	s.scrapeBody(parsePromText(body(140)))
+	if s.view.DecodeTokS != 0 || s.view.PrefillTokS <= 0 {
+		// prompt tokens feed prefill when no by_source exists.
+		t.Fatalf("after delta prefill=%v, want >0", s.view.PrefillTokS)
+	}
+	s.resetBaselines()
+	s.scrapeBody(parsePromText(body(180)))
+	if s.view.PrefillTokS != 0 {
+		t.Errorf("first scrape after reset = %v, want 0 (baseline-only)", s.view.PrefillTokS)
+	}
+	rewindBaselines(s, 2*time.Second)
+	s.scrapeBody(parsePromText(body(220)))
+	if s.view.PrefillTokS <= 0 {
+		t.Errorf("post-recovery delta = %v, want >0", s.view.PrefillTokS)
+	}
+}
+
+func TestSessions_EvictionKeepsLiveAggregate(t *testing.T) {
+	r := newSessionRegistry()
+	id := r.start("b", "/v1/chat/completions", true, "live-session", 10, 5)
+	for i := 0; i < sessStoreCap+5; i++ {
+		key := fmt.Sprintf("s%04d", i)
+		r.mu.Lock()
+		r.put(key, &sessionAgg{ID: key, Backend: "b", FirstMs: 1, LastMs: int64(i)})
+		r.mu.Unlock()
+	}
+	f := r.feed()
+	s := sessById(t, f, "live-session")
+	if s.LiveN != 1 || !s.Active {
+		t.Fatalf("live session after store pressure = %+v, want liveN=1 active (never evicted while live)", s)
+	}
+	r.finish(id, 200, 100, 40, 400)
+	f = r.feed()
+	s = sessById(t, f, "live-session")
+	if s.LiveN != 0 || s.N != 1 {
+		t.Errorf("after finish = liveN %d n %d, want 0/1", s.LiveN, s.N)
+	}
+}
+
+func TestSessionKey_RoleFraming(t *testing.T) {
+	a := &parsedBody{Messages: []rawMessage{
+		{Role: "user", Content: json.RawMessage(`"hi"`)},
+		{Role: "assistant", Content: json.RawMessage(`"hello"`)},
+	}}
+	b := &parsedBody{Messages: []rawMessage{
+		{Role: "assistant", Content: json.RawMessage(`"hi"`)},
+		{Role: "assistant", Content: json.RawMessage(`"hello"`)},
+	}}
+	if sessionKeyFor(a) == sessionKeyFor(b) {
+		t.Errorf("role difference produced the same session key")
+	}
+}
+
+func TestGPU_ParseFakeBody(t *testing.T) {
+	body := []byte(`DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 75.4205088076072
+DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 61000
+DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 81920
+DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52.018398644374244
+DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52000
+DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 81920
+`)
+	out := parseGPUDevices(parsePromText(body))
+	if len(out) != 2 {
+		t.Fatalf("devices = %d (%+v), want 2", len(out), out)
+	}
+}
+
+func TestRespTracker_ProxiedRequestIsNotARejection(t *testing.T) {
+	old := metrics
+	metrics = newMetricsRegistry()
+	defer func() { metrics = old }()
+
+	tr := &respTracker{
+		ResponseWriter: httptest.NewRecorder(),
+		backend:        "b",
+		reqStart:       time.Now().Add(-time.Second),
+		stream:         true,
+		bytesIn:        128,
+	}
+	tr.finish("b", "/v1/chat/completions", 200, 250, 400)
+	s := metrics.snapshot("b")
+	if s.ReqTotal != 1 || s.RejectedTotal != 0 {
+		t.Fatalf("proxied completion: reqTotal=%d rejectTotal=%d, want 1/0", s.ReqTotal, s.RejectedTotal)
+	}
+
+	// A router-originated rejection still counts as a rejected sample.
+	metrics.recordRequest("b", requestSample{Backend: "b", Status: 429, BytesIn: 10})
+	s = metrics.snapshot("b")
+	if s.ReqTotal != 2 || s.RejectedTotal != 1 {
+		t.Fatalf("after rejection: reqTotal=%d rejectTotal=%d, want 2/1", s.ReqTotal, s.RejectedTotal)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// float32 narrowing guards (history + GPU storage boundary)
+// ---------------------------------------------------------------------------
+
+func TestHistory_HpSet_Float32OverflowRejected(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      float64
+		wantSet bool
+		wantVal float32
+	}{
+		{"zero", 0, true, 0},
+		{"fraction", 0.42, true, 0.42},
+		{"large finite in float32 range", 1e30, true, 1e30},
+		{"float32 max", math.MaxFloat32, true, math.MaxFloat32},
+		{"past float32 max, finite float64", 1e100, false, 0},
+		{"overflow to +Inf", 1e308, false, 0},
+		{"overflow to -Inf", -1e308, false, 0},
+		{"max float64", math.MaxFloat64, false, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var p historyPoint
+			hpSet(&p, hiKVPct, tc.in)
+			set := hpHas(p, hiKVPct)
+			if set != tc.wantSet {
+				t.Fatalf("presence = %v, want %v (in=%v)", set, tc.wantSet, tc.in)
+			}
+			if set && p.V[hiKVPct] != tc.wantVal {
+				t.Errorf("value = %v, want %v", p.V[hiKVPct], tc.wantVal)
+			}
+			// A rejected value must not poison the point's JSON.
+			if _, err := json.Marshal(p.V); err != nil {
+				t.Errorf("marshal: %v", err)
+			}
+
+			var g gpuPoint
+			gpuSet(&g, guUtil, tc.in)
+			gset := g.Flags&(1<<uint(guUtil)) != 0
+			if gset != tc.wantSet {
+				t.Fatalf("gpu presence = %v, want %v (in=%v)", gset, tc.wantSet, tc.in)
+			}
+			if gset && g.V[guUtil] != tc.wantVal {
+				t.Errorf("gpu value = %v, want %v", g.V[guUtil], tc.wantVal)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ×100 scaled view fields (finite overflow must not reach JSON)
+// ---------------------------------------------------------------------------
+
+func TestEngine_ScrapeBody_ScaledPctOverflowDropped(t *testing.T) {
+	tests := []struct {
+		name   string
+		line   string
+		assert func(t *testing.T, v engineView)
+	}{
+		{
+			name: "vllm kv usage finite",
+			line: `vllm:kv_cache_usage_perc{model_name="m"} 0.42`,
+			assert: func(t *testing.T, v engineView) {
+				if v.KVPct != 42 {
+					t.Errorf("kvPct = %v, want 42", v.KVPct)
+				}
+			},
+		},
+		{
+			name: "vllm kv usage overflows x100",
+			line: `vllm:kv_cache_usage_perc{model_name="m"} 1e308`,
+			assert: func(t *testing.T, v engineView) {
+				if math.IsInf(v.KVPct, 0) || v.KVPct != 0 {
+					t.Errorf("kvPct = %v, want dropped (0)", v.KVPct)
+				}
+			},
+		},
+		{
+			name: "sglang full token usage finite",
+			line: `sglang:full_token_usage 0.77`,
+			assert: func(t *testing.T, v engineView) {
+				if v.FullPct == nil || *v.FullPct != 77 {
+					t.Errorf("fullPct = %v, want 77", v.FullPct)
+				}
+			},
+		},
+		{
+			name: "sglang full token usage overflows x100",
+			line: `sglang:full_token_usage 1e308`,
+			assert: func(t *testing.T, v engineView) {
+				if v.FullPct != nil {
+					t.Errorf("fullPct = %v, want nil", v.FullPct)
+				}
+			},
+		},
+		{
+			name: "sglang swa token usage overflows x100",
+			line: `sglang:swa_token_usage 1e308`,
+			assert: func(t *testing.T, v engineView) {
+				if v.SwaPct != nil {
+					t.Errorf("swaPct = %v, want nil", v.SwaPct)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &engineScrape{}
+			s.scrapeBody(parsePromText([]byte(tc.line + "\n")))
+			if s.status != "ok" {
+				t.Fatalf("status = %q, want ok", s.status)
+			}
+			tc.assert(t, s.view)
+			// The published view must stay marshalable — a leaked Inf
+			// would kill the SSE /metrics stream.
+			if _, err := json.Marshal(s.view); err != nil {
+				t.Errorf("marshal view: %v", err)
+			}
+		})
+	}
+}
+
+// TestSessions_RingWrap emits the last-32 ring after it has wrapped. The
+// 33rd request on a 32-slot ring is the case where the oldest slot sits at
+// reqIdx itself: the old linear slice overran the array and feed() panicked.
+func TestSessions_RingWrap(t *testing.T) {
+	isShown := func(k string, f sessionsFeed) bool {
+		for _, s := range f.Sessions {
+			if s.ID == k {
+				return true
+			}
+		}
+		return false // feed is capped at 100 sessions
+	}
+	for _, n := range []int{32, 33, 40, 64, 100} {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			r := newSessionRegistry()
+			key := "ringwrap00001"
+			for i := 1; i <= n; i++ {
+				id := r.start("b1", "/v1/chat/completions", false, key, 10, 5)
+				r.finish(id, 200, float64(i*4), 0, 20)
+			}
+			f := r.feed()
+			s := sessById(t, f, key)
+			if s.N != n {
+				t.Fatalf("n = %d, want %d", s.N, n)
+			}
+			want := 32
+			if n < 32 {
+				want = n
+			}
+			// The feed would have panicked on a wrap overrun.
+			if !isShown(key, f) {
+				t.Fatalf("session %s missing from feed", key)
+			}
+			if s.Reqs == nil || len(s.Reqs) != want {
+				t.Fatalf("len(reqs) = %d, want %d (oldest first)", len(s.Reqs), want)
+			}
+			// Newest request is n, oldest in the ring is n-31.
+			for i := 0; i < len(s.Reqs); i++ {
+				wantDur := float64((n - len(s.Reqs) + 1 + i) * 4)
+				if math.Abs(s.Reqs[i].DurMs-wantDur) > 1e-9 {
+					t.Errorf("reqs[%d].durMs = %v, want %v (n=%d)", i, s.Reqs[i].DurMs, wantDur, n)
+				}
+			}
+		})
+	}
+}
+
+// TestSessions_LiveEvictionDecmentsLiveN: when the live map overflows, the
+// evicted request never runs finish(), so its session's LiveN must be
+// retired at eviction — or the session stays "live" forever, put() can
+// never evict it, and the session store grows past sessStoreCap.
+func TestSessions_LiveEvictionDecmentsLiveN(t *testing.T) {
+	// One conversation with sessLiveCap+1 requests in flight: the first
+	// admitted request is evicted from the live map (its id never reaches
+	// finish()), so its session's LiveN must be retired at eviction.
+	r := newSessionRegistry()
+	key := "evict-live-1"
+	for range sessLiveCap + 1 {
+		r.start("b1", "/v1/chat/completions", true, key, 10, 5)
+	}
+	id1 := uint64(1) // nextID starts at 1 and only this registry is used
+	r.mu.Lock()
+	a, ok := r.sessions[key]
+	_, liveHasEvicted := r.live[id1]
+	r.mu.Unlock()
+	if !ok {
+		t.Fatalf("session %s missing from the store", key)
+	}
+	if liveHasEvicted {
+		t.Fatalf("oldest request %d should have been evicted from the live map", id1)
+	}
+	if a.LiveN != sessLiveCap {
+		t.Errorf("session LiveN = %d, want %d (%d admitted, 1 evicted)", a.LiveN, sessLiveCap, sessLiveCap+1)
+	}
+
+	// Full-cap stress: sessLiveCap+1 distinct conversations. The first one
+	// gets live-evicted (its id never reaches finish()); every request is
+	// then completed. With the fix the strander's LiveN was retired at
+	// eviction, so put() may evict it like any other finished conversation;
+	// without it, put() skips its forever-live count and it is pinned in
+	// the store even after it is the oldest finished session.
+	r2 := newSessionRegistry()
+	ids := make([]uint64, 0, sessLiveCap+1)
+	for i := range sessLiveCap + 1 {
+		ids = append(ids, r2.start("b1", "/v1/chat/completions", true,
+			fmt.Sprintf("stress-%04d", i), 10, 5))
+	}
+	for _, id := range ids {
+		r2.finish(id, 200, 1, 0, 40)
+	}
+	// A new conversation at/over the store cap triggers an LRU eviction of
+	// the oldest finished session — which is the live-evicted strander.
+	r2.start("b1", "/v1/chat/completions", true, "stress-new", 10, 5)
+	r2.mu.Lock()
+	_, stranded := r2.sessions["stress-0000"]
+	allFinished := true
+	for _, a := range r2.sessions {
+		if a.LiveN != 0 && a.ID != "stress-new" {
+			allFinished = false
+		}
+	}
+	r2.mu.Unlock()
+	if stranded {
+		t.Errorf("live-evicted session stress-0000 pinned in the store " +
+			"(phantom LiveN: put() skipped it in LRU eviction)")
+	}
+	if !allFinished {
+		t.Errorf("a finished session kept a live count after live eviction")
+	}
+}
+
+// newProdLikeProxy builds a reverse proxy exactly the way main() does, with
+// the real backend name in the ErrorHandler (newTestProxy hardcodes "test").
+func newProdLikeProxy(t *testing.T, name, upstream string) *httputil.ReverseProxy {
+	t.Helper()
+	u, err := url.Parse(upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := httputil.NewSingleHostReverseProxy(u)
+	p.FlushInterval = -1
+	n := name
+	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		handleProxyError(w, r, err, n)
+	}
+	return p
+}
+
+// waitForBurst polls the swapped metrics ring until it holds at least want
+// samples (the proxy's deferred finalizer can lag the client's roundtrip).
+func waitForBurst(t *testing.T, want int) []requestSample {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if ring := metrics.burst(100); len(ring) >= want {
+			return ring
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out: metrics ring holds %d samples, want %d", len(metrics.burst(100)), want)
+	return nil
+}
+
+// TestFleetAggregates_MixedFleetHitRateBlend covers the fleet hit-rate blend
+// for a mixed fleet: a vLLM backend's counter pair pools its totals, while
+// SGLang backends expose only a HitRate gauge and blend in weighted by their
+// query total when available, else weight 1.
+func TestFleetAggregates_MixedFleetHitRateBlend(t *testing.T) {
+	i64 := func(v int64) *int64 { return &v }
+	for _, tc := range []struct {
+		name string
+		sg   engineView // SGLang side: gauge (+ optional query total)
+		want float64
+	}{
+		{
+			name: "gauge without query total defaults weight 1",
+			sg:   engineView{Status: "ok", HitRate: 0.5},
+			want: (791.0 + 0.5*1) / (1000 + 1),
+		},
+		{
+			name: "gauge weighted by query total",
+			sg:   engineView{Status: "ok", HitRate: 0.5, HitQueriesTotal: i64(400)},
+			want: (791.0 + 0.5*400) / (1000 + 400),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := metricsFrame{Backends: []backendFrame{
+				// Counter-backed: its gauge (even if present) must NOT be
+				// blended on top of the pooled counters.
+				{Name: "vllm", Engine: engineView{Status: "ok", HitRate: 0.791,
+					HitQueriesTotal: i64(1000), HitHitsTotal: i64(791)}},
+				{Name: "sglang", Engine: tc.sg},
+			}}
+			applyFleetAggregates(&f)
+			if got := f.Totals.HitRate; got < tc.want-1e-9 || got > tc.want+1e-9 {
+				t.Errorf("blended hitRate = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEngine_ScrapeBySourceOneSided covers the vLLM by_source prefill split
+// when only one side reports: the missing component stays 0, the total
+// derives from the single source, and the legacy prompt_tokens_total
+// fallback still wins when by_source is absent entirely.
+func TestEngine_ScrapeBySourceOneSided(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  string
+		plant promSample
+	}{
+		{
+			name:  "only local_compute",
+			body:  "vllm:prompt_tokens_by_source_total{source=\"local_compute\"} 3000\n",
+			plant: promSample{name: "vllm:prompt_tokens_by_source_total", labels: map[string]string{"source": "local_compute"}},
+		},
+		{
+			name:  "only local_cache_hit",
+			body:  "vllm:prompt_tokens_by_source_total{source=\"local_cache_hit\"} 3000\n",
+			plant: promSample{name: "vllm:prompt_tokens_by_source_total", labels: map[string]string{"source": "local_cache_hit"}},
+		},
+		{
+			name:  "no by_source: legacy prompt_tokens_total",
+			body:  "vllm:prompt_tokens_total 3000\n",
+			plant: promSample{name: "vllm:prompt_tokens_total"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newEngineRegistry()
+			r.add("king", "http://127.0.0.1:1/metrics") // url unused
+			r.mu.Lock()
+			s := r.backends["king"]
+			r.mu.Unlock()
+
+			// Prime the matching baseline ~2s ago at 1000 tokens; the scrape
+			// advances it to 3000 -> ~1000/s, same pattern as TestEngine_ScrapeVllm.
+			key := counterKey(tc.plant)
+			s.counters[key] = 1000
+			s.cTimes[key] = time.Now().Add(-2 * time.Second)
+
+			s.scrapeBody(parsePromText([]byte(tc.body)))
+			v := s.view
+
+			wantRate := func(field string, got float64) {
+				if got < 980 || got > 1020 {
+					t.Errorf("%s = %v, want ~1000 (3000-1000 tokens / ~2s)", field, got)
+				}
+			}
+			switch tc.name {
+			case "only local_compute":
+				wantRate("prefillTokS", v.PrefillTokS)
+				if v.PrefillCacheTokS != 0 {
+					t.Errorf("prefillCacheTokS = %v, want 0 (missing source)", v.PrefillCacheTokS)
+				}
+				wantRate("prefillTotalTokS (compute-only)", v.PrefillTotalTokS)
+				if v.PrefillTotalTokS != v.PrefillTokS {
+					t.Errorf("prefillTotalTokS = %v, want prefillTokS %v (single source)", v.PrefillTotalTokS, v.PrefillTokS)
+				}
+			case "only local_cache_hit":
+				if v.PrefillTokS != 0 {
+					t.Errorf("prefillTokS = %v, want 0 (missing source)", v.PrefillTokS)
+				}
+				wantRate("prefillCacheTokS", v.PrefillCacheTokS)
+				wantRate("prefillTotalTokS (cache-only)", v.PrefillTotalTokS)
+				if v.PrefillTotalTokS != v.PrefillCacheTokS {
+					t.Errorf("prefillTotalTokS = %v, want prefillCacheTokS %v (single source)", v.PrefillTotalTokS, v.PrefillCacheTokS)
+				}
+			default: // legacy fallback
+				wantRate("prefillTokS (legacy)", v.PrefillTokS)
+				if v.PrefillCacheTokS != 0 {
+					t.Errorf("prefillCacheTokS = %v, want 0", v.PrefillCacheTokS)
+				}
+				wantRate("prefillTotalTokS (legacy)", v.PrefillTotalTokS)
+			}
+		})
+	}
+}
+
+// TestEngine_ScrapeFailureResetsBaselines covers the non-ok scrape contract:
+// gauges and lifetime counters are retained, interval fields are zeroed, and
+// counter + histogram baselines are reset so the next ok scrape re-baselines
+// without double-counting the failed interval.
+func TestEngine_ScrapeFailureResetsBaselines(t *testing.T) {
+	var mode atomic.Int64
+	bodyA := func(prompt float64, ttftSum, ttftCnt float64) string {
+		return fmt.Sprintf(`vllm:num_requests_running{model_name="m",engine="0"} 3
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.6
+vllm:num_preemptions_total{model_name="m",engine="0"} 4
+vllm:prompt_tokens_total{model_name="m",engine="0"} %g
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} %g
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} %g
+`, prompt, ttftSum, ttftCnt)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		switch mode.Load() {
+		case 0:
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case 1:
+			fmt.Fprint(w, bodyA(1000, 10, 2))
+		case 2:
+			fmt.Fprint(w, bodyA(2000, 30, 4))
+		case 3:
+			fmt.Fprint(w, bodyA(3000, 40, 5))
+		case 4:
+			fmt.Fprint(w, bodyA(4000, 60, 7))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	r := newEngineRegistry()
+	r.add("king", srv.URL)
+	r.mu.Lock()
+	s := r.backends["king"]
+	r.mu.Unlock()
+
+	mode.Store(1)
+	r.scrape("king") // ok: baselines established (first sight: rates 0)
+	mode.Store(2)
+	time.Sleep(250 * time.Millisecond)
+	r.scrape("king") // ok: interval fields live
+	if s.view.PrefillTokS < 3000 || s.view.PrefillTokS > 5000 {
+		t.Fatalf("prefillTokS before failure = %v, want ~4000 (1000 tokens / ~250ms)", s.view.PrefillTokS)
+	}
+	if s.view.TTFTms != 10000 || s.view.TTFTSamples != 2 {
+		t.Fatalf("ttft before failure = %vms/%d samples, want 10000/2", s.view.TTFTms, s.view.TTFTSamples)
+	}
+	if s.view.KVPct != 60 {
+		t.Fatalf("kvPct = %v, want 60", s.view.KVPct)
+	}
+
+	// 1) Failure: status err, interval fields zeroed, baselines reset,
+	// gauges + lifetime retained.
+	mode.Store(0)
+	r.scrape("king")
+	v := s.view
+	if v.Status != "err" {
+		t.Fatalf("status = %q, want err", v.Status)
+	}
+	if v.LastError == "" {
+		t.Errorf("lastError empty after 500")
+	}
+	if v.KVPct != 60 {
+		t.Errorf("kvPct = %v after failure, want 60 retained", v.KVPct)
+	}
+	if v.PreemptedTotal == nil || *v.PreemptedTotal != 4 {
+		t.Errorf("preemptedTotal = %v after failure, want 4 retained", v.PreemptedTotal)
+	}
+	if v.PrefillTokS != 0 || v.TTFTms != 0 || v.TTFTSamples != 0 || v.PrefillTotalTokS != 0 {
+		t.Errorf("interval fields not zeroed after failure: prefillTokS=%v ttftMs=%v ttftSamples=%d",
+			v.PrefillTokS, v.TTFTms, v.TTFTSamples)
+	}
+	if len(s.counters) != 0 {
+		t.Errorf("counter baselines not reset: %d entries remain", len(s.counters))
+	}
+	if h := s.hists["vllm:time_to_first_token_seconds"]; h == nil || h.have || !h.t.IsZero() {
+		t.Errorf("histogram baseline not reset: %+v", h)
+	}
+
+	// 2) Recovery: first success after reset re-baselines (rate 0, proving
+	// the failed interval's delta is NOT double-counted). The 1s err
+	// backoff is cleared by hand (whitebox, as the sibling backoff tests)
+	// so this recovery isn't a 1s poll.
+	r.mu.Lock()
+	s.errNext = time.Time{}
+	r.mu.Unlock()
+	mode.Store(3)
+	r.scrape("king")
+	v = s.view
+	if v.Status != "ok" {
+		t.Fatalf("recovery status = %q, want ok", v.Status)
+	}
+	if v.KVPct != 60 {
+		t.Errorf("kvPct = %v after recovery, want 60", v.KVPct)
+	}
+	if v.PrefillTokS != 0 {
+		t.Errorf("prefillTokS after reset = %v, want 0 (re-baselined, no double count)", v.PrefillTokS)
+	}
+	if v.TTFTms != 0 || v.TTFTSamples != 0 {
+		t.Errorf("ttft after reset = %vms/%d, want 0/0 (re-baselined)", v.TTFTms, v.TTFTSamples)
+	}
+
+	// 3) Interval fields restore on the following ok scrape, with the
+	// failure-era baseline as the floor.
+	mode.Store(4)
+	time.Sleep(250 * time.Millisecond)
+	r.scrape("king")
+	v = s.view
+	if v.PrefillTokS < 3000 || v.PrefillTokS > 5000 {
+		t.Errorf("prefillTokS after recovery = %v, want ~4000 (1000 tokens / ~250ms)", v.PrefillTokS)
+	}
+	if v.TTFTms != 10000 || v.TTFTSamples != 2 {
+		t.Errorf("restored ttft = %vms/%d samples, want 10000/2 from post-reset baseline", v.TTFTms, v.TTFTSamples)
+	}
+}
+
+// TestProxy_AbortAndCancelSamples covers the deferred finalizer for proxied
+// requests that end without a completed response: an upstream body abort
+// lands 502 with a sane TTFT/partial BytesOut; a client cancel lands 499.
+// Each case records exactly one sample.
+func TestProxy_AbortAndCancelSamples(t *testing.T) {
+	const chatBody = `{"model":"m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+
+	t.Run("abort", func(t *testing.T) {
+		// Upstream commits a Content-Length:1000 response, streams one
+		// body byte, then hard-closes the connection. The proxy's body copy
+		// hits EOF and aborts (ErrAbortHandler), so the request
+		// never returned cleanly: 502.
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer c.Close()
+					c.SetReadDeadline(time.Now().Add(2 * time.Second))
+					// Drain the whole client request (headers + body) BEFORE
+					// responding: closing mid-request RSTs the socket and
+					// kills the proxy's roundtrip (503) before any response
+					// byte — exactly what the 502 path must not hit.
+					br := bufio.NewReaderSize(c, 8192)
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						return
+					}
+					if req.ContentLength > 0 {
+						// ReadRequest consumed only the headers; the body
+						// bytes may already be buffered in br.
+						io.CopyN(io.Discard, io.MultiReader(br, c), req.ContentLength)
+					}
+					// Announce 1024 bytes, deliver 512, close: the proxy's
+					// body copy EOFs mid-response (ErrAbortHandler) -> 502.
+					c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\n\r\n" + strings.Repeat("x", 512)))
+				}(conn)
+			}
+		}()
+
+		upstream := "http://" + ln.Addr().String()
+		withRouterEnv(t, []Backend{{Name: "m1", URL: upstream, Tier: 0}}, nil, nil)
+		proxies["m1"] = newProdLikeProxy(t, "m1", upstream)
+		saveMetrics := metrics
+		metrics = newTestMetrics()
+		t.Cleanup(func() { metrics = saveMetrics })
+
+		srv := httptest.NewServer(buildMux())
+		t.Cleanup(srv.Close)
+
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
+		if err == nil {
+			io.ReadAll(resp.Body)
+			resp.Body.Close()
+		} // client sees the stream break; the server side is what matters here
+
+		ring := waitForBurst(t, 1)
+		if len(ring) != 1 {
+			t.Fatalf("ring = %d samples, want exactly 1", len(ring))
+		}
+		s := ring[0]
+		if s.Status != http.StatusBadGateway {
+			t.Errorf("status = %d, want 502 (upstream aborted mid-response)", s.Status)
+		}
+		if !s.Stream {
+			t.Errorf("stream = false, want true")
+		}
+		// Loopback first byte (the 200 header) is sub-millisecond, so 0ms
+		// is the sane floor; anything seconds-long is not.
+		if s.TTFTMs < 0 || s.TTFTMs > 60000 {
+			t.Errorf("ttftMs = %v, want sane first-byte time in [0, 60s)", s.TTFTMs)
+		}
+		// FlushInterval -1 flushes every chunk as it arrives, so the
+		// delivered partial reaches the tracker before the abort.
+		if s.BytesOut <= 0 || s.BytesOut > 512 {
+			t.Errorf("bytesOut = %d, want the delivered partial >0 and <= 512", s.BytesOut)
+		}
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		// Upstream streams forever; the client takes the first chunk and
+		// cancels. The proxy sees the request context canceled: 499 (metrics
+		// only — nothing can be written to a gone client).
+		up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "data: chunk\n\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+		}))
+		t.Cleanup(up2.Close)
+
+		withRouterEnv(t, []Backend{{Name: "m1", URL: up2.URL, Tier: 0}}, nil, nil)
+		proxies["m1"] = newProdLikeProxy(t, "m1", up2.URL)
+		saveMetrics := metrics
+		metrics = newTestMetrics()
+		t.Cleanup(func() { metrics = saveMetrics })
+
+		srv := httptest.NewServer(buildMux())
+		t.Cleanup(srv.Close)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(ctx, "POST", srv.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		buf := make([]byte, 32)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			n, _ := resp.Body.Read(buf)
+			if n > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel() // client bails mid-stream
+		resp.Body.Close()
+
+		ring := waitForBurst(t, 1)
+		if len(ring) != 1 {
+			t.Fatalf("ring = %d samples, want exactly 1", len(ring))
+		}
+		s := ring[0]
+		if s.Status != 499 {
+			t.Errorf("status = %d, want 499 (client cancel)", s.Status)
+		}
+		if !s.Stream {
+			t.Errorf("stream = false, want true")
+		}
+		// The 200 header is the first byte, landing sub-millisecond after
+		// admission on loopback: 0ms is the sane floor, not a failure.
+		if s.TTFTMs < 0 || s.TTFTMs > 60000 {
+			t.Errorf("ttftMs = %v, want sane first-byte time in [0, 60s)", s.TTFTMs)
+		}
+		if s.BytesOut <= 0 {
+			t.Errorf("bytesOut = %d, want > 0 (the streamed chunk reached the client)", s.BytesOut)
+		}
+	})
+}
+
+// TestProxy_TrackedUpstreamFailureBeforeResponse covers a tracked
+// (admitted) request whose upstream fails before any response byte: the
+// tracker finalizes with the upstream status, TTFT and BytesOut zero, and
+// exactly one sample — the JSON error body written afterwards must not
+// pollute the recorded BytesOut.
+func TestProxy_TrackedUpstreamFailureBeforeResponse(t *testing.T) {
+	withRouterEnv(t, []Backend{{Name: "m1", URL: "http://127.0.0.1:1", Tier: 0}}, nil, nil)
+	proxies["m1"] = newProdLikeProxy(t, "m1", "http://127.0.0.1:1") // dead: dial refused -> 503
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+
+	srv := httptest.NewServer(buildMux())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m1","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (upstream never reached)", resp.StatusCode)
+	}
+
+	ring := metrics.burst(100)
+	if len(ring) != 1 {
+		t.Fatalf("ring = %d samples, want exactly 1", len(ring))
+	}
+	s := ring[0]
+	if s.Status != http.StatusServiceUnavailable {
+		t.Errorf("sample status = %d, want 503", s.Status)
+	}
+	if s.Backend != "m1" {
+		t.Errorf("backend = %q, want m1", s.Backend)
+	}
+	if s.TTFTMs != 0 {
+		t.Errorf("ttftMs = %v, want 0 (no response byte)", s.TTFTMs)
+	}
+	if s.BytesOut != 0 {
+		t.Errorf("bytesOut = %d, want 0 (error body written after finish)", s.BytesOut)
+	}
+}
+
+// TestProxy_OversizedBodyRejected covers the MaxBytesReader reject: a body
+// over maxBodyBytes is answered 413 before the proxy runs, and the
+// rejection sample is attributed to the default backend with the capped
+// BytesIn.
+func TestProxy_OversizedBodyRejected(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("upstream must not be reached for a rejected body")
+	}))
+	t.Cleanup(fake.Close)
+
+	withRouterEnv(t, []Backend{{Name: "m1", URL: fake.URL, Tier: 0}}, nil, nil)
+	proxies["m1"] = newProdLikeProxy(t, "m1", fake.URL)
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+	saveMax := maxBodyBytes
+	maxBodyBytes = 1024
+	t.Cleanup(func() { maxBodyBytes = saveMax })
+
+	srv := httptest.NewServer(buildMux())
+	t.Cleanup(srv.Close)
+
+	body := strings.Repeat("a", 4096)
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Router-Reason"); got != "body-too-large" {
+		t.Errorf("X-Router-Reason = %q, want body-too-large", got)
+	}
+
+	ring := metrics.burst(100)
+	if len(ring) != 1 {
+		t.Fatalf("ring = %d samples, want exactly 1", len(ring))
+	}
+	s := ring[0]
+	if s.Status != http.StatusRequestEntityTooLarge {
+		t.Errorf("sample status = %d, want 413", s.Status)
+	}
+	if s.Backend != "m1" {
+		t.Errorf("backend = %q, want m1 (default backend)", s.Backend)
+	}
+	if s.BytesIn != 1024 {
+		t.Errorf("bytesIn = %d, want 1024 (capped at maxBodyBytes)", s.BytesIn)
+	}
+}
+
+// TestGPURegistry_ScrapeTransitions covers the registry's status machine:
+// 500 -> err with backoff, 404 -> off with engineOffBackoff, 200 -> ok with
+// the backoffs cleared; a failed scrape publishes no device values.
+func TestGPURegistry_ScrapeTransitions(t *testing.T) {
+	dcgms := `DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 75.4205088076072
+DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 61000
+DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 81920
+DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52.018398644374244
+DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52000
+DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 81920
+`
+	var mode atomic.Int64
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		switch mode.Load() {
+		case 0:
+			http.NotFound(w, r)
+		case 1:
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case 2:
+			fmt.Fprint(w, dcgms)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	g := newGPURegistry()
+	g.configure(srv.URL)
+
+	// (a) 500 -> err with the 1s backoff armed; the immediate re-probe is
+	// suppressed by that backoff.
+	mode.Store(1)
+	g.scrape()
+	g.mu.Lock()
+	status, lastErr, errNext, errDelay := g.status, g.lastErr, g.errNext, g.errDelay
+	g.mu.Unlock()
+	if status != "err" {
+		t.Fatalf("status = %q, want err (500)", status)
+	}
+	if lastErr == "" {
+		t.Errorf("lastError empty after 500")
+	}
+	if !errNext.After(time.Now()) {
+		t.Errorf("errNext = %v, want in the future (backoff armed)", errNext)
+	}
+	if errDelay != time.Second {
+		t.Errorf("errDelay = %v, want 1s (first failure)", errDelay)
+	}
+	g.scrape()
+	if h := atomic.LoadInt32(&hits); h != 1 {
+		t.Fatalf("hits = %d, want 1 (re-probe suppressed during err backoff)", h)
+	}
+	if len(g.view()) != 0 {
+		t.Errorf("view() = %d devices during err, want none published", len(g.view()))
+	}
+
+	// (b) 404 -> off with engineOffBackoff; lastErr cleared (absent, not
+	// broken). Same backoff-suppression check.
+	g.mu.Lock()
+	g.errNext = time.Time{}
+	g.mu.Unlock()
+	mode.Store(0)
+	g.scrape()
+	g.mu.Lock()
+	status, lastErr, offNext, offNow := g.status, g.lastErr, g.offNext, time.Now()
+	g.mu.Unlock()
+	if status != "off" {
+		t.Fatalf("status = %q, want off (404)", status)
+	}
+	if lastErr != "" {
+		t.Errorf("lastError = %q, want empty for absent endpoint", lastErr)
+	}
+	if !offNext.After(time.Now()) || offNext.After(offNow.Add(engineOffBackoff)) {
+		t.Errorf("offNext = %v, want ~engineOffBackoff ahead", offNext)
+	}
+	g.scrape()
+	if h := atomic.LoadInt32(&hits); h != 2 {
+		t.Fatalf("hits = %d, want 2 (re-probe suppressed during off backoff)", h)
+	}
+
+	// (c) 200 -> ok: backoffs cleared, devices published.
+	g.mu.Lock()
+	g.offNext = time.Time{}
+	g.mu.Unlock()
+	mode.Store(2)
+	g.scrape()
+	g.mu.Lock()
+	status, lastErr, errNext, offNext, errDelay = g.status, g.lastErr, g.errNext, g.offNext, g.errDelay
+	g.mu.Unlock()
+	if status != "ok" {
+		t.Fatalf("status = %q, want ok (200)", status)
+	}
+	if lastErr != "" {
+		t.Errorf("lastError = %q, want empty after recovery", lastErr)
+	}
+	if !errNext.IsZero() || !offNext.IsZero() || errDelay != 0 {
+		t.Errorf("backoffs after recovery = errNext %v / offNext %v / delay %v, want all cleared", errNext, offNext, errDelay)
+	}
+	if got := g.view(); len(got) != 2 {
+		t.Fatalf("view() = %d devices after recovery, want 2", len(got))
+	}
+	if st := g.feed().Status; st != "ok" {
+		t.Errorf("feed status = %q, want ok", st)
+	}
+}
+
+// TestHistory_InvalidRange covers the /metrics/history range contract: an
+// unknown ?range is a 400 with the JSON error body, before any series
+// lookup.
+func TestHistory_InvalidRange(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/metrics/history?range=bogus", nil)
+	handleHistory(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if got := w.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if body["error"] != "unknown range" {
+		t.Errorf("error = %q, want \"unknown range\"", body["error"])
+	}
+}
+
+// TestMetricsStream_IntervalClamp covers the SSE interval clamp
+// (200ms..10s) through its only external observation: the frame cadence.
+// interval=10ms must tick at ~200ms (not ~10ms or the 500ms default);
+// interval=30s must tick at ~10s (not ~30s).
+func TestMetricsStream_IntervalClamp(t *testing.T) {
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+	msrv := httptest.NewServer(buildMetricsMux())
+	t.Cleanup(msrv.Close)
+
+	// gaps returns the intervals between consecutive SSE frames received
+	// within the window.
+	gaps := func(interval string, window time.Duration) []time.Duration {
+		ctx, cancel := context.WithTimeout(context.Background(), window+3*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, "GET",
+			msrv.URL+"/metrics/stream?interval="+interval, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("stream request: %v", err)
+		}
+		defer resp.Body.Close()
+		rd := bufio.NewReaderSize(resp.Body, 4096)
+		var out []time.Duration
+		var last time.Time
+		deadline := time.Now().Add(window)
+		for time.Now().Before(deadline) {
+			line, err := rd.ReadString('\n')
+			if err != nil {
+				break
+			}
+			if strings.HasPrefix(line, "data:") {
+				now := time.Now()
+				if !last.IsZero() {
+					out = append(out, now.Sub(last))
+				}
+				last = now
+			}
+		}
+		return out
+	}
+
+	t.Run("below_min_clamps_to_200ms", func(t *testing.T) {
+		d := gaps("10ms", 650*time.Millisecond)
+		if len(d) < 2 {
+			t.Fatalf("frame gaps received in window = %d, want >= 2 (frames at ~0/200/400/600ms)", len(d))
+		}
+		for i, g := range d {
+			if g < 150*time.Millisecond || g > 450*time.Millisecond {
+				t.Errorf("gap[%d] = %v, want ~200ms (10ms clamps to 200ms; 500ms default would be >=500ms)", i, g)
+				return
+			}
+		}
+	})
+
+	t.Run("above_max_clamps_to_10s", func(t *testing.T) {
+		d := gaps("30s", 13*time.Second)
+		if len(d) != 1 {
+			t.Fatalf("frame gaps received in 13s window = %d, want exactly 1 (second frame at ~10s)", len(d))
+		}
+		if d[0] < time.Duration(8.5*float64(time.Second)) || d[0] > 11*time.Second {
+			t.Errorf("gap[0] = %v, want ~10s (30s clamps to 10s; unclamped would be >=30s)", d[0])
+		}
+	})
 }
