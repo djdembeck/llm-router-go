@@ -96,6 +96,14 @@
       metricAverages = null;
       metricLast = 0;
     }
+    // /stats frames carry no engine/GPU data. On either crossing of the
+    // boundary, a cached metric frame from the other feed kind would keep
+    // presenting its readings as current, so gate the cache on the kind.
+    if ((kind === "stats") !== (lastFeedKind === "stats")) {
+      metricFrame = null;
+      metricAverages = null;
+      metricLast = 0;
+    }
     if (kind) lastFeedKind = kind;
   });
 
@@ -263,9 +271,9 @@
         <LiveSessions
           singleBackend={singleBackendName}
           feed={live.sessions}
-          now={live.paused || live.stale ? (live.lastFrameAt ?? now) : now}
+          now={live.paused || live.stale || live.sessionsStale ? (live.lastFrameAt ?? now) : now}
           paused={live.paused}
-          stale={live.stale}
+          stale={live.stale || live.sessionsStale}
           tall={!requestLogOpen}
         />
       </div>

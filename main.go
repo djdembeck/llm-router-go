@@ -725,6 +725,7 @@ type engineScrape struct {
 	// counters: rate-differenced between scrapes, keyed by name+labels.
 	counters map[string]float64
 	cTimes   map[string]time.Time
+	rSeen    map[string]bool // counters baselined in the current scrape
 	// histograms: the ones the dashboard reads, keyed per label set.
 	hists   map[string]*histState
 	lastT   time.Time
@@ -874,6 +875,15 @@ func (e *engineRegistry) scrape(name string) {
 	s.scrapeBody(parsePromText(body))
 }
 
+// zeroF64Ptr returns a pointer to a freshly allocated zero float.
+// Snapshot readers dereference view pointers outside e.mu, so published
+// values must never be written through in place; replacing the pointer
+// with a new one is the race-free way to zero a nil-able field.
+func zeroF64Ptr() *float64 {
+	z := 0.0
+	return &z
+}
+
 // zeroIntervalFields blanks the rate + interval-mean fields (stale deltas
 // would mislead) while keeping gauges and lifetime fields at their last
 // known values. status is read from the scrape state.
@@ -905,22 +915,22 @@ func (s *engineScrape) zeroIntervalFields() {
 	v.HTTPStatus = s.httpStatus
 	v.LastError = s.lastErr
 	if v.TTFTStreamMs != nil {
-		*v.TTFTStreamMs = 0
+		v.TTFTStreamMs = zeroF64Ptr()
 	}
 	if v.TTFTNonStreamMs != nil {
-		*v.TTFTNonStreamMs = 0
+		v.TTFTNonStreamMs = zeroF64Ptr()
 	}
 	if v.RetractedTokS != nil {
-		*v.RetractedTokS = 0
+		v.RetractedTokS = zeroF64Ptr()
 	}
 	if v.PrefillMs != nil {
-		*v.PrefillMs = 0
+		v.PrefillMs = zeroF64Ptr()
 	}
 	if v.DecodeMs != nil {
-		*v.DecodeMs = 0
+		v.DecodeMs = zeroF64Ptr()
 	}
 	if v.PerTokMs != nil {
-		*v.PerTokMs = 0
+		v.PerTokMs = zeroF64Ptr()
 	}
 	s.view = v
 }
@@ -933,6 +943,11 @@ func (s *engineScrape) zeroIntervalFields() {
 // always the honest engine-side lifetime. Rates (prefillTokS, ...) and
 // interval histogram means come from counterRate/updateHist deltas and are
 // re-baselined on reset.
+// scaledFinite reports whether v*100 stays finite. A healthy engine reports
+// fractions (0..1); a pathological value past ~3.4e35 would overflow the ×100
+// scale to ±Inf and json.Marshal fatals the live stream — treated as absent.
+func scaledFinite(v float64) bool { return !math.IsInf(v*100, 0) }
+
 func (s *engineScrape) scrapeBody(samples []promSample) {
 	now := time.Now()
 	if s.seenEng == nil {
@@ -947,6 +962,9 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 	if s.cTimes == nil {
 		s.cTimes = map[string]time.Time{}
 	}
+	// Baselines not re-observed this scrape are pruned after the body is
+	// folded (see the rSeen pass at the end of scrapeBody).
+	s.rSeen = map[string]bool{}
 	if len(samples) == 0 {
 		s.status = "err"
 		s.lastErr = "empty engine metrics body"
@@ -968,7 +986,7 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 	var waitCap, waitDefer float64
 	haveCap, haveDefer := false, false
 	var hitRate, sloCap, ctxLen float64
-	var haveSLO, haveCTX bool
+	var haveHitRate, haveSLO, haveCTX bool
 	var kvMemGB, weightMemGB float64
 	var haveKVMem, haveWMem bool
 	var retracted float64
@@ -1047,6 +1065,9 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 			}
 		case strings.HasPrefix(sm.name, "sglang:"):
 			sg = true
+			// Presence = the sample was seen, tracked separately from the
+			// per-rank MAX: a valid measured zero (an exhausted pool) must
+			// not publish as null.
 			switch sm.name {
 			case "sglang:num_running_reqs":
 				if sm.value > running {
@@ -1057,98 +1078,99 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 					waiting = sm.value
 				}
 			case "sglang:token_usage":
+				haveKV = true
 				if sm.value > kvMax {
 					kvMax = sm.value
-					haveKV = true
 				}
 			case "sglang:full_token_usage":
+				haveFull = true
 				if sm.value > fullPct {
 					fullPct = sm.value
-					haveFull = true
 				}
 			case "sglang:swa_token_usage":
+				haveSWA = true
 				if sm.value > swaPct {
 					swaPct = sm.value
-					haveSWA = true
 				}
 			case "sglang:mamba_usage":
+				haveMamba = true
 				if sm.value > mambaPct {
 					mambaPct = sm.value
-					haveMamba = true
 				}
 			case "sglang:num_used_tokens":
+				haveKVUsed = true
 				if sm.value > kvUsed {
 					kvUsed = sm.value
-					haveKVUsed = true
 				}
 			case "sglang:max_total_num_tokens":
+				haveKVCap = true
 				if sm.value > kvCap {
 					kvCap = sm.value
-					haveKVCap = true
 				}
 			case "sglang:kv_available_tokens":
+				haveKVFree = true
 				if sm.value > kvFree {
 					kvFree = sm.value
-					haveKVFree = true
 				}
 			case "sglang:kv_evictable_tokens":
+				haveKVEvict = true
 				if sm.value > kvEvict {
 					kvEvict = sm.value
-					haveKVEvict = true
 				}
 			case "sglang:mamba_used_tokens":
+				haveMambaUsed = true
 				if sm.value > mambaUsed {
 					mambaUsed = sm.value
-					haveMambaUsed = true
 				}
 			case "sglang:mamba_available_tokens":
+				haveMambaAvail = true
 				if sm.value > mambaAvail {
 					mambaAvail = sm.value
-					haveMambaAvail = true
 				}
 			case "sglang:mamba_evictable_tokens":
+				haveMambaEvict = true
 				if sm.value > mambaEvict {
 					mambaEvict = sm.value
-					haveMambaEvict = true
 				}
 			case "sglang:num_retracted_reqs":
+				haveRetr = true
 				if sm.value > retracted {
 					retracted = sm.value
-					haveRetr = true
 				}
 			case "sglang:cache_hit_rate":
+				haveHitRate = true
 				if sm.value > hitRate {
 					hitRate = sm.value
 				}
 			case "sglang:max_running_requests_under_SLO":
+				haveSLO = true
 				if sm.value > sloCap {
 					sloCap = sm.value
-					haveSLO = true
 				}
 			case "sglang:context_len":
+				haveCTX = true
 				if sm.value > ctxLen {
 					ctxLen = sm.value
-					haveCTX = true
 				}
 			case "sglang:kv_cache_memory_usage_gb":
+				haveKVMem = true
 				if sm.value > kvMemGB {
 					kvMemGB = sm.value
-					haveKVMem = true
 				}
 			case "sglang:weight_memory_usage_gb":
+				haveWMem = true
 				if sm.value > weightMemGB {
 					weightMemGB = sm.value
-					haveWMem = true
 				}
 			case "sglang:hicache_host_used_tokens":
+				haveHCUsed = true
 				if sm.value > hicacheUsed {
 					hicacheUsed = sm.value
-					haveHCUsed = true
 				}
 			case "sglang:hicache_host_total_tokens":
+				haveHCCap = true
 				if sm.value > hicacheCap {
 					hicacheCap = sm.value
-					haveHCCap = true
 				}
 			case "sglang:num_aborted_requests_total":
 				aborted += int64(sm.value)
@@ -1201,7 +1223,7 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 		view.Running = running
 		view.Waiting = waiting
 	}
-	if haveKV {
+	if haveKV && scaledFinite(kvMax) {
 		view.KVPct = kvMax * 100
 	}
 
@@ -1244,15 +1266,15 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 			v := retracted
 			view.Retracted = &v
 		}
-		if haveFull {
+		if haveFull && scaledFinite(fullPct) {
 			v := fullPct * 100
 			view.FullPct = &v
 		}
-		if haveSWA {
+		if haveSWA && scaledFinite(swaPct) {
 			v := swaPct * 100
 			view.SwaPct = &v
 		}
-		if haveMamba {
+		if haveMamba && scaledFinite(mambaPct) {
 			v := mambaPct * 100
 			view.MambaPct = &v
 		}
@@ -1309,7 +1331,7 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 			v := hicacheCap
 			view.HiCacheHostCapTok = &v
 		}
-		if hitRate > 0 {
+		if haveHitRate {
 			if hitRate > 1 { // some builds report a percent, not a fraction
 				hitRate /= 100
 			}
@@ -1535,6 +1557,15 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 			delete(s.hists, k)
 		}
 	}
+	// Same for counter baselines: label churn in the engine adds new keys
+	// every scrape, and old keys would be retained forever.
+	for k := range s.counters {
+		if !s.rSeen[k] {
+			delete(s.counters, k)
+			delete(s.cTimes, k)
+		}
+	}
+	s.rSeen = nil
 	s.lastT = now
 	s.view = view
 }
@@ -1609,6 +1640,9 @@ func counterKey(sm promSample) string {
 func (s *engineScrape) counterRate(sm promSample, now time.Time) float64 {
 	k := counterKey(sm)
 	rate := 0.0
+	if s.rSeen != nil {
+		s.rSeen[k] = true // prune absent baselines after the scrape
+	}
 	if prev, ok := s.counters[k]; ok {
 		if dt := now.Sub(s.cTimes[k]).Seconds(); dt > 0 {
 			if sm.value >= prev {
@@ -1691,12 +1725,20 @@ func (s *engineScrape) counterSeen(sm promSample) bool {
 
 // ─── Prometheus text parser (stdlib, dashboard needs only) ────────────────
 
+// promSampleCap bounds the samples parsed from one exposition. The body
+// size cap alone admits ~1M short lines every second; the scrape only
+// reads a handful of metric names, so anything past the cap is dead weight.
+const promSampleCap = 8192
+
 // parsePromText parses the Prometheus text exposition format well enough
 // for gauges, counters, and histogram _sum/_count parts. HELP/TYPE lines,
 // openmetrics timestamps, and unparseable lines are skipped.
 func parsePromText(body []byte) []promSample {
 	var out []promSample
 	for _, line := range strings.Split(string(body), "\n") {
+		if len(out) >= promSampleCap {
+			break
+		}
 		line = strings.TrimRight(line, " \r")
 		if line == "" || line[0] == '#' {
 			continue
@@ -2015,6 +2057,14 @@ func (r *sessionRegistry) start(backend, path string, stream bool, sess string, 
 				oldestID = i
 			}
 		}
+		// The evicted request never runs finish(), so retire its liveness
+		// here or its session stays marked live forever (put() can then
+		// never evict it and the store grows past its cap).
+		if l, ok := r.live[oldestID]; ok && l.Sess != "" {
+			if a, ok := r.sessions[l.Sess]; ok && a.LiveN > 0 {
+				a.LiveN--
+			}
+		}
 		delete(r.live, oldestID)
 	}
 	if sess != "" {
@@ -2035,7 +2085,9 @@ func (r *sessionRegistry) start(backend, path string, stream bool, sess string, 
 func (r *sessionRegistry) firstByte(id uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if l, ok := r.live[id]; ok {
+	if l, ok := r.live[id]; ok && l.Stream {
+		// Non-streaming responses arrive in one body; their first byte
+		// marks generation END, so they keep phase "admitted" throughout.
 		l.Streaming = true
 		l.StreamAt = time.Now()
 	}
@@ -2240,10 +2292,18 @@ func (r *sessionRegistry) feed() sessionsFeed {
 		// first 20 after sorting; otherwise null to keep the feed small.
 		include := (a.LiveN > 0 || nowMs-a.LastMs < sessReqsWindowMs) && i < 20
 		if include {
-			// Ring is newest-at-(reqIdx-1); emit oldest first.
+			// Ring is newest-at-(reqIdx-1); emit oldest first. After the
+			// ring wraps (reqIdx caught up to the oldest slot) the oldest
+			// request sits at reqIdx itself and the slice overruns, so
+			// copy the two segments separately.
 			reqs := make([]sessReqFrame, a.reqN)
 			start := (a.reqIdx - a.reqN + sessReqsRing) % sessReqsRing
-			copy(reqs, a.reqs[start:start+a.reqN])
+			first := sessReqsRing - start
+			if first > a.reqN {
+				first = a.reqN
+			}
+			copy(reqs[:first], a.reqs[start:])
+			copy(reqs[first:], a.reqs[:a.reqIdx])
 			f.Reqs = reqs
 		}
 		out = append(out, f)
@@ -2300,7 +2360,8 @@ var (
 	queueTimeout                                    = 30 * time.Second
 	maxBodyBytes        int64                       = 16 << 20
 	prefillTokensPerSec int                         = 10000
-	durations           map[string]*durationTracker // per backend name
+	metricsListen       string                      = "127.0.0.1:9100" // METRICS_LISTEN
+	durations           map[string]*durationTracker                    // per backend name
 	proxies             map[string]*httputil.ReverseProxy
 	engineMetrics       = newEngineRegistry() // per-backend /metrics scrape
 	proxyTransport      = &http.Transport{
@@ -2326,9 +2387,12 @@ func tier0Inflight() int32 {
 	return total
 }
 
-// buildMux assembles the router's route table. /v1/ is the proxy prefix;
-// management routes are registered before it. A future web.Handler() would
-// be mounted at "/" by the caller, after this mux is built.
+// buildMux assembles the router's external route table. /v1/ is the proxy
+// prefix; /health, /stats, and /v1/models stay public. The telemetry
+// surface (/metrics/*, session data included) lives on a separate
+// management listener — see buildMetricsMux / metricsListen. A future
+// web.Handler() would be mounted at "/" by the caller, after this mux is
+// built.
 func buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -2336,11 +2400,25 @@ func buildMux() *http.ServeMux {
 	})
 	mux.HandleFunc("/stats", handleStats)
 	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/v1/", handleProxy)
+	return mux
+}
+
+// buildMetricsMux assembles the management route table: the live metrics
+// feeds and the session/history views. It is bound to METRICS_LISTEN
+// (default 127.0.0.1:9100), never to the external listener, so other
+// clients' session and conversation data is not exposed to the public
+// surface.
+func buildMetricsMux() *http.ServeMux {
+	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics/stream", handleMetricsStream)
 	mux.HandleFunc("/metrics/burst", handleBurst)
 	mux.HandleFunc("/metrics/sessions", handleSessions)
 	mux.HandleFunc("/metrics/history", handleHistory)
-	mux.HandleFunc("/v1/", handleProxy)
+	// /stats is already public on the external listener; the dashboard's
+	// last-resort /stats fallback is a relative URL, so it must also resolve
+	// when the SPA is reached via the management listener.
+	mux.HandleFunc("/stats", handleStats)
 	return mux
 }
 
@@ -2491,12 +2569,26 @@ func main() {
 
 	mux := buildMux()
 
-	// Mount the embedded SPA dashboard as the lowest-priority catch-all.
-	// buildMux() already registered the more specific management and proxy
-	// routes (/health, /stats, /v1/models, /metrics/*, /v1/); web.Handler()
-	// 404s any of those that reach it, so nothing is shadowed. Without the
-	// webui build tag web.Handler() is a 404 stub, so this is a no-op there.
-	mux.Handle("/", web.Handler())
+	if v := os.Getenv("METRICS_LISTEN"); v != "" {
+		if _, _, err := net.SplitHostPort(v); err != nil {
+			log.Fatalf("invalid METRICS_LISTEN %q: %v", v, err)
+		}
+		metricsListen = v
+	}
+
+	// Management listener: the embedded SPA dashboard plus the live metrics
+	// feeds, sharing one trust zone — it binds 127.0.0.1 by default
+	// (METRICS_LISTEN) and is pointed at a LAN interface only when the
+	// dashboard faces that network. Without the webui build tag
+	// web.Handler() is a 404 stub, so the dashboard route is a no-op there.
+	metricsMux := buildMetricsMux()
+	metricsMux.Handle("/", web.Handler())
+	go func() {
+		log.Printf("management listener: dashboard + /metrics/* on %s", metricsListen)
+		if err := http.ListenAndServe(metricsListen, metricsMux); err != nil {
+			log.Fatalf("management listener %s: %v", metricsListen, err)
+		}
+	}()
 
 	// Refresh per-backend + fleet rates for the live metrics feed. The
 	// actual elapsed time between ticks feeds the window decay, so a
@@ -2760,8 +2852,16 @@ type historyPoint struct {
 	Flags uint32
 }
 
+// hpSet stores v in field i, rejecting values that overflow float32:
+// a finite float64 past float32 max narrows to ±Inf and json.Marshal
+// fatals on /metrics/history. Rejection leaves the presence bit unset,
+// so the field serializes as null.
 func hpSet(p *historyPoint, i int, v float64) {
-	p.V[i] = float32(v)
+	fv := float32(v)
+	if math.IsInf(float64(fv), 0) {
+		return
+	}
+	p.V[i] = fv
 	p.Flags |= 1 << uint(i)
 }
 
@@ -2901,6 +3001,17 @@ type gpuPoint struct {
 	T     int64
 	V     [guFieldN]float32
 	Flags uint8
+}
+
+// gpuSet is the float32-narrowing guard for gpuPoint fields, mirroring
+// hpSet: Inf is rejected and the presence bit stays unset.
+func gpuSet(p *gpuPoint, i int, v float64) {
+	fv := float32(v)
+	if math.IsInf(float64(fv), 0) {
+		return
+	}
+	p.V[i] = fv
+	p.Flags |= 1 << uint(i)
 }
 
 type gpuAccum struct {
@@ -3071,23 +3182,18 @@ func (h *historyStore) sample() {
 		}
 		var p gpuPoint
 		p.T = now
-		p.V[guUtil] = float32(d.UtilPct)
-		p.Flags |= 1 << guUtil
+		gpuSet(&p, guUtil, d.UtilPct)
 		if d.MemUsedMB > 0 {
-			p.V[guMemUsed] = float32(d.MemUsedMB)
-			p.Flags |= 1 << guMemUsed
+			gpuSet(&p, guMemUsed, d.MemUsedMB)
 		}
 		if d.MemTotalMB > 0 {
-			p.V[guMemTotal] = float32(d.MemTotalMB)
-			p.Flags |= 1 << guMemTotal
+			gpuSet(&p, guMemTotal, d.MemTotalMB)
 		}
 		if d.TempC != nil {
-			p.V[guTemp] = float32(*d.TempC)
-			p.Flags |= 1 << guTemp
+			gpuSet(&p, guTemp, *d.TempC)
 		}
 		if d.PowerW != nil {
-			p.V[guPower] = float32(*d.PowerW)
-			p.Flags |= 1 << guPower
+			gpuSet(&p, guPower, *d.PowerW)
 		}
 		s.add(p, now)
 	}
@@ -3161,10 +3267,18 @@ func pointFromTotals(t totalsFrame) historyPoint {
 		hpSet(&p, hiDecodeTokS, t.DecodeTokS)
 		hpSet(&p, hiKVPct, t.KVPeak)
 		hpSet(&p, hiKVMax, t.KVPeak)
-		hpSet(&p, hiKVUsedTok, t.KVUsedTok)
-		hpSet(&p, hiKVCapTok, t.KVCapTok)
-		hpSet(&p, hiKVMemGB, t.KVMemGB)
-		hpSet(&p, hiWeightMemGB, t.WeightMemGB)
+		if t.KVUsedTokN > 0 {
+			hpSet(&p, hiKVUsedTok, t.KVUsedTok)
+		}
+		if t.KVCapTokN > 0 {
+			hpSet(&p, hiKVCapTok, t.KVCapTok)
+		}
+		if t.KVMemGBN > 0 {
+			hpSet(&p, hiKVMemGB, t.KVMemGB)
+		}
+		if t.WeightMemGBN > 0 {
+			hpSet(&p, hiWeightMemGB, t.WeightMemGB)
+		}
 		hpSet(&p, hiHitRate, t.HitRate)
 	}
 	return p
@@ -3497,8 +3611,13 @@ func (h *historyStore) loadSnapshot(path string) {
 func applyFleetAggregates(f *metricsFrame) {
 	t := &f.Totals
 	var ttftW, ttftN float64
-	var hitH, hitQ, hitMean float64
-	var hitN int
+	// Counter-derived hit totals (vLLM) are pooled directly and are the sole
+	// hit source for counter-backed backends: their HitRate is the same
+	// counters as a gauge, so blending it in again would double-count.
+	// Gauge-only backends (SGLang) mix their HitRate in, weighted by their
+	// query totals when available, so a mixed fleet reports one fleet-wide
+	// figure.
+	var hitH, hitQ, hitMean, hitDen float64
 	for _, b := range f.Backends {
 		e := b.Engine
 		if e.Status == "ok" {
@@ -3513,22 +3632,35 @@ func applyFleetAggregates(f *metricsFrame) {
 			}
 			if e.KVUsedTok != nil {
 				t.KVUsedTok += *e.KVUsedTok
+				t.KVUsedTokN = 1
 			}
 			if e.KVCapTok != nil {
 				t.KVCapTok += *e.KVCapTok
+				t.KVCapTokN = 1
 			}
 			if e.KVMemGB != nil {
 				t.KVMemGB += *e.KVMemGB
+				t.KVMemGBN = 1
 			}
 			if e.WeightMemGB != nil {
 				t.WeightMemGB += *e.WeightMemGB
+				t.WeightMemGBN = 1
 			}
 			if e.HitQueriesTotal != nil && e.HitHitsTotal != nil && *e.HitQueriesTotal > 0 {
 				hitH += float64(*e.HitHitsTotal)
 				hitQ += float64(*e.HitQueriesTotal)
-			} else if e.HitRate > 0 {
-				hitMean += e.HitRate
-				hitN++
+			}
+			// Blend in only backends whose HitRate is not already the pooled
+			// counter ratio: pooling a counter-backed backend's gauge too
+			// adds its queries twice.
+			counterBacked := e.HitQueriesTotal != nil && e.HitHitsTotal != nil
+			if e.HitRate > 0 && !counterBacked {
+				w := float64(1)
+				if q := e.HitQueriesTotal; q != nil {
+					w = float64(*q)
+				}
+				hitMean += e.HitRate * w
+				hitDen += w
 			}
 		}
 		if b.TTFTSampleCount > 0 {
@@ -3540,10 +3672,15 @@ func applyFleetAggregates(f *metricsFrame) {
 		t.TTFTMs = ttftW / ttftN
 		t.TTFTSampleCount = int(ttftN)
 	}
-	if hitQ > 0 {
-		t.HitRate = hitH / hitQ
-	} else if hitN > 0 {
-		t.HitRate = hitMean / float64(hitN)
+	// Blend both where available: Σhits/Σqueries over the counter-derived
+	// part plus the weighted gauge part, normalized by total queries.
+	hits, queries := hitH, hitQ
+	if hitDen > 0 {
+		hits += hitMean
+		queries += hitDen
+	}
+	if queries > 0 {
+		t.HitRate = hits / queries
 	}
 }
 
@@ -3887,6 +4024,13 @@ type totalsFrame struct {
 	KVMemGB          float64 `json:"kvMemGB"`
 	WeightMemGB      float64 `json:"weightMemGB"`
 	HitRate          float64 `json:"hitRate"`
+
+	// Optional-gauge presence: set when any ok engine reported the field,
+	// so history stays null (never 0) when no engine reports it at all.
+	KVUsedTokN   int `json:"-"`
+	KVCapTokN    int `json:"-"`
+	KVMemGBN     int `json:"-"`
+	WeightMemGBN int `json:"-"`
 }
 
 type metricsFrame struct {
@@ -4020,6 +4164,10 @@ type burstRequestFrame struct {
 	BytesOut     int64   `json:"bytesOut"`
 }
 
+// burstLimitMax bounds the number of recent requests ?limit= may return,
+// well under the ring capacity (2000) so a single poll stays cheap.
+const burstLimitMax = 1000
+
 // handleBurst serves the recent-request ring as {"requests":[...]} (newest
 // last), ?limit default 500, max 1000.
 func handleBurst(w http.ResponseWriter, r *http.Request) {
@@ -4029,8 +4177,8 @@ func handleBurst(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	if limit > metrics.ringCap {
-		limit = metrics.ringCap
+	if limit > burstLimitMax {
+		limit = burstLimitMax
 	}
 	samples := metrics.burst(limit)
 	out := make([]burstRequestFrame, 0, len(samples))

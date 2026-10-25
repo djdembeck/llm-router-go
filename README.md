@@ -68,12 +68,13 @@ Docker is the fastest path to a running router. The container listens on port `8
 Pull the pre-built image from GHCR and provide the required `BACKENDS` JSON array:
 
 ```bash
-docker run -d --name llm-router-go -p 80:80 \
+docker run -d --name llm-router-go -p 80:80 -p 127.0.0.1:9100:9100 \
   -e BACKENDS='[{"name":"primary","url":"http://vllm-1:8000","maxConcurrent":4,"tier":0}]' \
+  -e METRICS_LISTEN=0.0.0.0:9100 \
   ghcr.io/djdembeck/llm-router-go
 ```
 
-The backend URL must be reachable from the container. Adjust the published host port when port `80` is already in use.
+The backend URL must be reachable from the container. Adjust the published host port when port `80` is already in use. The dashboard and `/metrics/*` live on a separate management listener that binds `127.0.0.1:9100` inside the container by default — unreachable from the host. To serve the dashboard, set `METRICS_LISTEN=0.0.0.0:9100` (or the interface you want it on) and publish the port (`-p 127.0.0.1:9100:9100`): the container-side bind stays `0.0.0.0`, the host-side bind is loopback, so the port reaches the host at `http://127.0.0.1:9100` only and never on the network. Because it carries in-flight and per-conversation session data, if you ever proxy it beyond localhost, put it behind your TLS/auth reverse proxy, the same boundary as the rest of the management surface.
 
 ### Binary install
 
@@ -92,10 +93,13 @@ The resulting `llm-router-go` binary is placed in the Go binary directory (`$GOB
 Start the pre-built container with one vLLM backend:
 
 ```bash
-docker run -d --name llm-router-go -p 80:80 \
+docker run -d --name llm-router-go -p 80:80 -p 127.0.0.1:9100:9100 \
   -e BACKENDS='[{"name":"primary","url":"http://vllm-1:8000","maxConcurrent":4,"tier":0}]' \
+  -e METRICS_LISTEN=0.0.0.0:9100 \
   ghcr.io/djdembeck/llm-router-go
 ```
+
+The dashboard is on the management listener: `http://127.0.0.1:9100/`.
 
 Check queue, concurrency, latency, and GPU-budget state:
 
@@ -167,6 +171,7 @@ BACKENDS='[
 | `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput used to bound how long a non-streaming request holds a large-prefill slot. The slot is released after the estimated prefill duration or the first response byte, whichever comes first. This bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
 | `HISTORY_PATH` | *(empty)* | Optional file for the dashboard's history rings. Atomic snapshots every minute; empty means memory-only (history resets on restart). |
 | `GPU_METRICS_URL` | *(empty)* | Optional Prometheus text endpoint for device GPU utilization/VRAM/temperature/power (DCGM exporter or nvidia_gpu_exporter). Empty disables device telemetry; engine KV/memory gauges remain available. |
+| `METRICS_LISTEN` | `127.0.0.1:9100` | Address for the management listener that serves the dashboard and the `/metrics/*` endpoints (including in-flight and conversation session data, which is never exposed on the external listener). Point it at a LAN interface to expose the dashboard to that network. |
 
 ## API
 
@@ -225,9 +230,14 @@ Every figure carries its data class:
 | `device` | scraped from an optional DCGM / nvidia exporter: device utilization, VRAM, temperature, power |
 | `est` | body-based token estimate (~4 bytes/token), never measured decode |
 
-The same listener serves the dashboard and the management endpoints (so it
-inherits the deployment boundary: put it behind your TLS/auth reverse proxy).
-It reads four endpoints:
+The dashboard and the metrics endpoints share one dedicated management
+listener — `METRICS_LISTEN` (default `127.0.0.1:9100`) — which is separate
+from the external API listener. Because `/metrics/sessions` exposes
+in-flight and per-conversation request data, that surface binds to the
+loopback interface by default; point `METRICS_LISTEN` at a LAN interface
+only when the deployment boundary (TLS/auth reverse proxy) covers it. The
+external listener keeps `/health`, `/stats`, and `/v1/*` only. It reads four
+endpoints:
 
 | Endpoint | Description |
 | :--- | :--- |
@@ -236,8 +246,10 @@ It reads four endpoints:
 | `GET /metrics/burst` | The most recent completed requests (bounded ring, capacity `2000`, `?limit=` default `500`), newest last, including router-originated rejections. |
 | `GET /metrics/sessions` | The in-flight request stack plus conversation-grouped sessions (polling endpoint). |
 
-The frontend connects to `/metrics/stream` via `EventSource` and falls back to
-polling `/stats` if the stream is unavailable. In `bun run dev` with no router
+The frontend connects to `/metrics/stream` via `EventSource` and falls back
+to polling `/stats` if the stream is unavailable; `/stats` is served on both
+listeners so the fallback resolves from the dashboard's origin. In
+`bun run dev` with no router
 reachable, a dev-only synthetic feed is used and the top bar marks it
 `DEV MOCK`; the production build never loads it. Rebuilt on every code change
 with `cd web && bun run build` and embedded with the `webui` build tag (the

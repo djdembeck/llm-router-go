@@ -5,10 +5,12 @@ A must emit exactly these field names/types (adding fields is allowed, changing
 or removing is not). B builds its client/types/stores to match, using a local
 mock SSE dev server for independent development.
 
-All endpoints live on the router's existing listener (same listener, same
-absence-of-auth as /stats — the router has no auth and is always deployed
-behind a TLS/auth reverse proxy). None of these may shadow the existing
-`/health`, `/stats`, `/v1/models`, or any proxied `/v1/*` path.
+All `/metrics/*` endpoints — and the dashboard — ride the management
+listener `METRICS_LISTEN` (default `127.0.0.1:9100`), separate from the
+external listener; `GET /stats` is served on both. Same absence of auth as
+`/stats` — the router has no auth and is always deployed behind a TLS/auth
+reverse proxy. None of these may shadow the existing `/health`, `/stats`,
+`/v1/models`, or any proxied `/v1/*` path.
 
 Three new management endpoints. The client uses #1 (SSE) as its primary feed;
 #2 backs the live request feed; #3 backs the live sessions view (in-flight
@@ -195,8 +197,9 @@ On a non-ok scrape (`"off"`/`"err"`): the **rate** and **mean** fields are zeroe
 ## 2. GET /metrics/burst
 
 A single JSON object: the most recent completed requests in a bounded ring
-(server capacity 2000; `?limit=` default 500, clamped to the ring capacity).
-Newest last. Backs the live request-feed tape.
+(server capacity 2000; `?limit=` default 500, clamped to a **1000** response
+cap — the ring itself stays 2000). Newest last. Backs the live request-feed
+tape.
 
 ```json
 {
@@ -283,9 +286,12 @@ No query params. The client polls it (it is not an SSE feed).
 Semantics:
 
 **Session identity.** For chat requests (`messages` array non-empty), the
-session id is the sha1 of the raw JSON of every message **except the last**,
-joined by `"\n"` (a single-message conversation uses that message's content),
-hex-encoded, truncated to **12 chars**. Same conversation prefix → same
+session id is the sha1 of a length-framed digest of every message
+**except the last** — each message rendered as
+`len(role):role:len(content):content`, joined by `"\n"` (a
+single-message conversation uses that message's content) — hex-encoded,
+truncated to **12 chars**. Length framing avoids concatenation collisions
+and keeps role changes distinct. Same conversation prefix → same
 session; a conversation **forks a new session at its second turn** (the
 prefix grows). Non-chat paths (`/v1/completions` with a `prompt` string, or
 unparseable bodies) get `sess: ""` — the request still appears in `live`
@@ -309,8 +315,10 @@ beyond that); internal live map cap **1024** (evict oldest on insert).
 - `streamMs` — UnixMilli of the first response body byte (source:
   respTracker first-byte hook → `sessionRegistry.firstByte`). Class:
   **measured timestamp**. `0` while still admitted; the first-byte age
-  `streamMs − startMs` is the measured prefill duration (rendered `est`
-  only because the request's token count is an estimate).
+  `streamMs − startMs` is the measured time-to-first-byte (TTFT), the
+  router's primary streaming latency signal. The token-based prefill
+  estimate stays `estPrefillMs`, labeled `est` — it is not a measured
+  prefill duration.
 
 **`sessions[]`** — per conversation:
 - `n` — completed requests in the session (incl. rejections); `firstMs`/`lastMs` — first/last request ms.
@@ -361,15 +369,18 @@ usage inconsistently. Therefore:
 This is a measurement boundary, not a data-quality bug; the handoff states it.
 
 ## Dev mock (slice B)
-B ships a SvelteKit dev-only route (`src/routes/dev-metrics/+server.ts`) that
-emits the SAME SSE frame shape + burst shape from a small synthesizer, so the
-dashboard runs with `bun run dev` and no router running. The Vite proxy in
-`vite.config.ts` forwards `/stats`, `/metrics/*`, and `/v1/models` to the real
-router (default `http://localhost:80`) when one is up; the store prefers
-`/metrics/stream`, falls back to `/dev-metrics/stream` in dev, then to
-`/stats` polling. Never ship the mock in the production build (it is a
-`+server.ts` route that the static `adapter-static` build prerservers/omits;
-the production store only ever hits `/metrics/stream` and `/stats`).
+B ships SvelteKit dev-only routes (`web/src/routes/dev-metrics/stream`,
+`burst`, `sessions`, and `history` — one `+server.ts` each) that emit the
+SAME frame shapes from a small synthesizer, so the dashboard runs with
+`bun run dev` and no router running. The Vite proxy in `vite.config.ts`
+forwards `/metrics` to the router's management listener
+(`METRICS_ROUTER_PROXY`, default `http://localhost:9100`), while `/stats`
+and `/v1/models` keep the external listener (`DEV_ROUTER_PROXY`, default
+`http://localhost:80`); the store prefers `/metrics/stream`, falls back to
+`/dev-metrics/stream` in dev, then to `/stats` polling. Never ship the mock
+in the production build (the `+server.ts` routes are omitted by the static
+`adapter-static` build; the production store only ever hits
+`/metrics/stream` and `/stats`).
 
 ---
 

@@ -5,7 +5,7 @@
 // Frames are full snapshots. History lives on the server; this store keeps
 // one frame per second (a short live tail for the profile's right edge).
 
-import { browser } from "$app/environment";
+import { browser } from "$app/env";
 import {
   emptyEngine,
   getJSON,
@@ -54,6 +54,8 @@ export class LiveStore {
   stale = $state(false);
   paused = $state(false);
   sessions = $state<SessionsFeed | null>(null);
+  /** true once a poll succeeded and a later one failed; the kept feed is not current */
+  sessionsStale = $state(false);
   requests = $state<BurstRequest[]>([]);
   spikeCount = $state(0);
   spikePeak = $state(0);
@@ -78,6 +80,7 @@ export class LiveStore {
   private spikeSamples: number[] = [];
   private backendSig = "";
   private sseRetry = 0;
+  private sseStartMs = 0;
 
   start(): void {
     if (!browser || this.started) return;
@@ -146,6 +149,7 @@ export class LiveStore {
       this.lastSec = 0;
       this.framesVersion++;
       this.sessions = null;
+      this.sessionsStale = false;
       this.requests = [];
       this.spikeCount = 0;
       this.spikePeak = 0;
@@ -206,6 +210,10 @@ export class LiveStore {
   private startSse(i: number): void {
     if (this.stop) return;
     const gen = ++this.sseGen;
+    // Connect deadline anchor: the watchdog also times out when the
+    // connection never delivered a single frame (lastFrameMs is 0 until
+    // the first valid frame, so it cannot serve as an anchor on its own).
+    this.sseStartMs = Date.now();
     const feeds: FeedInfo[] = [
       { name: "stream", url: "/metrics/stream", kind: "sse", gone: false },
     ];
@@ -246,7 +254,8 @@ export class LiveStore {
     this.watchdogTimer = window.setInterval(() => {
       if (this.stop) return;
       if (this.feed && (this.feed.kind === "sse" || this.feed.kind === "sse-mock")) {
-        if (!this.paused && this.lastFrameMs && Date.now() - this.lastFrameMs > 6000) {
+        const anchor = this.lastFrameMs || this.sseStartMs;
+        if (!this.paused && anchor && Date.now() - anchor > 6000) {
           this.closeEs();
           this.startSse(0);
         }
@@ -272,7 +281,14 @@ export class LiveStore {
   private async pollSessions(): Promise<void> {
     if (this.paused) return;
     const j = await this.fetchSessions();
-    if (j) this.sessions = j;
+    if (j) {
+      this.sessions = j;
+      this.sessionsStale = false;
+    } else if (this.sessions !== null) {
+      // A successful poll preceded this one; a failed follow-up must not
+      // present the previous feed as current. Keep it, flagged stale.
+      this.sessionsStale = true;
+    }
   }
 
   private startSessions(): void {

@@ -2,7 +2,7 @@
 // short cache. The live tail is appended by the page from the 1 s frames, so
 // the profile's right edge keeps moving while the fetched series is stable.
 
-import { browser } from "$app/environment";
+import { browser } from "$app/env";
 import { getJSON, type HistoryResponse, type RangeName } from "./api";
 
 const REFRESH_MS: Record<RangeName, number> = {

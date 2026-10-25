@@ -141,7 +141,10 @@
           </tr>
         </thead>
         <tbody>
-          {#each shown as r (r.t + ":" + r.start + ":" + r.backend + ":" + r.path + ":" + r.status)}
+          <!-- no key: server rows share no unique id, and the ms-rounded
+               start/complete + backend + endpoint tuple is not unique (immediate
+               rejections share the millisecond) → a duplicate key crashes #each -->
+          {#each shown as r}
             <tr>
               <td class="col-time mono">{fmtClock(r.t)}</td>
               {#if singleBackend == null}

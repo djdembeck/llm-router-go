@@ -1591,8 +1591,11 @@ func TestMetricsStream_LiveSnapshot(t *testing.T) {
 	metrics = newTestMetrics()
 	t.Cleanup(func() { metrics = saveMetrics })
 
-	srv := httptest.NewServer(buildMux())
-	defer srv.Close()
+	ext := httptest.NewServer(buildMux())
+	defer ext.Close()
+	msrv := httptest.NewServer(buildMetricsMux())
+	defer msrv.Close()
+	srv := ext
 
 	// 1. Slow streaming request on "subject": first byte lands after ~150ms.
 	streamDone := make(chan int, 1)
@@ -1611,7 +1614,7 @@ func TestMetricsStream_LiveSnapshot(t *testing.T) {
 	// 2. Open the SSE feed (200ms interval = clamped floor).
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", srv.URL+"/metrics/stream?interval=200ms", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", msrv.URL+"/metrics/stream?interval=200ms", nil)
 	if err != nil {
 		t.Fatalf("SSE request build: %v", err)
 	}
@@ -1746,7 +1749,7 @@ func TestMetricsStream_LiveSnapshot(t *testing.T) {
 	<-kingBusy
 
 	// 5. Burst: the 429 rejection must be in the ring with queue-wait dur.
-	burstResp, err := http.Get(srv.URL + "/metrics/burst")
+	burstResp, err := http.Get(msrv.URL + "/metrics/burst")
 	if err != nil {
 		t.Fatalf("burst request: %v", err)
 	}
@@ -1850,6 +1853,8 @@ func TestMetricsStream_RouteShadowing(t *testing.T) {
 
 	srv := httptest.NewServer(buildMux())
 	defer srv.Close()
+	msrv := httptest.NewServer(buildMetricsMux())
+	defer msrv.Close()
 
 	// /v1/models serves the merged catalog, not the proxy.
 	resp, err := http.Get(srv.URL + "/v1/models")
@@ -1886,10 +1891,11 @@ func TestMetricsStream_RouteShadowing(t *testing.T) {
 		t.Errorf("proxied = %+v, want id=proxied", proxied)
 	}
 
-	// /metrics/stream is a distinct route (SSE, not a 404/405 proxy miss).
+	// /metrics/stream serves SSE on the management mux — and the external
+	// listener no longer exposes it (session data left the public surface).
 	sctx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer scancel()
-	req, err := http.NewRequestWithContext(sctx, "GET", srv.URL+"/metrics/stream", nil)
+	req, err := http.NewRequestWithContext(sctx, "GET", msrv.URL+"/metrics/stream", nil)
 	if err != nil {
 		t.Fatalf("stream request build: %v", err)
 	}
@@ -1901,6 +1907,15 @@ func TestMetricsStream_RouteShadowing(t *testing.T) {
 		t.Errorf("stream status/content-type = %d/%q, want 200/text-event-stream", resp3.StatusCode, resp3.Header.Get("Content-Type"))
 	}
 	resp3.Body.Close()
+
+	extResp, err := http.Get(srv.URL + "/metrics/stream")
+	if err != nil {
+		t.Fatalf("external stream request: %v", err)
+	}
+	extResp.Body.Close()
+	if extResp.StatusCode != http.StatusNotFound {
+		t.Errorf("external /metrics/stream = %d, want 404 (management-only route)", extResp.StatusCode)
+	}
 }
 
 func TestHandleBurst_LimitClamp(t *testing.T) {
@@ -1913,7 +1928,7 @@ func TestHandleBurst_LimitClamp(t *testing.T) {
 	metrics = m
 	t.Cleanup(func() { metrics = saveMetrics })
 
-	srv := httptest.NewServer(buildMux())
+	srv := httptest.NewServer(buildMetricsMux())
 	defer srv.Close()
 
 	// limit=5 returns exactly 5, newest last.
@@ -2284,7 +2299,7 @@ func TestSessions_FeedJSON(t *testing.T) {
 	sessions = r
 	t.Cleanup(func() { sessions = saveSessions })
 
-	srv := httptest.NewServer(buildMux())
+	srv := httptest.NewServer(buildMetricsMux())
 	defer srv.Close()
 
 	// A chat request (12-hex session) and a non-chat request (sess "").
@@ -2524,6 +2539,16 @@ func TestHistory_QueryDenseArrays(t *testing.T) {
 			h.backends["b"] = s
 		}
 		s.add(p, p.T)
+	}
+	// The 5m window's final bucket is [floor(now,1s)-1s, floor(now,1s)):
+	// it is the previous, not the current, second, so the seeded points
+	// (now-0..3s) land in the excluded top second and the final bucket can
+	// be empty. Seed a point in the final bucket directly.
+	var lp historyPoint
+	lp.T = now/1000*1000 - 500
+	hpSet(&lp, hiInFlight, 3.5)
+	if s, ok := h.backends["b"]; ok {
+		s.add(lp, lp.T)
 	}
 	resp := h.query("5m", []string{"b"})
 	if resp.StepMs != 1000 || len(resp.Backends) != 1 {
@@ -2791,4 +2816,948 @@ func TestRespTracker_ProxiedRequestIsNotARejection(t *testing.T) {
 	if s.ReqTotal != 2 || s.RejectedTotal != 1 {
 		t.Fatalf("after rejection: reqTotal=%d rejectTotal=%d, want 2/1", s.ReqTotal, s.RejectedTotal)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// float32 narrowing guards (history + GPU storage boundary)
+// ---------------------------------------------------------------------------
+
+func TestHistory_HpSet_Float32OverflowRejected(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      float64
+		wantSet bool
+		wantVal float32
+	}{
+		{"zero", 0, true, 0},
+		{"fraction", 0.42, true, 0.42},
+		{"large finite in float32 range", 1e30, true, 1e30},
+		{"float32 max", math.MaxFloat32, true, math.MaxFloat32},
+		{"past float32 max, finite float64", 1e100, false, 0},
+		{"overflow to +Inf", 1e308, false, 0},
+		{"overflow to -Inf", -1e308, false, 0},
+		{"max float64", math.MaxFloat64, false, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var p historyPoint
+			hpSet(&p, hiKVPct, tc.in)
+			set := hpHas(p, hiKVPct)
+			if set != tc.wantSet {
+				t.Fatalf("presence = %v, want %v (in=%v)", set, tc.wantSet, tc.in)
+			}
+			if set && p.V[hiKVPct] != tc.wantVal {
+				t.Errorf("value = %v, want %v", p.V[hiKVPct], tc.wantVal)
+			}
+			// A rejected value must not poison the point's JSON.
+			if _, err := json.Marshal(p.V); err != nil {
+				t.Errorf("marshal: %v", err)
+			}
+
+			var g gpuPoint
+			gpuSet(&g, guUtil, tc.in)
+			gset := g.Flags&(1<<uint(guUtil)) != 0
+			if gset != tc.wantSet {
+				t.Fatalf("gpu presence = %v, want %v (in=%v)", gset, tc.wantSet, tc.in)
+			}
+			if gset && g.V[guUtil] != tc.wantVal {
+				t.Errorf("gpu value = %v, want %v", g.V[guUtil], tc.wantVal)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ×100 scaled view fields (finite overflow must not reach JSON)
+// ---------------------------------------------------------------------------
+
+func TestEngine_ScrapeBody_ScaledPctOverflowDropped(t *testing.T) {
+	tests := []struct {
+		name   string
+		line   string
+		assert func(t *testing.T, v engineView)
+	}{
+		{
+			name: "vllm kv usage finite",
+			line: `vllm:kv_cache_usage_perc{model_name="m"} 0.42`,
+			assert: func(t *testing.T, v engineView) {
+				if v.KVPct != 42 {
+					t.Errorf("kvPct = %v, want 42", v.KVPct)
+				}
+			},
+		},
+		{
+			name: "vllm kv usage overflows x100",
+			line: `vllm:kv_cache_usage_perc{model_name="m"} 1e308`,
+			assert: func(t *testing.T, v engineView) {
+				if math.IsInf(v.KVPct, 0) || v.KVPct != 0 {
+					t.Errorf("kvPct = %v, want dropped (0)", v.KVPct)
+				}
+			},
+		},
+		{
+			name: "sglang full token usage finite",
+			line: `sglang:full_token_usage 0.77`,
+			assert: func(t *testing.T, v engineView) {
+				if v.FullPct == nil || *v.FullPct != 77 {
+					t.Errorf("fullPct = %v, want 77", v.FullPct)
+				}
+			},
+		},
+		{
+			name: "sglang full token usage overflows x100",
+			line: `sglang:full_token_usage 1e308`,
+			assert: func(t *testing.T, v engineView) {
+				if v.FullPct != nil {
+					t.Errorf("fullPct = %v, want nil", v.FullPct)
+				}
+			},
+		},
+		{
+			name: "sglang swa token usage overflows x100",
+			line: `sglang:swa_token_usage 1e308`,
+			assert: func(t *testing.T, v engineView) {
+				if v.SwaPct != nil {
+					t.Errorf("swaPct = %v, want nil", v.SwaPct)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &engineScrape{}
+			s.scrapeBody(parsePromText([]byte(tc.line + "\n")))
+			if s.status != "ok" {
+				t.Fatalf("status = %q, want ok", s.status)
+			}
+			tc.assert(t, s.view)
+			// The published view must stay marshalable — a leaked Inf
+			// would kill the SSE /metrics stream.
+			if _, err := json.Marshal(s.view); err != nil {
+				t.Errorf("marshal view: %v", err)
+			}
+		})
+	}
+}
+
+// TestSessions_RingWrap emits the last-32 ring after it has wrapped. The
+// 33rd request on a 32-slot ring is the case where the oldest slot sits at
+// reqIdx itself: the old linear slice overran the array and feed() panicked.
+func TestSessions_RingWrap(t *testing.T) {
+	isShown := func(k string, f sessionsFeed) bool {
+		for _, s := range f.Sessions {
+			if s.ID == k {
+				return true
+			}
+		}
+		return false // feed is capped at 100 sessions
+	}
+	for _, n := range []int{32, 33, 40, 64, 100} {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			r := newSessionRegistry()
+			key := "ringwrap00001"
+			for i := 1; i <= n; i++ {
+				id := r.start("b1", "/v1/chat/completions", false, key, 10, 5)
+				r.finish(id, 200, float64(i*4), 0, 20)
+			}
+			f := r.feed()
+			s := sessById(t, f, key)
+			if s.N != n {
+				t.Fatalf("n = %d, want %d", s.N, n)
+			}
+			want := 32
+			if n < 32 {
+				want = n
+			}
+			// The feed would have panicked on a wrap overrun.
+			if !isShown(key, f) {
+				t.Fatalf("session %s missing from feed", key)
+			}
+			if s.Reqs == nil || len(s.Reqs) != want {
+				t.Fatalf("len(reqs) = %d, want %d (oldest first)", len(s.Reqs), want)
+			}
+			// Newest request is n, oldest in the ring is n-31.
+			for i := 0; i < len(s.Reqs); i++ {
+				wantDur := float64((n - len(s.Reqs) + 1 + i) * 4)
+				if math.Abs(s.Reqs[i].DurMs-wantDur) > 1e-9 {
+					t.Errorf("reqs[%d].durMs = %v, want %v (n=%d)", i, s.Reqs[i].DurMs, wantDur, n)
+				}
+			}
+		})
+	}
+}
+
+// TestSessions_LiveEvictionDecmentsLiveN: when the live map overflows, the
+// evicted request never runs finish(), so its session's LiveN must be
+// retired at eviction — or the session stays "live" forever, put() can
+// never evict it, and the session store grows past sessStoreCap.
+func TestSessions_LiveEvictionDecmentsLiveN(t *testing.T) {
+	// One conversation with sessLiveCap+1 requests in flight: the first
+	// admitted request is evicted from the live map (its id never reaches
+	// finish()), so its session's LiveN must be retired at eviction.
+	r := newSessionRegistry()
+	key := "evict-live-1"
+	for range sessLiveCap + 1 {
+		r.start("b1", "/v1/chat/completions", true, key, 10, 5)
+	}
+	id1 := uint64(1) // nextID starts at 1 and only this registry is used
+	r.mu.Lock()
+	a, ok := r.sessions[key]
+	_, liveHasEvicted := r.live[id1]
+	r.mu.Unlock()
+	if !ok {
+		t.Fatalf("session %s missing from the store", key)
+	}
+	if liveHasEvicted {
+		t.Fatalf("oldest request %d should have been evicted from the live map", id1)
+	}
+	if a.LiveN != sessLiveCap {
+		t.Errorf("session LiveN = %d, want %d (%d admitted, 1 evicted)", a.LiveN, sessLiveCap, sessLiveCap+1)
+	}
+
+	// Full-cap stress: sessLiveCap+1 distinct conversations. The first one
+	// gets live-evicted (its id never reaches finish()); every request is
+	// then completed. With the fix the strander's LiveN was retired at
+	// eviction, so put() may evict it like any other finished conversation;
+	// without it, put() skips its forever-live count and it is pinned in
+	// the store even after it is the oldest finished session.
+	r2 := newSessionRegistry()
+	ids := make([]uint64, 0, sessLiveCap+1)
+	for i := range sessLiveCap + 1 {
+		ids = append(ids, r2.start("b1", "/v1/chat/completions", true,
+			fmt.Sprintf("stress-%04d", i), 10, 5))
+	}
+	for _, id := range ids {
+		r2.finish(id, 200, 1, 0, 40)
+	}
+	// A new conversation at/over the store cap triggers an LRU eviction of
+	// the oldest finished session — which is the live-evicted strander.
+	r2.start("b1", "/v1/chat/completions", true, "stress-new", 10, 5)
+	r2.mu.Lock()
+	_, stranded := r2.sessions["stress-0000"]
+	allFinished := true
+	for _, a := range r2.sessions {
+		if a.LiveN != 0 && a.ID != "stress-new" {
+			allFinished = false
+		}
+	}
+	r2.mu.Unlock()
+	if stranded {
+		t.Errorf("live-evicted session stress-0000 pinned in the store " +
+			"(phantom LiveN: put() skipped it in LRU eviction)")
+	}
+	if !allFinished {
+		t.Errorf("a finished session kept a live count after live eviction")
+	}
+}
+
+// newProdLikeProxy builds a reverse proxy exactly the way main() does, with
+// the real backend name in the ErrorHandler (newTestProxy hardcodes "test").
+func newProdLikeProxy(t *testing.T, name, upstream string) *httputil.ReverseProxy {
+	t.Helper()
+	u, err := url.Parse(upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := httputil.NewSingleHostReverseProxy(u)
+	p.FlushInterval = -1
+	n := name
+	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		handleProxyError(w, r, err, n)
+	}
+	return p
+}
+
+// waitForBurst polls the swapped metrics ring until it holds at least want
+// samples (the proxy's deferred finalizer can lag the client's roundtrip).
+func waitForBurst(t *testing.T, want int) []requestSample {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if ring := metrics.burst(100); len(ring) >= want {
+			return ring
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out: metrics ring holds %d samples, want %d", len(metrics.burst(100)), want)
+	return nil
+}
+
+// TestFleetAggregates_MixedFleetHitRateBlend covers the fleet hit-rate blend
+// for a mixed fleet: a vLLM backend's counter pair pools its totals, while
+// SGLang backends expose only a HitRate gauge and blend in weighted by their
+// query total when available, else weight 1.
+func TestFleetAggregates_MixedFleetHitRateBlend(t *testing.T) {
+	i64 := func(v int64) *int64 { return &v }
+	for _, tc := range []struct {
+		name string
+		sg   engineView // SGLang side: gauge (+ optional query total)
+		want float64
+	}{
+		{
+			name: "gauge without query total defaults weight 1",
+			sg:   engineView{Status: "ok", HitRate: 0.5},
+			want: (791.0 + 0.5*1) / (1000 + 1),
+		},
+		{
+			name: "gauge weighted by query total",
+			sg:   engineView{Status: "ok", HitRate: 0.5, HitQueriesTotal: i64(400)},
+			want: (791.0 + 0.5*400) / (1000 + 400),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := metricsFrame{Backends: []backendFrame{
+				// Counter-backed: its gauge (even if present) must NOT be
+				// blended on top of the pooled counters.
+				{Name: "vllm", Engine: engineView{Status: "ok", HitRate: 0.791,
+					HitQueriesTotal: i64(1000), HitHitsTotal: i64(791)}},
+				{Name: "sglang", Engine: tc.sg},
+			}}
+			applyFleetAggregates(&f)
+			if got := f.Totals.HitRate; got < tc.want-1e-9 || got > tc.want+1e-9 {
+				t.Errorf("blended hitRate = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEngine_ScrapeBySourceOneSided covers the vLLM by_source prefill split
+// when only one side reports: the missing component stays 0, the total
+// derives from the single source, and the legacy prompt_tokens_total
+// fallback still wins when by_source is absent entirely.
+func TestEngine_ScrapeBySourceOneSided(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  string
+		plant promSample
+	}{
+		{
+			name:  "only local_compute",
+			body:  "vllm:prompt_tokens_by_source_total{source=\"local_compute\"} 3000\n",
+			plant: promSample{name: "vllm:prompt_tokens_by_source_total", labels: map[string]string{"source": "local_compute"}},
+		},
+		{
+			name:  "only local_cache_hit",
+			body:  "vllm:prompt_tokens_by_source_total{source=\"local_cache_hit\"} 3000\n",
+			plant: promSample{name: "vllm:prompt_tokens_by_source_total", labels: map[string]string{"source": "local_cache_hit"}},
+		},
+		{
+			name:  "no by_source: legacy prompt_tokens_total",
+			body:  "vllm:prompt_tokens_total 3000\n",
+			plant: promSample{name: "vllm:prompt_tokens_total"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newEngineRegistry()
+			r.add("king", "http://127.0.0.1:1/metrics") // url unused
+			r.mu.Lock()
+			s := r.backends["king"]
+			r.mu.Unlock()
+
+			// Prime the matching baseline ~2s ago at 1000 tokens; the scrape
+			// advances it to 3000 -> ~1000/s, same pattern as TestEngine_ScrapeVllm.
+			key := counterKey(tc.plant)
+			s.counters[key] = 1000
+			s.cTimes[key] = time.Now().Add(-2 * time.Second)
+
+			s.scrapeBody(parsePromText([]byte(tc.body)))
+			v := s.view
+
+			wantRate := func(field string, got float64) {
+				if got < 980 || got > 1020 {
+					t.Errorf("%s = %v, want ~1000 (3000-1000 tokens / ~2s)", field, got)
+				}
+			}
+			switch tc.name {
+			case "only local_compute":
+				wantRate("prefillTokS", v.PrefillTokS)
+				if v.PrefillCacheTokS != 0 {
+					t.Errorf("prefillCacheTokS = %v, want 0 (missing source)", v.PrefillCacheTokS)
+				}
+				wantRate("prefillTotalTokS (compute-only)", v.PrefillTotalTokS)
+				if v.PrefillTotalTokS != v.PrefillTokS {
+					t.Errorf("prefillTotalTokS = %v, want prefillTokS %v (single source)", v.PrefillTotalTokS, v.PrefillTokS)
+				}
+			case "only local_cache_hit":
+				if v.PrefillTokS != 0 {
+					t.Errorf("prefillTokS = %v, want 0 (missing source)", v.PrefillTokS)
+				}
+				wantRate("prefillCacheTokS", v.PrefillCacheTokS)
+				wantRate("prefillTotalTokS (cache-only)", v.PrefillTotalTokS)
+				if v.PrefillTotalTokS != v.PrefillCacheTokS {
+					t.Errorf("prefillTotalTokS = %v, want prefillCacheTokS %v (single source)", v.PrefillTotalTokS, v.PrefillCacheTokS)
+				}
+			default: // legacy fallback
+				wantRate("prefillTokS (legacy)", v.PrefillTokS)
+				if v.PrefillCacheTokS != 0 {
+					t.Errorf("prefillCacheTokS = %v, want 0", v.PrefillCacheTokS)
+				}
+				wantRate("prefillTotalTokS (legacy)", v.PrefillTotalTokS)
+			}
+		})
+	}
+}
+
+// TestEngine_ScrapeFailureResetsBaselines covers the non-ok scrape contract:
+// gauges and lifetime counters are retained, interval fields are zeroed, and
+// counter + histogram baselines are reset so the next ok scrape re-baselines
+// without double-counting the failed interval.
+func TestEngine_ScrapeFailureResetsBaselines(t *testing.T) {
+	var mode atomic.Int64
+	bodyA := func(prompt float64, ttftSum, ttftCnt float64) string {
+		return fmt.Sprintf(`vllm:num_requests_running{model_name="m",engine="0"} 3
+vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.6
+vllm:num_preemptions_total{model_name="m",engine="0"} 4
+vllm:prompt_tokens_total{model_name="m",engine="0"} %g
+vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} %g
+vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} %g
+`, prompt, ttftSum, ttftCnt)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		switch mode.Load() {
+		case 0:
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case 1:
+			fmt.Fprint(w, bodyA(1000, 10, 2))
+		case 2:
+			fmt.Fprint(w, bodyA(2000, 30, 4))
+		case 3:
+			fmt.Fprint(w, bodyA(3000, 40, 5))
+		case 4:
+			fmt.Fprint(w, bodyA(4000, 60, 7))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	r := newEngineRegistry()
+	r.add("king", srv.URL)
+	r.mu.Lock()
+	s := r.backends["king"]
+	r.mu.Unlock()
+
+	mode.Store(1)
+	r.scrape("king") // ok: baselines established (first sight: rates 0)
+	mode.Store(2)
+	time.Sleep(250 * time.Millisecond)
+	r.scrape("king") // ok: interval fields live
+	if s.view.PrefillTokS < 3000 || s.view.PrefillTokS > 5000 {
+		t.Fatalf("prefillTokS before failure = %v, want ~4000 (1000 tokens / ~250ms)", s.view.PrefillTokS)
+	}
+	if s.view.TTFTms != 10000 || s.view.TTFTSamples != 2 {
+		t.Fatalf("ttft before failure = %vms/%d samples, want 10000/2", s.view.TTFTms, s.view.TTFTSamples)
+	}
+	if s.view.KVPct != 60 {
+		t.Fatalf("kvPct = %v, want 60", s.view.KVPct)
+	}
+
+	// 1) Failure: status err, interval fields zeroed, baselines reset,
+	// gauges + lifetime retained.
+	mode.Store(0)
+	r.scrape("king")
+	v := s.view
+	if v.Status != "err" {
+		t.Fatalf("status = %q, want err", v.Status)
+	}
+	if v.LastError == "" {
+		t.Errorf("lastError empty after 500")
+	}
+	if v.KVPct != 60 {
+		t.Errorf("kvPct = %v after failure, want 60 retained", v.KVPct)
+	}
+	if v.PreemptedTotal == nil || *v.PreemptedTotal != 4 {
+		t.Errorf("preemptedTotal = %v after failure, want 4 retained", v.PreemptedTotal)
+	}
+	if v.PrefillTokS != 0 || v.TTFTms != 0 || v.TTFTSamples != 0 || v.PrefillTotalTokS != 0 {
+		t.Errorf("interval fields not zeroed after failure: prefillTokS=%v ttftMs=%v ttftSamples=%d",
+			v.PrefillTokS, v.TTFTms, v.TTFTSamples)
+	}
+	if len(s.counters) != 0 {
+		t.Errorf("counter baselines not reset: %d entries remain", len(s.counters))
+	}
+	if h := s.hists["vllm:time_to_first_token_seconds"]; h == nil || h.have || !h.t.IsZero() {
+		t.Errorf("histogram baseline not reset: %+v", h)
+	}
+
+	// 2) Recovery: first success after reset re-baselines (rate 0, proving
+	// the failed interval's delta is NOT double-counted). The 1s err
+	// backoff is cleared by hand (whitebox, as the sibling backoff tests)
+	// so this recovery isn't a 1s poll.
+	r.mu.Lock()
+	s.errNext = time.Time{}
+	r.mu.Unlock()
+	mode.Store(3)
+	r.scrape("king")
+	v = s.view
+	if v.Status != "ok" {
+		t.Fatalf("recovery status = %q, want ok", v.Status)
+	}
+	if v.KVPct != 60 {
+		t.Errorf("kvPct = %v after recovery, want 60", v.KVPct)
+	}
+	if v.PrefillTokS != 0 {
+		t.Errorf("prefillTokS after reset = %v, want 0 (re-baselined, no double count)", v.PrefillTokS)
+	}
+	if v.TTFTms != 0 || v.TTFTSamples != 0 {
+		t.Errorf("ttft after reset = %vms/%d, want 0/0 (re-baselined)", v.TTFTms, v.TTFTSamples)
+	}
+
+	// 3) Interval fields restore on the following ok scrape, with the
+	// failure-era baseline as the floor.
+	mode.Store(4)
+	time.Sleep(250 * time.Millisecond)
+	r.scrape("king")
+	v = s.view
+	if v.PrefillTokS < 3000 || v.PrefillTokS > 5000 {
+		t.Errorf("prefillTokS after recovery = %v, want ~4000 (1000 tokens / ~250ms)", v.PrefillTokS)
+	}
+	if v.TTFTms != 10000 || v.TTFTSamples != 2 {
+		t.Errorf("restored ttft = %vms/%d samples, want 10000/2 from post-reset baseline", v.TTFTms, v.TTFTSamples)
+	}
+}
+
+// TestProxy_AbortAndCancelSamples covers the deferred finalizer for proxied
+// requests that end without a completed response: an upstream body abort
+// lands 502 with a sane TTFT/partial BytesOut; a client cancel lands 499.
+// Each case records exactly one sample.
+func TestProxy_AbortAndCancelSamples(t *testing.T) {
+	const chatBody = `{"model":"m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+
+	t.Run("abort", func(t *testing.T) {
+		// Upstream commits a Content-Length:1000 response, streams one
+		// body byte, then hard-closes the connection. The proxy's body copy
+		// hits EOF and aborts (ErrAbortHandler), so the request
+		// never returned cleanly: 502.
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer c.Close()
+					c.SetReadDeadline(time.Now().Add(2 * time.Second))
+					// Drain the whole client request (headers + body) BEFORE
+					// responding: closing mid-request RSTs the socket and
+					// kills the proxy's roundtrip (503) before any response
+					// byte — exactly what the 502 path must not hit.
+					br := bufio.NewReaderSize(c, 8192)
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						return
+					}
+					if req.ContentLength > 0 {
+						// ReadRequest consumed only the headers; the body
+						// bytes may already be buffered in br.
+						io.CopyN(io.Discard, io.MultiReader(br, c), req.ContentLength)
+					}
+					// Announce 1024 bytes, deliver 512, close: the proxy's
+					// body copy EOFs mid-response (ErrAbortHandler) -> 502.
+					c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\n\r\n" + strings.Repeat("x", 512)))
+				}(conn)
+			}
+		}()
+
+		upstream := "http://" + ln.Addr().String()
+		withRouterEnv(t, []Backend{{Name: "m1", URL: upstream, Tier: 0}}, nil, nil)
+		proxies["m1"] = newProdLikeProxy(t, "m1", upstream)
+		saveMetrics := metrics
+		metrics = newTestMetrics()
+		t.Cleanup(func() { metrics = saveMetrics })
+
+		srv := httptest.NewServer(buildMux())
+		t.Cleanup(srv.Close)
+
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
+		if err == nil {
+			io.ReadAll(resp.Body)
+			resp.Body.Close()
+		} // client sees the stream break; the server side is what matters here
+
+		ring := waitForBurst(t, 1)
+		if len(ring) != 1 {
+			t.Fatalf("ring = %d samples, want exactly 1", len(ring))
+		}
+		s := ring[0]
+		if s.Status != http.StatusBadGateway {
+			t.Errorf("status = %d, want 502 (upstream aborted mid-response)", s.Status)
+		}
+		if !s.Stream {
+			t.Errorf("stream = false, want true")
+		}
+		// Loopback first byte (the 200 header) is sub-millisecond, so 0ms
+		// is the sane floor; anything seconds-long is not.
+		if s.TTFTMs < 0 || s.TTFTMs > 60000 {
+			t.Errorf("ttftMs = %v, want sane first-byte time in [0, 60s)", s.TTFTMs)
+		}
+		// FlushInterval -1 flushes every chunk as it arrives, so the
+		// delivered partial reaches the tracker before the abort.
+		if s.BytesOut <= 0 || s.BytesOut > 512 {
+			t.Errorf("bytesOut = %d, want the delivered partial >0 and <= 512", s.BytesOut)
+		}
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		// Upstream streams forever; the client takes the first chunk and
+		// cancels. The proxy sees the request context canceled: 499 (metrics
+		// only — nothing can be written to a gone client).
+		up2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "data: chunk\n\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+		}))
+		t.Cleanup(up2.Close)
+
+		withRouterEnv(t, []Backend{{Name: "m1", URL: up2.URL, Tier: 0}}, nil, nil)
+		proxies["m1"] = newProdLikeProxy(t, "m1", up2.URL)
+		saveMetrics := metrics
+		metrics = newTestMetrics()
+		t.Cleanup(func() { metrics = saveMetrics })
+
+		srv := httptest.NewServer(buildMux())
+		t.Cleanup(srv.Close)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(ctx, "POST", srv.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		buf := make([]byte, 32)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			n, _ := resp.Body.Read(buf)
+			if n > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel() // client bails mid-stream
+		resp.Body.Close()
+
+		ring := waitForBurst(t, 1)
+		if len(ring) != 1 {
+			t.Fatalf("ring = %d samples, want exactly 1", len(ring))
+		}
+		s := ring[0]
+		if s.Status != 499 {
+			t.Errorf("status = %d, want 499 (client cancel)", s.Status)
+		}
+		if !s.Stream {
+			t.Errorf("stream = false, want true")
+		}
+		// The 200 header is the first byte, landing sub-millisecond after
+		// admission on loopback: 0ms is the sane floor, not a failure.
+		if s.TTFTMs < 0 || s.TTFTMs > 60000 {
+			t.Errorf("ttftMs = %v, want sane first-byte time in [0, 60s)", s.TTFTMs)
+		}
+		if s.BytesOut <= 0 {
+			t.Errorf("bytesOut = %d, want > 0 (the streamed chunk reached the client)", s.BytesOut)
+		}
+	})
+}
+
+// TestProxy_TrackedUpstreamFailureBeforeResponse covers a tracked
+// (admitted) request whose upstream fails before any response byte: the
+// tracker finalizes with the upstream status, TTFT and BytesOut zero, and
+// exactly one sample — the JSON error body written afterwards must not
+// pollute the recorded BytesOut.
+func TestProxy_TrackedUpstreamFailureBeforeResponse(t *testing.T) {
+	withRouterEnv(t, []Backend{{Name: "m1", URL: "http://127.0.0.1:1", Tier: 0}}, nil, nil)
+	proxies["m1"] = newProdLikeProxy(t, "m1", "http://127.0.0.1:1") // dead: dial refused -> 503
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+
+	srv := httptest.NewServer(buildMux())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m1","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (upstream never reached)", resp.StatusCode)
+	}
+
+	ring := metrics.burst(100)
+	if len(ring) != 1 {
+		t.Fatalf("ring = %d samples, want exactly 1", len(ring))
+	}
+	s := ring[0]
+	if s.Status != http.StatusServiceUnavailable {
+		t.Errorf("sample status = %d, want 503", s.Status)
+	}
+	if s.Backend != "m1" {
+		t.Errorf("backend = %q, want m1", s.Backend)
+	}
+	if s.TTFTMs != 0 {
+		t.Errorf("ttftMs = %v, want 0 (no response byte)", s.TTFTMs)
+	}
+	if s.BytesOut != 0 {
+		t.Errorf("bytesOut = %d, want 0 (error body written after finish)", s.BytesOut)
+	}
+}
+
+// TestProxy_OversizedBodyRejected covers the MaxBytesReader reject: a body
+// over maxBodyBytes is answered 413 before the proxy runs, and the
+// rejection sample is attributed to the default backend with the capped
+// BytesIn.
+func TestProxy_OversizedBodyRejected(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("upstream must not be reached for a rejected body")
+	}))
+	t.Cleanup(fake.Close)
+
+	withRouterEnv(t, []Backend{{Name: "m1", URL: fake.URL, Tier: 0}}, nil, nil)
+	proxies["m1"] = newProdLikeProxy(t, "m1", fake.URL)
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+	saveMax := maxBodyBytes
+	maxBodyBytes = 1024
+	t.Cleanup(func() { maxBodyBytes = saveMax })
+
+	srv := httptest.NewServer(buildMux())
+	t.Cleanup(srv.Close)
+
+	body := strings.Repeat("a", 4096)
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Router-Reason"); got != "body-too-large" {
+		t.Errorf("X-Router-Reason = %q, want body-too-large", got)
+	}
+
+	ring := metrics.burst(100)
+	if len(ring) != 1 {
+		t.Fatalf("ring = %d samples, want exactly 1", len(ring))
+	}
+	s := ring[0]
+	if s.Status != http.StatusRequestEntityTooLarge {
+		t.Errorf("sample status = %d, want 413", s.Status)
+	}
+	if s.Backend != "m1" {
+		t.Errorf("backend = %q, want m1 (default backend)", s.Backend)
+	}
+	if s.BytesIn != 1024 {
+		t.Errorf("bytesIn = %d, want 1024 (capped at maxBodyBytes)", s.BytesIn)
+	}
+}
+
+// TestGPURegistry_ScrapeTransitions covers the registry's status machine:
+// 500 -> err with backoff, 404 -> off with engineOffBackoff, 200 -> ok with
+// the backoffs cleared; a failed scrape publishes no device values.
+func TestGPURegistry_ScrapeTransitions(t *testing.T) {
+	dcgms := `DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 75.4205088076072
+DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 61000
+DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="0",UUID="GPU-fake-0",modelName="Fake H100"} 81920
+DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52.018398644374244
+DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52000
+DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 81920
+`
+	var mode atomic.Int64
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		switch mode.Load() {
+		case 0:
+			http.NotFound(w, r)
+		case 1:
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case 2:
+			fmt.Fprint(w, dcgms)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	g := newGPURegistry()
+	g.configure(srv.URL)
+
+	// (a) 500 -> err with the 1s backoff armed; the immediate re-probe is
+	// suppressed by that backoff.
+	mode.Store(1)
+	g.scrape()
+	g.mu.Lock()
+	status, lastErr, errNext, errDelay := g.status, g.lastErr, g.errNext, g.errDelay
+	g.mu.Unlock()
+	if status != "err" {
+		t.Fatalf("status = %q, want err (500)", status)
+	}
+	if lastErr == "" {
+		t.Errorf("lastError empty after 500")
+	}
+	if !errNext.After(time.Now()) {
+		t.Errorf("errNext = %v, want in the future (backoff armed)", errNext)
+	}
+	if errDelay != time.Second {
+		t.Errorf("errDelay = %v, want 1s (first failure)", errDelay)
+	}
+	g.scrape()
+	if h := atomic.LoadInt32(&hits); h != 1 {
+		t.Fatalf("hits = %d, want 1 (re-probe suppressed during err backoff)", h)
+	}
+	if len(g.view()) != 0 {
+		t.Errorf("view() = %d devices during err, want none published", len(g.view()))
+	}
+
+	// (b) 404 -> off with engineOffBackoff; lastErr cleared (absent, not
+	// broken). Same backoff-suppression check.
+	g.mu.Lock()
+	g.errNext = time.Time{}
+	g.mu.Unlock()
+	mode.Store(0)
+	g.scrape()
+	g.mu.Lock()
+	status, lastErr, offNext, offNow := g.status, g.lastErr, g.offNext, time.Now()
+	g.mu.Unlock()
+	if status != "off" {
+		t.Fatalf("status = %q, want off (404)", status)
+	}
+	if lastErr != "" {
+		t.Errorf("lastError = %q, want empty for absent endpoint", lastErr)
+	}
+	if !offNext.After(time.Now()) || offNext.After(offNow.Add(engineOffBackoff)) {
+		t.Errorf("offNext = %v, want ~engineOffBackoff ahead", offNext)
+	}
+	g.scrape()
+	if h := atomic.LoadInt32(&hits); h != 2 {
+		t.Fatalf("hits = %d, want 2 (re-probe suppressed during off backoff)", h)
+	}
+
+	// (c) 200 -> ok: backoffs cleared, devices published.
+	g.mu.Lock()
+	g.offNext = time.Time{}
+	g.mu.Unlock()
+	mode.Store(2)
+	g.scrape()
+	g.mu.Lock()
+	status, lastErr, errNext, offNext, errDelay = g.status, g.lastErr, g.errNext, g.offNext, g.errDelay
+	g.mu.Unlock()
+	if status != "ok" {
+		t.Fatalf("status = %q, want ok (200)", status)
+	}
+	if lastErr != "" {
+		t.Errorf("lastError = %q, want empty after recovery", lastErr)
+	}
+	if !errNext.IsZero() || !offNext.IsZero() || errDelay != 0 {
+		t.Errorf("backoffs after recovery = errNext %v / offNext %v / delay %v, want all cleared", errNext, offNext, errDelay)
+	}
+	if got := g.view(); len(got) != 2 {
+		t.Fatalf("view() = %d devices after recovery, want 2", len(got))
+	}
+	if st := g.feed().Status; st != "ok" {
+		t.Errorf("feed status = %q, want ok", st)
+	}
+}
+
+// TestHistory_InvalidRange covers the /metrics/history range contract: an
+// unknown ?range is a 400 with the JSON error body, before any series
+// lookup.
+func TestHistory_InvalidRange(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/metrics/history?range=bogus", nil)
+	handleHistory(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if got := w.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if body["error"] != "unknown range" {
+		t.Errorf("error = %q, want \"unknown range\"", body["error"])
+	}
+}
+
+// TestMetricsStream_IntervalClamp covers the SSE interval clamp
+// (200ms..10s) through its only external observation: the frame cadence.
+// interval=10ms must tick at ~200ms (not ~10ms or the 500ms default);
+// interval=30s must tick at ~10s (not ~30s).
+func TestMetricsStream_IntervalClamp(t *testing.T) {
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+	msrv := httptest.NewServer(buildMetricsMux())
+	t.Cleanup(msrv.Close)
+
+	// gaps returns the intervals between consecutive SSE frames received
+	// within the window.
+	gaps := func(interval string, window time.Duration) []time.Duration {
+		ctx, cancel := context.WithTimeout(context.Background(), window+3*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, "GET",
+			msrv.URL+"/metrics/stream?interval="+interval, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("stream request: %v", err)
+		}
+		defer resp.Body.Close()
+		rd := bufio.NewReaderSize(resp.Body, 4096)
+		var out []time.Duration
+		var last time.Time
+		deadline := time.Now().Add(window)
+		for time.Now().Before(deadline) {
+			line, err := rd.ReadString('\n')
+			if err != nil {
+				break
+			}
+			if strings.HasPrefix(line, "data:") {
+				now := time.Now()
+				if !last.IsZero() {
+					out = append(out, now.Sub(last))
+				}
+				last = now
+			}
+		}
+		return out
+	}
+
+	t.Run("below_min_clamps_to_200ms", func(t *testing.T) {
+		d := gaps("10ms", 650*time.Millisecond)
+		if len(d) < 2 {
+			t.Fatalf("frame gaps received in window = %d, want >= 2 (frames at ~0/200/400/600ms)", len(d))
+		}
+		for i, g := range d {
+			if g < 150*time.Millisecond || g > 450*time.Millisecond {
+				t.Errorf("gap[%d] = %v, want ~200ms (10ms clamps to 200ms; 500ms default would be >=500ms)", i, g)
+				return
+			}
+		}
+	})
+
+	t.Run("above_max_clamps_to_10s", func(t *testing.T) {
+		d := gaps("30s", 13*time.Second)
+		if len(d) != 1 {
+			t.Fatalf("frame gaps received in 13s window = %d, want exactly 1 (second frame at ~10s)", len(d))
+		}
+		if d[0] < time.Duration(8.5*float64(time.Second)) || d[0] > 11*time.Second {
+			t.Errorf("gap[0] = %v, want ~10s (30s clamps to 10s; unclamped would be >=30s)", d[0])
+		}
+	})
 }

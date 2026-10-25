@@ -1,9 +1,19 @@
-FROM node:22-alpine AS web
+# Digest-pinned (the x86_64 digest; the go stage pins its own per-arch digests).
+FROM node:22-alpine@sha256:025b8e975a61d94e33abeafaad1255ef44e4898cf1a1b6446860009c72e6d284 AS web
 WORKDIR /web
 COPY web/package.json web/bun.lock* ./
-RUN npm install --no-audit --no-fund
+# node:22-alpine is musl, so pin the musl build of bun and verify it; the
+# committed bun.lock is authoritative -- no registry resolution happens here.
+RUN apk add --no-cache curl unzip \
+    && curl -fsSL -o /tmp/bun.zip \
+        https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64-musl.zip \
+    && echo "83b5f12fd258dd8d4fdcaea65ede954366aa717dab399e20093ecab280d54e7a  /tmp/bun.zip" | sha256sum -c - \
+    && unzip -j /tmp/bun.zip bun-linux-x64-musl/bun -d /usr/local/bin \
+    && rm /tmp/bun.zip
+ENV PATH="/usr/local/bin:$PATH"
+RUN bun install --frozen-lockfile
 COPY web/ ./
-RUN npm run build
+RUN bun run build
 
 FROM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
 WORKDIR /src

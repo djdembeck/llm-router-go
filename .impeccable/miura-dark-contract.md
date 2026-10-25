@@ -1,5 +1,8 @@
 # Direction Contract — "Vast Miura-Fold Sheet, dark mode"
 
+> **Historical (pre-Capacity-Survey design).** This document is kept for provenance
+> only; `DESIGN.md` is the authoritative design. Do not implement against this file.
+
 Seed 5f8d7aae, mode operate, challenger `paper-folds-pleats-deployable-miura-orbit-sheet`,
 user-pinned dark mode. This is the committed world; both build slices follow it.
 It is the opening-comment contract (also embedded in the emitted markup).
