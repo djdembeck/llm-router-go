@@ -7,5 +7,6 @@
   "packageRules": [
     { groupName: "github-actions", matchManagers: ["github-actions"] },
     { groupName: "dockerfile", matchManagers: ["dockerfile"] },
+    { groupName: "docker-compose", matchManagers: ["docker-compose"] }
   ]
 }
