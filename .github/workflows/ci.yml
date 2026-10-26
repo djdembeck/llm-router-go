@@ -44,7 +44,11 @@ jobs:
         run: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
 
   build:
-    name: Build (web + Go)
+    # Kept canonically named "Build": main's required status checks pin
+    # this exact check-run name — renaming it strands PRs waiting on the
+    # stale context (happened with the "CI / " prefix stripping and again
+    # with the "(web + Go)" suffix).
+    name: Build
     needs: [lint-format]
     runs-on: ubuntu-latest
     steps:
