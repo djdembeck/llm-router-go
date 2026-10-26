@@ -254,7 +254,10 @@ export class LiveStore {
     this.watchdogTimer = window.setInterval(() => {
       if (this.stop) return;
       if (this.feed && (this.feed.kind === "sse" || this.feed.kind === "sse-mock")) {
-        const anchor = this.lastFrameMs || this.sseStartMs;
+        // Anchor to the newer of last frame and this connection's start:
+        // a stale lastFrameMs from a prior connection must not eat the new
+        // connection's connect window (a late first frame gets 6s).
+        const anchor = Math.max(this.lastFrameMs, this.sseStartMs);
         if (!this.paused && anchor && Date.now() - anchor > 6000) {
           this.closeEs();
           this.startSse(0);

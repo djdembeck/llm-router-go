@@ -14,17 +14,32 @@
   const age = $derived(lastFrameAt ? now - lastFrameAt : 0);
 </script>
 
-<div class="stale" role="alert">
-  <span class="mark" aria-hidden="true"></span>
-  <span class="text">
-    <strong>STALE</strong> — feed interrupted; last data
-    <span class="mono">{lastFrameAt ? fmtClock(lastFrameAt) : "—"}</span>
-    <span class="mono">· {fmtSince(age)} ago; holding the last frame</span>
+<div class="stale-wrap">
+  <div class="stale" role="alert">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="text">
+      <strong>STALE</strong> — feed interrupted; last data
+      <span class="mono">{lastFrameAt ? fmtClock(lastFrameAt) : "—"}</span>;
+      holding the last frame
+    </span>
+    <span class="right mono muted">re-arming {feedName}</span>
+  </div>
+  <!-- The ticking age lives outside the assertive region: a role=timer
+       sibling that AT tracks by its own (opt-in) means, never re-announced
+       as a whole-region alert every second. -->
+  <span class="age mono muted" role="timer" aria-label="stale feed age">
+    {lastFrameAt ? `${fmtSince(age)} ago` : ""}
   </span>
-  <span class="right mono muted">re-arming {feedName}</span>
 </div>
 
 <style>
+  .stale-wrap {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    background: var(--panel);
+    border-bottom: 1px solid var(--verm);
+  }
   .stale {
     animation: banner-in var(--dur) var(--ease-out);
     display: flex;
@@ -32,10 +47,12 @@
     gap: var(--s3);
     min-height: 34px;
     padding: 6px var(--s5);
-    background: var(--panel);
-    border-bottom: 1px solid var(--verm);
     color: var(--verm);
     font-size: var(--fs-detail);
+  }
+  .age {
+    padding-right: var(--s5);
+    white-space: nowrap;
   }
   .mark {
     width: 8px;
@@ -73,6 +90,9 @@
     .right {
       margin-left: 0;
       width: 100%;
+    }
+    .age {
+      padding-right: var(--s3);
     }
   }
 </style>

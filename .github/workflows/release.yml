@@ -104,14 +104,26 @@ jobs:
           if git rev-parse "refs/tags/${VERSION}" >/dev/null 2>&1; then
             echo "Tag ${VERSION} already exists, skipping"
             echo "created=false" >> "$GITHUB_OUTPUT"
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git tag -a "${VERSION}" -m "Release ${VERSION}"
           git push origin "${VERSION}"
           echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "tag_exists=true" >> "$GITHUB_OUTPUT"
 
       - name: Login to GHCR
-        if: steps.tag.outputs.created == 'true'
+        # Gated on tag existence (not created=true), so a re-run of a failed
+        # release still reaches the build and sync-back steps. Intended
+        # re-run contract:
+        #   tag missing            -> create tag, then full pipeline
+        #   tag exists at own SHA  -> rebuild + push (idempotent)
+        #   tag at older commit    -> skip image build (it belongs to that
+        #                             run), sync-back still runs
+        #   tag at foreign commit  -> build step hard-fails
+        #   sync-back              -> idempotent and re-runnable (ancestor
+        #                             check exits 0 when already synced)
+        if: steps.tag.outputs.tag_exists == 'true'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -119,7 +131,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push release Docker image
-        if: steps.tag.outputs.created == 'true'
+        # Gated on tag existence (not created=true): the internal TAG_SHA
+        # guard makes the step idempotent on re-runs (skips when the tag
+        # points at an older commit, hard-fails on a foreign commit).
+        if: steps.tag.outputs.tag_exists == 'true'
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.new_version }}"
@@ -150,7 +165,10 @@ jobs:
           echo "Pushed ${IMAGE}"
 
       - name: Sync release back to develop
-        if: steps.tag.outputs.created == 'true'
+        # Gated on tag existence (not created=true): the ancestor check below
+        # is the idempotency guard for re-runs (exits 0 when develop already
+        # contains main).
+        if: steps.tag.outputs.tag_exists == 'true'
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.new_version }}"
@@ -164,9 +182,11 @@ jobs:
             exit 0
           fi
 
-          # Merge main into develop
+          # Merge origin/main into develop. No local `main` ref exists in
+          # this job (only develop was fetched), so the remote-tracking
+          # ref must be named explicitly.
           git checkout develop
-          git merge --no-ff main -m "chore(release): sync ${VERSION} back to develop [skip ci]"
+          git merge --no-ff origin/main -m "chore(release): sync ${VERSION} back to develop [skip ci]"
           git push origin develop
           echo "Synced ${VERSION} back to develop"
           # If develop is branch-protected, replace this with a peter-evans/create-pull-request sync PR

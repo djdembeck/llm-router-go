@@ -57,7 +57,6 @@
     void framesVersion;
     return buildLanes(history, frames, layer, singleBackend);
   });
-  const scale = $derived(scaleFor(layer, lanes));
   const singleServerLane = $derived(
     singleBackend !== null && !layer.device && lanes.length === 1,
   );
@@ -102,6 +101,7 @@
     const to = edge;
     return { from: to - laneSpan, to: Math.max(to, to - laneSpan + 1000) };
   });
+  const scale = $derived(scaleFor(layer, lanes, domain));
 
   let plotOpacity = $state(1);
   let rangePrimed = false;

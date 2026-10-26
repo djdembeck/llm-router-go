@@ -221,8 +221,9 @@ tape.
 ```
 
 - `status` is the upstream status as proxied (or the 429/413/503/502 the router itself returned — the router's own rejections are recorded too, so the feed shows capacity rejections live). An aborted proxy copy records `502`, and a client-cancelled request records `499`, when no explicit failure status was already recorded. These are request-history outcomes only: an already-committed HTTP response is not rewritten.
+- `t` is the completion time for every sample, including router-originated rejections: a 429 that waited in the queue is stamped at the moment it was rejected, not at arrival.
 - `ttftMs` is `0` for non-streaming and for router-originated rejections.
-- `durMs` for a router-originated 429 is the queue-wait time before rejection.
+- `durMs` for a router-originated 429 is the queue-wait time before rejection (arrival → rejection); `t` − `durMs` is the arrival instant.
 
 ## 3. GET /metrics/sessions
 
@@ -409,7 +410,8 @@ subtracts from the window. Worked value: 10 requests admitted at t=0 produce
 ### Burst
 
 The request ring capacity is **2000**. `GET /metrics/burst?limit=` defaults
-to `500`, is clamped to the ring capacity, and returns newest last. Each
+to `500`, is clamped to a **1000** response cap (the ring itself stays
+2000), and returns newest last. Each
 request sample adds `start` (UnixMilli admission) alongside `t` (completion);
 the dashboard draws the interval from `start` to `t`.
 
@@ -440,9 +442,11 @@ the dashboard draws the interval from `start` to `t`.
   vanished histogram or a zero-count interval reports 0 samples, never a
   stale mean. Histogram state for absent series is dropped.
 - Any failed scrape resets every counter/histogram baseline; the first
-  successful scrape after an outage is baseline-only (rates/means 0). 401 /
-  403 / 5xx / unreachable back off exponentially 1s → 30s; 404/405 keep the
-  30s `off` backoff.
+  successful scrape after an outage is baseline-only (rates/means 0).
+  Unreachable ("err") endpoints are re-probed on every 1s tick (a network
+  blip can end any moment; no backoff), so recovery is detected within one
+  interval; 404/405 keep the fixed 30s `off` backoff (the route only
+  reappears on an engine restart).
 - vLLM prefill: compute and cache rates come from
   `prompt_tokens_by_source_total{local_compute|local_cache_hit}` only when
   the split is complete; otherwise the total counter feeds `prefillTokS`

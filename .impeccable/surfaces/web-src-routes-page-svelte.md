@@ -13,7 +13,7 @@ Mode: Operate. Single-page live fleet dashboard for an ML-infrastructure operato
 
 THESIS: Capacity is terrain. The surface is a survey sheet of the fleet: level lines, spot heights, grid references, marginal scale. It refuses the equal-card grid and the dark-neon ops board.
 
-OWN-WORLD: Night survey sheet — ground #10130e/#151910, sand #b9a684, chalk #e9e5d8, water #7fa3c4, moss #8fae74, amber #d6a445, vermilion #cf5b43; Overpass + Overpass Mono; 1 px rules at 8–14% alpha, 8 px baseline, sharp corners, no shadows; day sheet inverts to cool paper with the same roles.
+OWN-WORLD: Night survey sheet — ground #10130e/#151a13, sand #b9a684, chalk #e9e5d8, water #7fa3c4, moss #8fae74, amber #d6a445, vermilion #e07a66; Overpass + Overpass Mono; 1 px rules at 8–14% alpha, 8 px baseline, sharp corners, no shadows; day sheet inverts to cool paper with the same roles.
 
 STORY: At a glance the operator sees where pressure is building, which lane is saturated, which requests are still prefilling, and how the last month looked; then scrubs any instant and reads exact values without losing the live edge.
 

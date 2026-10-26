@@ -46,3 +46,18 @@ func TestVllmKVCapacity(t *testing.T) {
 		})
 	}
 }
+
+// TestVllmKVCapacity_SumOverflowStaysFinite: every per-engine capacity is
+// individually finite and valid, but the SUM across DP engines overflows to
+// +Inf. A published +Inf would make json.Marshal fatal and drop the whole
+// /metrics/stream, so the view must stay finite (absent). The normal finite
+// sum is covered by "data parallel sum" in TestVllmKVCapacity.
+func TestVllmKVCapacity_SumOverflowStaysFinite(t *testing.T) {
+	s := &engineScrape{}
+	s.scrapeBody(parsePromText([]byte(
+		`vllm:cache_config_info{engine="0",kv_cache_size_tokens="1e308"} 1` + "\n" +
+			`vllm:cache_config_info{engine="1",kv_cache_size_tokens="1e308"} 1`)))
+	if v := s.view.KVCapTok; v != nil {
+		t.Fatalf("overflowed capacity published as %v, want absent", *v)
+	}
+}

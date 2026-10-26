@@ -141,7 +141,26 @@ export interface BurstReq {
 }
 const BURST_CAP = 500;
 let ring: BurstReq[] = [];
+// Completed requests only enter the ring: a request is admitted at `start`
+// and finishes at its simulated `t`, so /dev-metrics/burst must not expose
+// it (and the client's 5s error spike must not count it) before `t`.
+let pending: BurstReq[] = [];
 const T0 = Date.now();
+
+// insert completed requests in ring order (newest last), trimming to cap.
+function flushPending(now: number, all: boolean = false): void {
+  if (!pending.length) return;
+  const keep: BurstReq[] = [];
+  for (const r of pending) {
+    if (all || r.t <= now) {
+      ring.push(r);
+      if (ring.length > BURST_CAP) ring.splice(0, ring.length - BURST_CAP);
+    } else {
+      keep.push(r);
+    }
+  }
+  pending = keep;
+}
 
 function spawnRequest(t: number): void {
   const b = Math.random() < 0.62 ? BACKENDS[0] : BACKENDS[1];
@@ -161,7 +180,7 @@ function spawnRequest(t: number): void {
   const bytesOut = rejected
     ? Math.round(120 + Math.random() * 300)
     : Math.round(durMs * (8 + Math.random() * 10));
-  ring.push({
+  pending.push({
     t: t + durMs,
     start: t,
     backend: b.name,
@@ -174,7 +193,6 @@ function spawnRequest(t: number): void {
     bytesIn,
     bytesOut,
   });
-  if (ring.length > BURST_CAP) ring.splice(0, ring.length - BURST_CAP);
   if (rejected) b.rejectTotal++;
   if (!rejected) {
     b.reqTotal++;
@@ -184,8 +202,12 @@ function spawnRequest(t: number): void {
   }
 }
 
-// pre-seed a little history so the tape is not empty on first paint
+// pre-seed a little history so the tape is not empty on first paint. No force
+// flag: seeds whose simulated completion lands after T0 (recent start, long
+// duration) stay pending and flush on real ticks, so the first burst response
+// never exposes future-dated completions.
 for (let i = 60; i > 0; i--) spawnRequest(T0 - i * 1900);
+flushPending(T0);
 
 export interface Frame {
   t: number;
@@ -203,6 +225,9 @@ function tick(): Frame {
   // 429s, decaying over ~6 ticks
   if (BACKENDS[1].spikeTicks > 0) BACKENDS[1].spikeTicks--;
   else if (Math.random() < 0.02) BACKENDS[1].spikeTicks = 5;
+
+  // complete requests whose simulated finish time has passed
+  flushPending(now);
 
   for (let i = 0; i < BACKENDS.length; i++) {
     const b = BACKENDS[i];
@@ -601,6 +626,7 @@ interface MockConv {
   liveStart: number | null; // in-flight request start, or null
   liveDurMs: number; // how long the live request runs before completing
   liveNewTok: number;
+  liveReqId: number; // assigned once at start so the ID is stable for the request's lifetime
   turns: MockTurn[];
 }
 
@@ -655,6 +681,7 @@ const CONVS: MockConv[] = Array.from(
       liveStart: null,
       liveDurMs: 0,
       liveNewTok: 0,
+      liveReqId: 0,
       turns: [],
     };
     // seed 3–7 historical turns at 8–40s gaps, ending ≤ 100s ago
@@ -677,6 +704,7 @@ const LONE_LIVE = [
   { backend: BACKENDS[1].name, start: T0 - 2400, stream: false, path: "/v1/completions" },
 ].map((l) => ({
   ...l,
+  reqId: ++liveReqId, // drawn from the counter, so fresh/restarted IDs never collide
   id: hexId(),
   ctxTok: Math.round(300 + Math.random() * 2200),
   newTok: Math.round(100 + Math.random() * 900),
@@ -689,7 +717,9 @@ const LONE_LIVE = [
 const PREFILL_PERIOD_MS = 20000;
 const PREFILL_ADMIT_MS = 6000;
 const PREFILL_TOKENS = 32000;
-let prefillCycleId = 9000;
+// Base far above where liveReqId can reach during a dev server's life, so
+// the two ID streams never collide.
+let prefillCycleId = 1_000_000;
 
 const convReqs = (c: MockConv): SessionReq[] =>
   c.turns.map((t) => ({
@@ -732,6 +762,7 @@ export function synthSessions(nowMs: number): SessionsFeed {
       c.liveStart = nowMs - (3000 + Math.random() * 27000);
       c.liveDurMs = 15000 + Math.random() * 20000;
       c.liveNewTok = Math.round(100 + Math.random() * 900);
+      c.liveReqId = ++liveReqId;
     }
     // complete the live request once its stream is done
     if (c.liveStart !== null && nowMs - c.liveStart > c.liveDurMs) {
@@ -748,6 +779,7 @@ export function synthSessions(nowMs: number): SessionsFeed {
         c.liveStart = nowMs - (3000 + Math.random() * 27000);
         c.liveDurMs = 15000 + Math.random() * 20000;
         c.liveNewTok = Math.round(100 + Math.random() * 900);
+        c.liveReqId = ++liveReqId;
       }
     }
     if (c.turns.length > 40) c.turns.splice(0, c.turns.length - 40);
@@ -759,7 +791,7 @@ export function synthSessions(nowMs: number): SessionsFeed {
       const firstByteMs = 200 + (c.ctxTok % 1800);
       const streaming = nowMs - c.liveStart > firstByteMs;
       live.push({
-        id: ++liveReqId,
+        id: c.liveReqId,
         sess: c.id,
         backend: c.backend,
         path: "/v1/chat/completions",
@@ -778,12 +810,19 @@ export function synthSessions(nowMs: number): SessionsFeed {
     }
   }
   for (const l of LONE_LIVE) {
-    // lone requests loop: when they finish, restart a few seconds out
-    if (nowMs - l.start > 18000) l.start = nowMs - 1000;
-    const firstByteMs = 250 + (l.ctxTok % 1500);
-    const streaming = nowMs - l.start > firstByteMs;
+    // lone requests loop: when they finish, restart a few seconds out with
+    // a fresh ID (the in-flight one must stay stable across polls)
+    if (nowMs - l.start > 18000) {
+      l.start = nowMs - 1000;
+      l.reqId = ++liveReqId;
+    }
+    const firstByte = l.stream ? 250 + (l.ctxTok % 1500) : 0;
+    // sessions contract: non-streaming requests stay admitted until
+    // completion — their first byte is the end of generation, not a
+    // streaming phase
+    const streaming = l.stream && nowMs - l.start > firstByte;
     live.push({
-      id: ++liveReqId,
+      id: l.reqId,
       sess: "",
       backend: l.backend,
       path: l.path,
@@ -794,7 +833,7 @@ export function synthSessions(nowMs: number): SessionsFeed {
       newTok: l.newTok,
       ...liveFields({
         stream: l.stream,
-        streamMs: streaming ? l.start + firstByteMs : 0,
+        streamMs: streaming ? l.start + firstByte : 0,
         startMs: l.start,
         newTok: l.newTok,
       }),

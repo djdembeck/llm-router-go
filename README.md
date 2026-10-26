@@ -293,8 +293,11 @@ bursts, even while requests decode. The full field table lives in
 `.impeccable/metrics-contract.md`.
 
 Failure handling is explicit: a 404/405 endpoint is `off` and re-probed every
-30s; other failures (`401`, `403`, `5xx`, unreachable) are `err` with the HTTP
-status and message, retried with a bounded exponential backoff. On any failed
+30s (fixed, since the route only reappears when the engine restarts with
+metrics enabled); other failures (`401`, `403`, `5xx`, unreachable) are `err`
+with the HTTP status and message and re-probed on the **next 1s tick** — no
+backoff, because they can recover at any moment — while a successful scrape
+clears any backoff. On any failed
 scrape the interval means and rates are zeroed (with their sample counts
 cleared) and every counter/histogram baseline is reset, so the first
 successful scrape after an outage is baseline-only rather than a delta across

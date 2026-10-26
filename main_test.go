@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -469,9 +470,182 @@ func TestLargePrefillGateCountsMultiTurnPrefix(t *testing.T) {
 	}
 }
 
+// TestMultiTurn_AdmissionGateVsTelemetry pins the two deliberately different
+// token semantics for a multi-turn request (cbf987c): the large-prefill
+// ADMISSION gate uses the whole-conversation estimate, while the published
+// telemetry (session live frame, burst newTokensEst) uses the last-message
+// (cached-context) estimate. Unifying the figures in either direction is
+// caught:
+//   - gate on the last message: A's short final turn falls below the
+//     threshold, the slot is kept free, and B is forwarded immediately
+//     (reached == 2 while the gate should be full).
+//   - telemetry on the full conversation: live newTok / estPrefillMs and
+//     burst newTokensEst read the whole-conversation figure.
+func TestMultiTurn_AdmissionGateVsTelemetry(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+
+	var reached atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		reached.Add(1)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	origBackends, origSlots, origPrefillSlots := backends, slots, prefillSlots
+	origDurations, origProxies, origGpu := durations, proxies, gpu
+	origSessions, origMetrics := sessions, metrics
+	defer func() {
+		backends, slots, prefillSlots = origBackends, origSlots, origPrefillSlots
+		durations, proxies = origDurations, origProxies
+		gpu = origGpu
+		sessions, metrics = origSessions, origMetrics
+	}()
+
+	backends = []Backend{{
+		Name:                        "probe",
+		URL:                         upstream.URL,
+		MaxConcurrent:               8,
+		MaxQueueDepth:               5,
+		MaxConcurrentLargePrefill:   1,
+		LargePrefillThresholdTokens: 8192,
+	}}
+	slots = map[string]*slotManager{"probe": newSlot(8, 5)}
+	prefillSlots = map[string]*slotManager{"probe": newSlot(1, 4)}
+	durations = map[string]*durationTracker{"probe": {}}
+	gpu = nil
+	sessions = newSessionRegistry()
+	metrics = newTestMetrics()
+
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.FlushInterval = -1
+	proxy.Transport = proxyTransport
+	proxies = map[string]*httputil.ReverseProxy{"probe": proxy}
+
+	// 4-message conversation: 80011 total chars (20002 est tokens, above
+	// the 8192 threshold) but a last message of only 8 chars (2 est
+	// tokens, far below the threshold).
+	long := strings.Repeat("x", 40000)
+	body := `{"model":"probe","stream":true,"messages":[` +
+		`{"role":"system","content":"` + long + `"},` +
+		`{"role":"user","content":"` + long + `"},` +
+		`{"role":"assistant","content":"ack"},` +
+		`{"role":"user","content":"continue"}]}`
+	wantCtx := (40000 + 40000 + 3 + 8) / 4
+	wantNew := 8 / 4
+	if wantCtx < 8192 || wantNew >= 8192 {
+		t.Fatalf("fixture must span both sides of the threshold: ctx=%d new=%d", wantCtx, wantNew)
+	}
+
+	do := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handleProxy(rec, req)
+		return rec.Code
+	}
+
+	statuses := make(chan int, 2)
+	go func() { statuses <- do() }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for reached.Load() != 1 {
+		if time.Now().After(deadline) {
+			releaseAll()
+			<-statuses
+			t.Fatal("first request did not reach upstream")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// ADMISSION: A must hold the single large-prefill slot by virtue of the
+	// FULL-conversation estimate (20002 >= 8192). A gate on the
+	// last-message estimate (2 tokens) would have skipped the gate.
+	if in, maxC, _, _ := prefillSlots["probe"].snapshot(); in != 1 || maxC != 1 {
+		t.Fatalf("prefill gate = inflight %d max %d, want 1/1 (gate must use the full-conversation estimate)", in, maxC)
+	}
+
+	// TELEMETRY at admission: the session live frame carries the
+	// LAST-MESSAGE estimate. estPrefillMs = NewTok/10000·1000 must be 0 for
+	// 2 tokens; the full-conversation figure would yield ~2000.
+	f := sessions.feed()
+	if len(f.Live) != 1 {
+		t.Fatalf("live = %d, want 1", len(f.Live))
+	}
+	l := f.Live[0]
+	if l.CtxTok != wantCtx {
+		t.Errorf("live ctxTok = %d, want %d", l.CtxTok, wantCtx)
+	}
+	if l.NewTok != wantNew {
+		t.Errorf("live newTok = %d, want %d (last-message estimate)", l.NewTok, wantNew)
+	}
+	if l.EstPrefillMs != 0 {
+		t.Errorf("estPrefillMs = %d, want 0 (2 new tokens at 10k tok/s)", l.EstPrefillMs)
+	}
+
+	// A second request with the same conversation must QUEUE on the full
+	// gate, not slip through.
+	go func() { statuses <- do() }()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		_, _, waiting, _ := prefillSlots["probe"].snapshot()
+		if reached.Load() >= 2 || waiting >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := reached.Load(); got != 1 {
+		releaseAll()
+		t.Fatalf("second request forwarded while the gate was full: upstream received %d requests", got)
+	}
+
+	releaseAll()
+	for i := range 2 {
+		if code := <-statuses; code != http.StatusOK {
+			t.Errorf("request %d returned status %d, want %d", i+1, code, http.StatusOK)
+		}
+	}
+
+	// TELEMETRY on completion: every burst sample for this conversation
+	// carries the last-message estimate, not the gate's full-conversation
+	// figure.
+	found := 0
+	for _, s := range metrics.burst(100) {
+		if s.Backend != "probe" {
+			continue
+		}
+		found++
+		if s.NewTokensEst != wantNew || s.CtxTok != wantCtx {
+			t.Errorf("burst sample = newTok %d ctx %d, want new %d ctx %d", s.NewTokensEst, s.CtxTok, wantNew, wantCtx)
+		}
+	}
+	if found != 2 {
+		t.Errorf("burst samples for probe = %d, want 2", found)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // handleProxyError
 // ---------------------------------------------------------------------------
+
+// fakeTimeoutErr is a bare net.Error whose Timeout() reports true: this is
+// the shape of a response-header deadline (ResponseHeaderTimeout) surfacing
+// through *url.Error, which is NOT a *net.OpError.
+type fakeTimeoutErr struct {
+	timeout bool
+}
+
+func (e *fakeTimeoutErr) Error() string   { return "net dial timeout" }
+func (e *fakeTimeoutErr) Timeout() bool   { return e.timeout }
+func (e *fakeTimeoutErr) Temporary() bool { return false }
 
 func TestHandleProxyError_Classification(t *testing.T) {
 	tests := []struct {
@@ -483,6 +657,8 @@ func TestHandleProxyError_Classification(t *testing.T) {
 		{"connection refused", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}, http.StatusServiceUnavailable, "backend_unavailable"},
 		{"eof before response", io.EOF, http.StatusServiceUnavailable, "backend_unavailable"},
 		{"i/o deadline", os.ErrDeadlineExceeded, http.StatusServiceUnavailable, "backend_unavailable"},
+		{"generic net.Error timeout", &fakeTimeoutErr{timeout: true}, http.StatusServiceUnavailable, "backend_unavailable"},
+		{"generic net.Error non-timeout", &fakeTimeoutErr{timeout: false}, http.StatusBadGateway, "bad_gateway"},
 		{"malformed upstream response", errors.New("malformed HTTP response"), http.StatusBadGateway, "bad_gateway"},
 	}
 
@@ -518,8 +694,10 @@ func TestHandleProxyError_Classification(t *testing.T) {
 			if body.Error.Type != "server_error" {
 				t.Errorf("error.type: got %q, want %q", body.Error.Type, "server_error")
 			}
-			if !strings.Contains(body.Error.Message, "qwen3.6-27b") {
-				t.Errorf("error.message should name the backend, got %q", body.Error.Message)
+			// The public message is static: the backend name and upstream
+			// error text are log-only and must not leak topology.
+			if body.Error.Message != "backend temporarily unavailable" {
+				t.Errorf("error.message: got %q, want %q", body.Error.Message, "backend temporarily unavailable")
 			}
 		})
 	}
@@ -813,6 +991,26 @@ func TestEngine_ParsePromText_EscapedLabel(t *testing.T) {
 	}
 }
 
+// TestEngine_ParsePromText_Capped bounds the scan work: a body with far
+// more sample lines than promSampleCap yields exactly promSampleCap
+// samples and stops scanning, so a huge many-line body cannot allocate a
+// chunky whole-body split and keep walking.
+func TestEngine_ParsePromText_Capped(t *testing.T) {
+	// 2x the cap of sample lines, each short.
+	var body bytes.Buffer
+	for i := range promSampleCap * 2 {
+		fmt.Fprintf(&body, "metric_x%d 1\n", i)
+	}
+	samples := parsePromText(body.Bytes())
+	if len(samples) != promSampleCap {
+		t.Fatalf("samples = %d, want exactly %d (cap)", len(samples), promSampleCap)
+	}
+	// The first sample must be the first line (ordering preserved).
+	if !strings.HasPrefix(samples[0].name, "metric_x0") {
+		t.Errorf("first sample = %q, want metric_x0", samples[0].name)
+	}
+}
+
 // fakeExpo serves a fixed Prometheus body for one scrape.
 func TestEngine_ScrapeVllm(t *testing.T) {
 	r := newEngineRegistry()
@@ -1065,6 +1263,56 @@ func TestEngine_EndpointOffBackoff(t *testing.T) {
 	r.scrape("king")
 	if h := atomic.LoadInt32(&hits); h != 4 {
 		t.Fatalf("hits = %d, want 4 (no backoff after recovery)", h)
+	}
+}
+
+// TestEngine_EndpointErrNoBackoff pins the counterpart of the off backoff:
+// unreachable ("err") endpoints are re-probed on EVERY tick (a network blip
+// can end any moment; exponential backoff would delay recovery detection),
+// and a 200 clears the err state so the 1s cadence continues cleanly.
+func TestEngine_EndpointErrNoBackoff(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	r := newEngineRegistry()
+	r.add("king", srv.URL+"/metrics")
+	r.scrape("king")
+	r.mu.Lock()
+	st0 := r.backends["king"].status
+	r.mu.Unlock()
+	if st0 != "err" {
+		t.Fatalf("status = %q, want err (500)", st0)
+	}
+
+	// Four immediate re-scrapes: every one must reach the endpoint (no
+	// suppression, no escalating delay).
+	for i := 1; i <= 4; i++ {
+		r.scrape("king")
+		if h := atomic.LoadInt32(&hits); h != int32(i+1) {
+			t.Fatalf("hits = %d, want %d (err endpoint re-probed every tick)", h, i+1)
+		}
+	}
+
+	// Recovery: the same endpoint returning 200 flips back to ok and the
+	// next scrape is probed again with nothing to clear.
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, `sglang:num_running_reqs 3`)
+	}))
+	defer srv2.Close()
+	r.mu.Lock()
+	r.backends["king"].url = srv2.URL + "/metrics"
+	r.mu.Unlock()
+	r.scrape("king")
+	r.scrape("king")
+	r.mu.Lock()
+	status := r.backends["king"].status
+	r.mu.Unlock()
+	if status != "ok" {
+		t.Fatalf("status = %q, want ok after 200 (err state cleared)", status)
 	}
 }
 
@@ -2033,8 +2281,16 @@ func TestMetricsStream_RouteShadowing(t *testing.T) {
 func TestHandleBurst_LimitClamp(t *testing.T) {
 	m := newTestMetrics()
 	now := time.Now()
-	for i := range 30 {
+	// More samples than the response cap, and enough to wrap the 2000-slot
+	// ring: with only 30 samples every limit above the clamp bound came
+	// back 30 and the clamp itself was invisible.
+	for i := range 2500 {
 		m.recordRequest("b", requestSample{T: now, Backend: "b", Status: 200, NewTokensEst: i})
+	}
+	// The ring retains 2000 samples: burstLimitMax (1000) bounds the
+	// RESPONSE, not storage.
+	if got := len(m.burst(10000)); got != 2000 {
+		t.Fatalf("ring retained %d samples, want 2000", got)
 	}
 	saveMetrics := metrics
 	metrics = m
@@ -2043,7 +2299,7 @@ func TestHandleBurst_LimitClamp(t *testing.T) {
 	srv := httptest.NewServer(buildMetricsMux())
 	defer srv.Close()
 
-	// limit=5 returns exactly 5, newest last.
+	// limit=5 returns exactly 5, newest last: indices 2495..2499.
 	resp, err := http.Get(srv.URL + "/metrics/burst?limit=5")
 	if err != nil {
 		t.Fatalf("burst: %v", err)
@@ -2057,27 +2313,34 @@ func TestHandleBurst_LimitClamp(t *testing.T) {
 		t.Fatalf("burst decode: %v", err)
 	}
 	resp.Body.Close()
-	if len(burst.Requests) != 5 || burst.Requests[0].NewTokensEst != 25 || burst.Requests[4].NewTokensEst != 29 {
-		t.Errorf("burst?limit=5 = %d entries [%d..%d], want 5 [25..29]",
+	if len(burst.Requests) != 5 || burst.Requests[0].NewTokensEst != 2495 || burst.Requests[4].NewTokensEst != 2499 {
+		t.Errorf("burst?limit=5 = %d entries [%d..%d], want 5 [2495..2499]",
 			len(burst.Requests), firstTokInt(burst), lastTokInt(burst))
 	}
 
-	// limit over the max is clamped to 1000 (ring has only 30, so 30 back).
-	resp2, err := http.Get(srv.URL + "/metrics/burst?limit=5000")
-	if err != nil {
-		t.Fatalf("burst: %v", err)
-	}
-	var burst2 struct {
-		Requests []struct {
-			NewTokensEst int `json:"newTokensEst"`
-		} `json:"requests"`
-	}
-	if err := json.NewDecoder(resp2.Body).Decode(&burst2); err != nil {
-		t.Fatalf("burst decode: %v", err)
-	}
-	resp2.Body.Close()
-	if len(burst2.Requests) != 30 {
-		t.Errorf("burst?limit=5000 = %d entries, want 30 (clamped)", len(burst2.Requests))
+	// limit over the cap is clamped to burstLimitMax: exactly 1000 entries
+	// back off a full ring (30 of them went to the ring before the clamp
+	// was ever exercised).
+	for _, lim := range []string{"1500", "5000"} {
+		respN, err := http.Get(srv.URL + "/metrics/burst?limit=" + lim)
+		if err != nil {
+			t.Fatalf("burst?limit=%s: %v", lim, err)
+		}
+		var burstN struct {
+			Requests []struct {
+				NewTokensEst int `json:"newTokensEst"`
+			} `json:"requests"`
+		}
+		if err := json.NewDecoder(respN.Body).Decode(&burstN); err != nil {
+			t.Fatalf("burst decode: %v", err)
+		}
+		respN.Body.Close()
+		if len(burstN.Requests) != burstLimitMax {
+			t.Errorf("burst?limit=%s = %d entries, want %d (clamped)", lim, len(burstN.Requests), burstLimitMax)
+		} else if burstN.Requests[0].NewTokensEst != 2499-burstLimitMax+1 || burstN.Requests[len(burstN.Requests)-1].NewTokensEst != 2499 {
+			t.Errorf("burst?limit=%s = [%d..%d], want [%d..2499]",
+				lim, burstN.Requests[0].NewTokensEst, lastTokInt(burstN), 2499-burstLimitMax+1)
+		}
 	}
 }
 
@@ -2803,6 +3066,40 @@ func TestFleetAggregates_GatesNonOKEngines(t *testing.T) {
 	}
 }
 
+// TestEngine_HistNoNewObservationsNoStaleMean pins the idle-interval
+// behavior: when a histogram's _count does not advance between two ticks,
+// that interval reports NO mean/count (0/0), not the prior interval's
+// values leaked forward.
+func TestEngine_HistNoNewObservationsNoStaleMean(t *testing.T) {
+	s := &engineScrape{counters: map[string]float64{}, cTimes: map[string]time.Time{}, hists: map[string]*histState{}}
+	base := `
+vllm:num_requests_running{model_name="m",engine="0"} 1
+vllm:time_to_first_token_seconds_sum{model_name="m"} 10.0
+vllm:time_to_first_token_seconds_count{model_name="m"} 2
+`
+	s.scrapeBody(parsePromText([]byte(base)))
+	// Interval 1: two new observations -> a mean exists.
+	rewindBaselines(s, 2*time.Second)
+	s.scrapeBody(parsePromText([]byte(`
+vllm:num_requests_running{model_name="m",engine="0"} 1
+vllm:time_to_first_token_seconds_sum{model_name="m"} 30.0
+vllm:time_to_first_token_seconds_count{model_name="m"} 4
+`)))
+	if s.view.TTFTSamples == 0 || s.view.TTFTms == 0 {
+		t.Fatalf("after delta: ttft=%v samples=%d, want a mean and count", s.view.TTFTms, s.view.TTFTSamples)
+	}
+	// Interval 2: the counter is unchanged (d == 0) -> no new data.
+	rewindBaselines(s, 2*time.Second)
+	s.scrapeBody(parsePromText([]byte(`
+vllm:num_requests_running{model_name="m",engine="0"} 1
+vllm:time_to_first_token_seconds_sum{model_name="m"} 30.0
+vllm:time_to_first_token_seconds_count{model_name="m"} 4
+`)))
+	if s.view.TTFTSamples != 0 || s.view.TTFTms != 0 {
+		t.Errorf("idle interval: ttft=%v samples=%d, want 0/0 (no stale mean from the prior interval)", s.view.TTFTms, s.view.TTFTSamples)
+	}
+}
+
 func TestEngine_HistogramDisappears(t *testing.T) {
 	s := &engineScrape{counters: map[string]float64{}, cTimes: map[string]time.Time{}, hists: map[string]*histState{}}
 	base := `
@@ -3031,6 +3328,31 @@ func TestEngine_ScrapeBody_ScaledPctOverflowDropped(t *testing.T) {
 			assert: func(t *testing.T, v engineView) {
 				if v.SwaPct != nil {
 					t.Errorf("swaPct = %v, want nil", v.SwaPct)
+				}
+			},
+		},
+		{
+			name: "sglang mamba pool total overflows",
+			line: `sglang:mamba_used_tokens{tp_rank="0"} 1e308
+sglang:mamba_available_tokens{tp_rank="0"} 1e308`,
+			assert: func(t *testing.T, v engineView) {
+				if v.MambaUsedTok == nil {
+					t.Errorf("mambaUsedTok = nil, want a value")
+				}
+				if v.MambaCapTok == nil {
+					t.Errorf("mambaCapTok = nil, want 0 (overflow guarded)")
+				} else if math.IsInf(*v.MambaCapTok, 0) || *v.MambaCapTok != 0 {
+					t.Errorf("mambaCapTok = %v, want 0 (overflow guarded)", *v.MambaCapTok)
+				}
+			},
+		},
+		{
+			name: "sglang mamba pool total finite",
+			line: `sglang:mamba_used_tokens{tp_rank="0"} 100
+sglang:mamba_available_tokens{tp_rank="0"} 200`,
+			assert: func(t *testing.T, v engineView) {
+				if v.MambaCapTok == nil || *v.MambaCapTok != 300 {
+					t.Errorf("mambaCapTok = %v, want 300", v.MambaCapTok)
 				}
 			},
 		},
@@ -3391,12 +3713,8 @@ vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} %g
 	}
 
 	// 2) Recovery: first success after reset re-baselines (rate 0, proving
-	// the failed interval's delta is NOT double-counted). The 1s err
-	// backoff is cleared by hand (whitebox, as the sibling backoff tests)
-	// so this recovery isn't a 1s poll.
-	r.mu.Lock()
-	s.errNext = time.Time{}
-	r.mu.Unlock()
+	// the failed interval's delta is NOT double-counted). "err" endpoints
+	// are never backed off, so recovery is probed on plain scrapes.
 	mode.Store(3)
 	r.scrape("king")
 	v = s.view
@@ -3624,9 +3942,109 @@ func TestProxy_TrackedUpstreamFailureBeforeResponse(t *testing.T) {
 	}
 }
 
+// TestProxy_RejectionSampleStampCompletionTime covers a request that waits
+// in the backend queue and is then rejected with 429: the burst sample's T
+// must be the rejection (completion) time, not the arrival time, so the
+// feed shows where the elapsed time actually went. DurMs stays
+// arrival->completion.
+func TestProxy_RejectionSampleStampCompletionTime(t *testing.T) {
+	block := make(chan struct{})
+	// A must have won the single slot and reached the upstream before
+	// B is sent: if B were admitted first, it would block in the
+	// upstream handler and the synchronous Post below would never
+	// return.
+	arrived := make(chan struct{})
+	var arrivedOnce sync.Once
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		arrivedOnce.Do(func() { close(arrived) })
+		<-block
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"x"}`)
+	}))
+	defer up.Close()
+
+	withRouterEnv(t, []Backend{{Name: "m1", URL: up.URL, Tier: 0, MaxConcurrent: 1, MaxQueueDepth: 2}},
+		map[string]int{"m1": 1}, map[string]int{"m1": 2})
+	proxies["m1"] = newProdLikeProxy(t, "m1", up.URL)
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+	saveQT := queueTimeout
+	queueTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { queueTimeout = saveQT })
+
+	srv := httptest.NewServer(buildMux())
+	defer srv.Close()
+	body := `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
+
+	// Request A occupies the single slot until released. It must run in a
+	// goroutine: the upstream never responds while `block` is closed, so
+	// http.Post would not return inline.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	go func() {
+		reqA, err := http.NewRequestWithContext(ctxA, "POST", srv.URL+"/v1/chat/completions", strings.NewReader(body))
+		if err != nil {
+			return
+		}
+		respA, err := http.DefaultClient.Do(reqA)
+		if err != nil || respA == nil {
+			return
+		}
+		io.Copy(io.Discard, respA.Body)
+		respA.Body.Close()
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(2 * time.Second):
+		close(block)
+		t.Fatal("request A did not reach the upstream within 2s")
+	}
+
+	// Request B arrives after A: it queues, hits queueTimeout, gets 429.
+	bStart := time.Now()
+	respB, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer respB.Body.Close()
+	if respB.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (queue timeout)", respB.StatusCode)
+	}
+	close(block) // release A
+
+	deadline := time.Now().Add(2 * time.Second)
+	var s requestSample
+	found := false
+	for time.Now().Before(deadline) {
+		for _, rs := range metrics.burst(100) {
+			if rs.Status == http.StatusTooManyRequests {
+				s = rs
+				found = true
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("no 429 sample in the burst ring")
+	}
+	// T should be stamped at rejection time (arrive + ~queueTimeout), NOT at
+	// arrival. If T were arrival, the delta vs bStart would be ~0.
+	delta := s.T.Sub(bStart)
+	if delta < 150*time.Millisecond {
+		t.Errorf("sample T - arrival = %v, want >= 150ms (stamped at rejection, not arrival)", delta)
+	}
+	if s.DurMs < 150 {
+		t.Errorf("DurMs = %v, want >= ~150 (arrival -> rejection)", s.DurMs)
+	}
+}
+
 // TestProxy_OversizedBodyRejected covers the MaxBytesReader reject: a body
-// over maxBodyBytes is answered 413 before the proxy runs, and the
-// rejection sample is attributed to the default backend with the capped
+// over maxBodyBytes is answered 413 before the proxy runs, and the rejection
+// sample is attributed to the default backend with the capped
 // BytesIn.
 func TestProxy_OversizedBodyRejected(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

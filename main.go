@@ -563,11 +563,13 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 // In-engine running/waiting, KV-cache pressure, and REAL token throughput
 // (prompt + completion — not the ~4 bytes/token body estimate) only exist
 // inside the engine, so we scrape each backend's Prometheus /metrics with a
-// stdlib text-exposition parser at 1s — except a 404 endpoint, which backs
-// off to 30s re-probes (engineOffBackoff) since the route only reappears on
-// an engine restart. vLLM always serves /metrics; SGLang requires
-// --enable-metrics. When the endpoint is absent or down the view
-// degrades to status "off"/"err" and the sheet renders "—" — never a guess.
+// stdlib text-exposition parser at 1s. A 404 endpoint backs off to 30s
+// re-probes (engineOffBackoff) since the route only reappears on an engine
+// restart; an unreachable ("err") endpoint is probed on every tick so a
+// vanishing engine is detected within one interval. vLLM always serves
+// /metrics; SGLang requires --enable-metrics. When the endpoint is absent
+// or down the view degrades to status "off"/"err" and the sheet renders
+// "—" — never a guess.
 //
 // Aggregation rules (from the engines' source, verified 2026-08-20):
 //   - vLLM gauges are labeled [model_name, engine]; request counts SUM
@@ -714,11 +716,7 @@ type engineScrape struct {
 	// offNext: the next allowed probe while status is "off" (404/405).
 	// The endpoint is structurally absent until the engine restarts, so
 	// probes back off to engineOffBackoff instead of once per second.
-	offNext time.Time
-	// errNext/errDelay bound non-404 failures (401/403/5xx) with an
-	// exponential 1s→30s retry instead of hammering a broken endpoint.
-	errNext    time.Time
-	errDelay   time.Duration
+	offNext    time.Time
 	httpStatus int
 	lastErr    string
 	view       engineView
@@ -800,11 +798,10 @@ func (e *engineRegistry) scrape(name string) {
 	// A 404 endpoint is structurally absent (SGLang without
 	// --enable-metrics): it only reappears on an engine restart, so hold
 	// the probe at engineOffBackoff instead of hammering once per second.
+	// Unreachable ("err") endpoints are the opposite: a network blip can
+	// end at any moment, so they are re-probed on every tick (no backoff)
+	// and recovery is detected immediately.
 	if s.status == "off" && time.Now().Before(s.offNext) {
-		e.mu.Unlock()
-		return
-	}
-	if s.status == "err" && time.Now().Before(s.errNext) {
 		e.mu.Unlock()
 		return
 	}
@@ -845,6 +842,8 @@ func (e *engineRegistry) scrape(name string) {
 			s.httpStatus = httpStatus
 			s.offNext = time.Now().Add(engineOffBackoff)
 		} else {
+			// No backoff: unreachable endpoints are re-probed on the next
+			// tick so a vanishing engine is detected within one interval.
 			s.status = "err"
 			s.httpStatus = httpStatus
 			if fetchErr != nil {
@@ -852,12 +851,6 @@ func (e *engineRegistry) scrape(name string) {
 			} else {
 				s.lastErr = "engine metrics unavailable"
 			}
-			if s.errDelay == 0 {
-				s.errDelay = time.Second
-			} else if s.errDelay < engineOffBackoff {
-				s.errDelay *= 2
-			}
-			s.errNext = time.Now().Add(s.errDelay)
 		}
 		// Rates and interval means are deltas over a scrape interval; a stale
 		// delta would mislead, so zero them and re-baseline every counter and
@@ -868,8 +861,6 @@ func (e *engineRegistry) scrape(name string) {
 		return
 	}
 	s.offNext = time.Time{}
-	s.errNext = time.Time{}
-	s.errDelay = 0
 	s.httpStatus = httpStatus
 	s.lastErr = ""
 	s.scrapeBody(parsePromText(body))
@@ -1319,8 +1310,14 @@ func (s *engineScrape) scrapeBody(samples []promSample) {
 		}
 		if haveMambaUsed || haveMambaAvail || haveMambaEvict {
 			u := mambaUsed
-			c := mambaUsed + mambaAvail + mambaEvict
 			view.MambaUsedTok = &u
+			// Derived total of finite parsed values; an overflow to Inf
+			// would kill json.Marshal (and the whole stream). Keep 0 over
+			// a poisoned total, as the GPU memory total does.
+			c := mambaUsed + mambaAvail + mambaEvict
+			if math.IsInf(c, 0) {
+				c = 0
+			}
 			view.MambaCapTok = &c
 		}
 		if haveHCUsed {
@@ -1735,15 +1732,27 @@ const promSampleCap = 8192
 // openmetrics timestamps, and unparseable lines are skipped.
 func parsePromText(body []byte) []promSample {
 	var out []promSample
-	for _, line := range strings.Split(string(body), "\n") {
+	// Scan line by line instead of strings.Split over the whole body: a
+	// 4 MiB body of many short lines must not allocate a million-entry
+	// slice, and the cap stops the scan as soon as it is reached.
+	for rest := body; len(rest) > 0; {
 		if len(out) >= promSampleCap {
 			break
 		}
-		line = strings.TrimRight(line, " \r")
-		if line == "" || line[0] == '#' {
+		nl := bytes.IndexByte(rest, '\n')
+		var line, next []byte
+		if nl >= 0 {
+			line = rest[:nl]
+			next = rest[nl+1:]
+		} else {
+			line = rest
+		}
+		rest = next
+		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
-		head, val, ok := splitPromLine(line)
+		line = bytes.TrimRight(line, " \r")
+		head, val, ok := splitPromLine(string(line))
 		if !ok {
 			continue
 		}
@@ -2322,18 +2331,21 @@ func sessionKeyFor(parsed *parsedBody) string {
 	if len(prefix) == 0 {
 		prefix = parsed.Messages[:1]
 	}
-	var b strings.Builder
+	// Hash the framed message pieces incrementally: the body is already
+	// in memory once, and per-request keying runs it through sha1 without
+	// building a second body-sized copy (builder + []byte) before the
+	// caller's admission checks.
+	h := sha1.New()
 	for i, m := range prefix {
 		if i > 0 {
-			b.WriteByte('\n')
+			h.Write([]byte{'\n'})
 		}
 		// Length-framed role + content: different role partitions must not
 		// collide, and concatenation ambiguity is impossible.
-		fmt.Fprintf(&b, "%d:%s:%d:", len(m.Role), m.Role, len(m.Content))
-		b.Write(m.Content)
+		fmt.Fprintf(h, "%d:%s:%d:", len(m.Role), m.Role, len(m.Content))
+		h.Write(m.Content)
 	}
-	sum := sha1.Sum([]byte(b.String()))
-	return fmt.Sprintf("%x", sum)[:12]
+	return fmt.Sprintf("%x", h.Sum(nil))[:12]
 }
 
 // estimateCtxTokens estimates the conversation context (all messages, or
@@ -4277,6 +4289,11 @@ func handleSessions(w http.ResponseWriter, r *http.Request) {
 //     backend_unavailable + Retry-After — the engine is down or restarting;
 //     the request never reached it, so retrying is safe
 //   - anything else (e.g. malformed upstream response): 502 bad_gateway
+//
+// The JSON body carries a static message ("backend temporarily
+// unavailable") for every 503/502: the full upstream error is logged server-
+// side only, so transport details (internal hostnames, ports) never reach
+// the client.
 func handleProxyError(w http.ResponseWriter, r *http.Request, err error, backend string) {
 	if errors.Is(err, context.Canceled) {
 		log.Printf("%s %s -> %s client canceled during upstream roundtrip", r.Method, r.URL.Path, backend)
@@ -4289,7 +4306,9 @@ func handleProxyError(w http.ResponseWriter, r *http.Request, err error, backend
 	status := http.StatusBadGateway
 	code := "bad_gateway"
 	var opErr *net.OpError
-	if errors.As(err, &opErr) || errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded) {
+	var netErr net.Error
+	if errors.As(err, &opErr) || errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded) ||
+		(errors.As(err, &netErr) && netErr.Timeout()) {
 		status = http.StatusServiceUnavailable
 		code = "backend_unavailable"
 	}
@@ -4305,9 +4324,12 @@ func handleProxyError(w http.ResponseWriter, r *http.Request, err error, backend
 	w.Header().Set("Retry-After", "5")
 	w.Header().Set("X-Router-Reason", code)
 	w.WriteHeader(status)
+	// The full upstream error (transport details can include internal
+	// hostnames/ports) stays in the server log only; the public message is
+	// static so a dial refused/reset/timeout can never leak topology.
 	json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{
-			"message": fmt.Sprintf("backend %q unavailable (engine down or restarting): %v", backend, err),
+			"message": "backend temporarily unavailable",
 			"type":    "server_error",
 			"code":    code,
 		},
@@ -4396,6 +4418,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	recordRejection := func(status int) {
 		reqContext.Status = status
+		// Stamp T at completion, like recordRequest: a request that waited
+		// in a queue before being rejected belongs in the burst feed at
+		// the moment it was rejected, not at arrival. DurMs stays
+		// arrival->completion, so both stay consistent.
+		reqContext.T = time.Now()
 		reqContext.DurMs = float64(time.Since(reqStart) / time.Millisecond)
 		// Rejections never enter the live stack, but they DO belong to the
 		// conversation — fold them into the session ring/aggregates.

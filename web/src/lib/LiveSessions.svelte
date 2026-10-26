@@ -55,7 +55,7 @@
         <div class="req-top">
           <span class="req-name mono">{single ? `REQUEST #${l.id}` : l.backend}</span>
           <span class="phase {l.phase}">
-            <span class="dot"></span>{l.phase === "streaming" ? "stream" : "queued"}
+            <span class="dot"></span>{l.phase === "streaming" ? "stream" : "admitted"}
           </span>
         </div>
         <div class="metrics">

@@ -324,7 +324,11 @@ export interface Scale {
   ticks: { v: number; label: string }[];
 }
 
-export function scaleFor(layer: LayerDef, lanes: Lane[]): Scale {
+export function scaleFor(
+  layer: LayerDef,
+  lanes: Lane[],
+  domain?: { from: number; to: number },
+): Scale {
   if (layer.fixedMax) {
     const max = layer.fixedMax;
     return {
@@ -335,9 +339,13 @@ export function scaleFor(layer: LayerDef, lanes: Lane[]): Scale {
       })),
     };
   }
+  // Only the visible domain may set the scale: the live tail keeps up to
+  // 15 min of one-second frames, and a spike outside the window must not
+  // compress the current data.
   let peak = 0;
   for (const lane of lanes) {
     for (const p of lane.points) {
+      if (domain && (p.t < domain.from || p.t > domain.to)) continue;
       if (p.v != null && p.v > peak) peak = p.v;
     }
   }

@@ -11,6 +11,7 @@
   import { LiveStore } from "$lib/live.svelte";
   import { HistoryStore } from "$lib/history.svelte";
   import type { Frame, MetricAverages, RangeName } from "$lib/api";
+  import type { BurstRequest } from "$lib/api";
   import type { LayerId } from "$lib/profile";
 
   const live = new LiveStore();
@@ -139,6 +140,20 @@
   const historyError = $derived(
     history.error && !history.data ? "history feed unavailable — showing live frames only" : null,
   );
+
+  // Burst polling keeps replacing the list while the stream is stale, but
+  // the tape must hold under the STALE banner: capture the snapshot at the
+  // stale transition and keep returning that same reference (plain vars,
+  // no extra reactivity).
+  let heldRequests: BurstRequest[] | null = null;
+  const frozenRequests = $derived.by(() => {
+    if (live.stale) {
+      if (!heldRequests) heldRequests = live.requests;
+      return heldRequests;
+    }
+    heldRequests = null;
+    return live.requests;
+  });
 
   function toggleTheme(): void {
     theme = theme === "night" ? "day" : "night";
@@ -292,7 +307,7 @@
         <RequestFeed
           singleBackend={singleBackendName}
           bind:open={requestLogOpen}
-          requests={live.requests}
+          requests={frozenRequests}
           spikeCount={live.spikeCount}
           spikePeak={live.spikePeak}
         />

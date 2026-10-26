@@ -459,56 +459,17 @@ selection uses sand at 30%.
 
 ## Do's and Don'ts
 
-### Do:
+Only what the sections above do not already state is repeated here:
 
-- **Do** lead live-session rows with TTFT as the one large measured value;
-  keep estimated context/reuse/load smaller, muted, and `~`-prefixed. Time,
-  endpoint, id, and phase are secondary.
-- **Do** keep the request log collapsed by default; the header still carries
-  its spike and 429+ counts.
-- **Do** put live sessions beside the profile in the first viewport; the
-  operator's first question is what is running now.
-- **Do** label every figure `router`, `engine`, `device`, or `est`.
-- **Do** keep the Fleet Profile as the only history chart; the readings strip
-  is not a second chart.
-- **Do** hatch missing data and break lines at nulls; never interpolate.
-- **Do** freeze the last truth on feed loss and label it `stale`; the STALE
-  banner is the only feed-level failure.
-- **Do** use tabular mono for every measured figure and integer 2px type steps.
-- **Do** keep 429 water (a capacity rejection) and vermilion for 5xx/saturation.
-- **Do** keep device lanes separate; never attribute VRAM to a backend.
-- **Do** move TTFT/prefill/decode/KV with a 1.6s ease-in-out tween and counts
-  with 480ms; the exact value remains in screen-reader text and a metric never
-  overshoots.
-- **Do** glide the live edge continuously across each 1s interval; stop the
-  loop when the profile is offscreen and under reduced motion.
-- **Do** give TTFT, prefill, decode, and KV a 15s mean or 5s hold and a 1.6s
-  tween; motion is for transitions, not for chasing every scrape. Print the
-  window on the cell.
-- **Do** let rows keep identity through reflow with FLIP; skip entrance
-  flashes on load and on bursts.
-- **Do** honor `prefers-reduced-motion`: snap the edge and numbers, run JS
-  row transitions at zero duration, and keep color/state feedback legible.
-
-### Don't:
-
-- **Don't** use sand as decoration or a generic accent; it is the survey level
-  line.
-- **Don't** add shadows, glows, gradients, glass, or rounded corners.
-- **Don't** use serif or italic type, or a display face.
-- **Don't** re-introduce equal KPI cards, sparkline tiles, or a second chart
-  style beside the profile.
 - **Don't** present the router's GPU budget as device utilization; it is an
   admission weight.
-- **Don't** show a stale engine's retained gauges as current; use `—` and
-  hatch the lane.
-- **Don't** forward-fill history or claim a percentile the sample ring does
-  not cover; state `n` and coverage.
-- **Don't** let the compact/mobile layout become a separate design; it is the
-  same sheet with a narrower gutter and fewer table columns.
 - **Don't** use bounce or elastic easing on measured numbers; motion may
   smooth a transition, never imply a value that was not sampled.
-- **Don't** add page-load choreography, mount fades, scroll reveals, or a
-  60fps canvas loop for a 1.6px/s edge.
-- **Don't** fade or fly in live rows and request rows; a panel that flashes on
-  load reads as jank, not responsiveness.
+- **Don't** let the compact/mobile layout become a separate design; it is the
+  same sheet with a narrower gutter and fewer table columns.
+
+Everything else is specified once, in place: the named rules under Colors,
+Typography, and Elevation (Source, One Failure, Day-Sheet, Integer-Step,
+Tabular, No-Serif, Flat-Sheet), and the component sections — Layout, Motion,
+Readings Strip, Fleet Profile, Live Sessions, Backend Detail, Request Feed,
+and Stale Banner.
