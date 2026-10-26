@@ -1,0 +1,51 @@
+# One-off: delete accidental release artifacts (v1.0.2, v1.0.3) from the
+# Oct 26 2026 mis-merge to main. Delete this workflow after the run.
+name: GHCR cleanup (one-off)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  packages: write
+  contents: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete package versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PKGS=$(gh api "user/packages?per_page=100" --jq '.packages[] | select(.name == "llm-router-go")')
+          PKG_ID=$(echo "$PKGS" | python3 -c "import json,sys; lines=[l for l in sys.stdin if l.strip()]; print(json.loads(lines[0])['id'] if lines else '')" 2>/dev/null || true)
+          if [ -z "$PKG_ID" ]; then
+            echo "No docker package found for llm-router-go; nothing to do"
+            exit 0
+          fi
+          echo "package id: $PKG_ID"
+          for VER in v1.0.2 v1.0.3; do
+            VID=$(gh api "user/packages/docker/llm-router-go/versions?per_page=100" --jq ".versions[] | select(.name == \"$VER\") | .id" | head -n1 || true)
+            if [ -z "$VID" ]; then
+              echo "$VER: no package version, skipping"
+              continue
+            fi
+            echo "deleting $VER (version id $VID)"
+            gh api -X DELETE "user/packages/docker/llm-router-go/versions/$VID" \
+              -H "X-GitHub-Api-Version: 2020-02-28"
+          done
+
+      - name: Verify deleted
+        run: |
+          set -euo pipefail
+          TOK=$(gh auth token)
+          RT=$(curl -s -u "djdembeck:$TOK" "https://ghcr.io/token?service=ghcr.io&scope=repository:djdembeck/llm-router-go:pull" | python3 -c "import json,sys;print(json.load(sys.stdin)['token'])")
+          TAGS=$(curl -s -H "Authorization: Bearer $RT" "https://ghcr.io/v2/djdembeck/llm-router-go/tags/list?n=200")
+          for VER in v1.0.2 v1.0.3; do
+            if echo "$TAGS" | grep -q "\"$VER\""; then
+              echo "ERROR: $VER still present in registry"
+              exit 1
+            fi
+            echo "$VER gone from registry tags"
+          done
