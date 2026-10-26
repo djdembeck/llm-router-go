@@ -6,12 +6,9 @@
     <meta name="theme-color" content="#10130e" media="(prefers-color-scheme: dark)" />
     <meta name="theme-color" content="#eceadf" media="(prefers-color-scheme: light)" />
     <title>llm-router-go — fleet survey</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Overpass:wght@400;500;600;700&family=Overpass+Mono:wght@400;500;600&display=swap"
-    />
+    <!-- Overpass + Overpass Mono are vendored at /fonts.css (web/static);
+         no CDN on load — the embedded SPA must work air-gapped. -->
+    <link rel="stylesheet" href="/fonts.css" />
     <script>
       (function () {
         try {

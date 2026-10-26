@@ -863,7 +863,7 @@ func (e *engineRegistry) scrape(name string) {
 	s.offNext = time.Time{}
 	s.httpStatus = httpStatus
 	s.lastErr = ""
-	s.scrapeBody(parsePromText(body))
+	s.scrapeBody(body)
 }
 
 // zeroF64Ptr returns a pointer to a freshly allocated zero float.
@@ -939,8 +939,21 @@ func (s *engineScrape) zeroIntervalFields() {
 // scale to ±Inf and json.Marshal fatals the live stream — treated as absent.
 func scaledFinite(v float64) bool { return !math.IsInf(v*100, 0) }
 
-func (s *engineScrape) scrapeBody(samples []promSample) {
+func (s *engineScrape) scrapeBody(raw []byte) {
 	now := time.Now()
+	samples, truncated := parsePromText(raw)
+	// A capped parse lost the tail of the needed series (a histogram
+	// _count after its _sum skews updateHist baselines; a dropped
+	// _Total understates a lifetime counter). Treat the scrape as
+	// incomplete like the empty body — missing data, not ok with
+	// understated sums.
+	if truncated {
+		s.status = "err"
+		s.lastErr = "engine metrics body truncated (past sample cap)"
+		s.resetBaselines()
+		s.zeroIntervalFields()
+		return
+	}
 	if s.seenEng == nil {
 		s.seenEng = map[string]bool{}
 	}
@@ -1722,23 +1735,152 @@ func (s *engineScrape) counterSeen(sm promSample) bool {
 
 // ─── Prometheus text parser (stdlib, dashboard needs only) ────────────────
 
-// promSampleCap bounds the samples parsed from one exposition. The body
+// promSampleCap bounds the samples RETAINED from one exposition. The body
 // size cap alone admits ~1M short lines every second; the scrape only
-// reads a handful of metric names, so anything past the cap is dead weight.
+// reads a handful of metric families, so anything past the cap is dead
+// weight. With the name filter, the cap counts the families the router
+// consumes — an exposition dominated by unrelated series can no longer
+// push a needed series (e.g. a histogram _count after its _sum) past
+// the cap and publish partial data as complete.
 const promSampleCap = 8192
+
+// scrapeSamples is the set of metric names the router's scrapes
+// consume, enumerated EXACTLY from the two consumers: the vllm:/sglang:
+// gauges, counters, and histogram base names folded by
+// engineScrape.scrapeBody, and the DCGM/nvidia_smi names handled by
+// parseGPUDevices. The filter must not admit whole namespaces (the old
+// "vllm:*", "sglang:*", "gpu:" prefixes): any series the router ignores
+// counts against promSampleCap and can truncate the series it reads,
+// publishing partial data as complete.
+var scrapeSamples = map[string]struct{}{
+	// vLLM — gauge/counter names folded by engineScrape.scrapeBody.
+	"vllm:num_requests_running":           {},
+	"vllm:num_requests_waiting":           {},
+	"vllm:num_requests_waiting_by_reason": {},
+	"vllm:kv_cache_usage_perc":            {},
+	"vllm:cache_config_info":              {},
+	"vllm:num_preemptions_total":          {},
+	"vllm:request_success_total":          {},
+	"vllm:prefix_cache_queries_total":     {},
+	"vllm:prefix_cache_hits_total":        {},
+	"vllm:mm_cache_queries_total":         {},
+	"vllm:mm_cache_hits_total":            {},
+	"vllm:prompt_tokens_by_source_total":  {},
+	"vllm:prompt_tokens_total":            {},
+	"vllm:generation_tokens_total":        {},
+	// vLLM — histogram families: updateHist reads the _sum/_count parts
+	// (the _bucket lines are not consumed — they only count cap volume and
+	// can push a healthy scrape past the cap).
+	"vllm:time_to_first_token_seconds":                 {},
+	"vllm:time_to_first_token_seconds_sum":             {},
+	"vllm:time_to_first_token_seconds_count":           {},
+	"vllm:inter_token_latency_seconds":                 {},
+	"vllm:inter_token_latency_seconds_sum":             {},
+	"vllm:inter_token_latency_seconds_count":           {},
+	"vllm:e2e_request_latency_seconds":                 {},
+	"vllm:e2e_request_latency_seconds_sum":             {},
+	"vllm:e2e_request_latency_seconds_count":           {},
+	"vllm:request_queue_time_seconds":                  {},
+	"vllm:request_queue_time_seconds_sum":              {},
+	"vllm:request_queue_time_seconds_count":            {},
+	"vllm:request_prefill_time_seconds":                {},
+	"vllm:request_prefill_time_seconds_sum":            {},
+	"vllm:request_prefill_time_seconds_count":          {},
+	"vllm:request_decode_time_seconds":                 {},
+	"vllm:request_decode_time_seconds_sum":             {},
+	"vllm:request_decode_time_seconds_count":           {},
+	"vllm:request_time_per_output_token_seconds":       {},
+	"vllm:request_time_per_output_token_seconds_sum":   {},
+	"vllm:request_time_per_output_token_seconds_count": {},
+	"vllm:request_prompt_tokens":                       {},
+	"vllm:request_prompt_tokens_sum":                   {},
+	"vllm:request_prompt_tokens_count":                 {},
+	"vllm:request_generation_tokens":                   {},
+	"vllm:request_generation_tokens_sum":               {},
+	"vllm:request_generation_tokens_count":             {},
+	// SGLang — gauge/counter names folded by engineScrape.scrapeBody.
+	"sglang:num_running_reqs":                 {},
+	"sglang:num_queue_reqs":                   {},
+	"sglang:token_usage":                      {},
+	"sglang:full_token_usage":                 {},
+	"sglang:swa_token_usage":                  {},
+	"sglang:mamba_usage":                      {},
+	"sglang:num_used_tokens":                  {},
+	"sglang:max_total_num_tokens":             {},
+	"sglang:kv_available_tokens":              {},
+	"sglang:kv_evictable_tokens":              {},
+	"sglang:mamba_used_tokens":                {},
+	"sglang:mamba_available_tokens":           {},
+	"sglang:mamba_evictable_tokens":           {},
+	"sglang:num_retracted_reqs":               {},
+	"sglang:cache_hit_rate":                   {},
+	"sglang:max_running_requests_under_SLO":   {},
+	"sglang:context_len":                      {},
+	"sglang:kv_cache_memory_usage_gb":         {},
+	"sglang:weight_memory_usage_gb":           {},
+	"sglang:hicache_host_used_tokens":         {},
+	"sglang:hicache_host_total_tokens":        {},
+	"sglang:num_aborted_requests_total":       {},
+	"sglang:num_retracted_input_tokens_total": {},
+	"sglang:num_requests_total":               {},
+	"sglang:prompt_tokens_total":              {},
+	"sglang:generation_tokens_total":          {},
+	"sglang:realtime_tokens_total":            {},
+	// SGLang — histogram families (same part coverage as vLLM).
+	"sglang:time_to_first_token_seconds":       {},
+	"sglang:time_to_first_token_seconds_sum":   {},
+	"sglang:time_to_first_token_seconds_count": {},
+	"sglang:inter_token_latency_seconds":       {},
+	"sglang:inter_token_latency_seconds_sum":   {},
+	"sglang:inter_token_latency_seconds_count": {},
+	"sglang:e2e_request_latency_seconds":       {},
+	"sglang:e2e_request_latency_seconds_sum":   {},
+	"sglang:e2e_request_latency_seconds_count": {},
+	"sglang:queue_time_seconds":                {},
+	"sglang:queue_time_seconds_sum":            {},
+	"sglang:queue_time_seconds_count":          {},
+	"sglang:prompt_tokens_histogram":           {},
+	"sglang:prompt_tokens_histogram_sum":       {},
+	"sglang:prompt_tokens_histogram_count":     {},
+	"sglang:generation_tokens_histogram":       {},
+	"sglang:generation_tokens_histogram_sum":   {},
+	"sglang:generation_tokens_histogram_count": {},
+	// DCGM exporter — names handled by parseGPUDevices.
+	"DCGM_FI_DEV_GPU_UTIL":    {},
+	"DCGM_FI_DEV_FB_USED":     {},
+	"DCGM_FI_DEV_FB_TOTAL":    {},
+	"DCGM_FI_DEV_FB_FREE":     {},
+	"DCGM_FI_DEV_GPU_TEMP":    {},
+	"DCGM_FI_DEV_POWER_USAGE": {},
+	// nvidia_gpu_exporter — names handled by parseGPUDevices.
+	"nvidia_smi_utilization_gpu_ratio": {},
+	"nvidia_smi_memory_used_bytes":     {},
+	"nvidia_smi_memory_total_bytes":    {},
+	"nvidia_smi_temperature_gpu":       {},
+	"nvidia_smi_power_draw_watts":      {},
+}
+
+func isScrapeSample(name string) bool {
+	_, ok := scrapeSamples[name]
+	return ok
+}
 
 // parsePromText parses the Prometheus text exposition format well enough
 // for gauges, counters, and histogram _sum/_count parts. HELP/TYPE lines,
-// openmetrics timestamps, and unparseable lines are skipped.
-func parsePromText(body []byte) []promSample {
+// openmetrics timestamps, and unparseable lines are skipped. Only samples
+// from the exact metric names in scrapeSamples are retained — the memory
+// cost of the scrape is bounded by promSampleCap, not the body size. The
+// scan always walks the whole body (line by line, no full-body split), so
+// memory is bounded by that count, not the body. truncated is true when
+// the exposition held more retained samples than the cap: in that case
+// later series are lost and the consumer must treat the scrape as
+// incomplete (missing data), never as ok with understated sums.
+func parsePromText(body []byte) (samples []promSample, truncated bool) {
 	var out []promSample
 	// Scan line by line instead of strings.Split over the whole body: a
 	// 4 MiB body of many short lines must not allocate a million-entry
-	// slice, and the cap stops the scan as soon as it is reached.
+	// slice; found samples past the cap are counted, not kept.
 	for rest := body; len(rest) > 0; {
-		if len(out) >= promSampleCap {
-			break
-		}
 		nl := bytes.IndexByte(rest, '\n')
 		var line, next []byte
 		if nl >= 0 {
@@ -1756,6 +1898,10 @@ func parsePromText(body []byte) []promSample {
 		if !ok {
 			continue
 		}
+		name, labels, hok := splitPromHead(head)
+		if !hok || !isScrapeSample(name) {
+			continue
+		}
 		v, err := strconv.ParseFloat(val, 64)
 		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 			// Non-finite values are valid in the Prometheus format, but
@@ -1763,13 +1909,13 @@ func parsePromText(body []byte) []promSample {
 			// the whole live stream. Treat it as an unparseable line.
 			continue
 		}
-		name, labels, ok := splitPromHead(head)
-		if !ok {
+		if len(out) >= promSampleCap {
+			truncated = true
 			continue
 		}
 		out = append(out, promSample{name: name, labels: labels, value: v})
 	}
-	return out
+	return out, truncated
 }
 
 // splitPromLine separates the metric head from its value without splitting
@@ -1970,7 +2116,11 @@ type sessLiveFrame struct {
 	Phase   string `json:"phase"` // "admitted" | "streaming"
 	StartMs int64  `json:"startMs"`
 	CtxTok  int    `json:"ctxTok"`
-	NewTok  int    `json:"newTok"`
+	// NewTok: WHOLE-conversation new-prefill estimate
+	// (estimatePrefillTokens), matching the admission gate — the
+	// last-message telemetry figure (estimateNewTokens) is a separate
+	// burst-feed field.
+	NewTok int `json:"newTok"`
 	// EstPrefillMs: estimated prefill duration (newTok /
 	// PREFILL_TOKENS_PER_SEC · 1000) — a router estimate, not a
 	// measurement. 0 for non-streaming requests (their first byte marks
@@ -2166,7 +2316,9 @@ func (r *sessionRegistry) finish(id uint64, status int, durMs, ttftMs float64, b
 }
 
 // finishRejection folds a router-side rejection (429/413) directly into the
-// session ring/aggregates — rejections never enter the live stack.
+// session ring/aggregates — rejections never enter the live stack. newTok is
+// the whole-conversation prefill estimate (the same figure the live/finish
+// paths record); the last-message burst newTokensEst stays out of sessions.
 func (r *sessionRegistry) finishRejection(backend, path, sess string, ctxTok, newTok, status int, durMs float64) {
 	if sess == "" {
 		return
@@ -2598,7 +2750,11 @@ func main() {
 	go func() {
 		log.Printf("management listener: dashboard + /metrics/* on %s", metricsListen)
 		if err := http.ListenAndServe(metricsListen, metricsMux); err != nil {
-			log.Fatalf("management listener %s: %v", metricsListen, err)
+			// The management surface (SPA dashboard, /metrics, /feeds,
+			// /stats) is telemetry; a port collision or other bind failure
+			// must not kill the data plane. Routing keeps serving without
+			// the dashboard.
+			log.Printf("management listener %s: %v — dashboard + /metrics feeds disabled, routing continues", metricsListen, err)
 		}
 	}()
 
@@ -3850,11 +4006,23 @@ func (g *gpuRegistry) scrape() {
 		}
 		return
 	}
+	// A capped parse lost part of the exposition: the retained devices
+	// are partial exactly like a truncated engine body, so the scrape is
+	// incomplete (err) and the partial list is withheld — never "ok"
+	// with devices silently missing from the frame.
+	samples, truncated := parsePromText(body)
+	if truncated {
+		g.status = "err"
+		g.lastErr = "gpu metrics body truncated (past sample cap)"
+		g.errDelay = time.Second
+		g.errNext = time.Now().Add(g.errDelay)
+		return
+	}
 	g.status = "ok"
 	g.lastErr = ""
 	g.errDelay = 0
 	g.errNext = time.Time{}
-	g.devices = parseGPUDevices(parsePromText(body))
+	g.devices = parseGPUDevices(samples)
 }
 
 // gpuBuilder accumulates one device across the family-specific metric names.
@@ -4400,10 +4568,15 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Estimated NEW prefill tokens (request-body based, ~4 bytes/token).
-	// Computed once, before any admission decision: the large-prefill
-	// throttle and metrics both use this value.
+	// Estimated NEW prefill tokens (request-body based, ~4 bytes/token)
+	// for human-facing telemetry (the burst feed's newTokensEst):
+	// last-message-only for multi-turn conversations. Computed once,
+	// before any admission decision.
 	newTokens := estimateNewTokens(&parsed)
+	// The admission gate and the live-session prefill bar both measure
+	// against the WHOLE-conversation estimate: the throttle and the bar
+	// must agree, so both use this value (see estimatePrefillTokens).
+	prefillTok := estimatePrefillTokens(&parsed)
 	// Est context tokens (whole conversation/prompt) + the conversation
 	// session id, for the live sessions view. Both are body estimates.
 	ctxTok := estimateCtxTokens(&parsed)
@@ -4425,8 +4598,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		reqContext.T = time.Now()
 		reqContext.DurMs = float64(time.Since(reqStart) / time.Millisecond)
 		// Rejections never enter the live stack, but they DO belong to the
-		// conversation — fold them into the session ring/aggregates.
-		sessions.finishRejection(reqContext.Backend, r.URL.Path, sessKey, ctxTok, newTokens, status, reqContext.DurMs)
+		// conversation — fold them into the session ring/aggregates with
+		// the whole-conversation prefill estimate (the figure live/finish
+		// record); the last-message newTokens stays in the burst feed only.
+		sessions.finishRejection(reqContext.Backend, r.URL.Path, sessKey, ctxTok, prefillTok, status, reqContext.DurMs)
 		metrics.recordRequest(reqContext.Backend, reqContext)
 	}
 
@@ -4522,7 +4697,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		if threshold == 0 {
 			threshold = 8192
 		}
-		prefillTokens := estimatePrefillTokens(&parsed)
+		prefillTokens := prefillTok
 		if prefillTokens >= threshold {
 			pin, pmaxC, pwaiting, _ := prefillSem.snapshot()
 			if pin >= pmaxC {
@@ -4585,7 +4760,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	reqContext.accepted = true
 	metrics.recordAccept(target.Name, int64(len(body)), newTokens)
 	// The request enters the live session stack at admission.
-	reqID := sessions.start(target.Name, r.URL.Path, parsed.Stream, sessKey, ctxTok, newTokens)
+	// The session live figure (estPrefillMs) feeds the queue prefill bar;
+	// it must measure the same estimate the gate throttles on — the
+	// whole-conversation figure, not the last-message telemetry value
+	// above.
+	reqID := sessions.start(target.Name, r.URL.Path, parsed.Stream, sessKey, ctxTok, prefillTok)
 	proxy := proxies[target.Name]
 	// Wrap ResponseWriter to capture status + detect completion for duration
 	// tracking. Also releases the prefill slot on first response byte.
@@ -4621,8 +4800,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				status = http.StatusBadGateway
 			}
 		}
+		// TTFT on completion follows the same success rule as the
+		// first-byte sample in respTracker.Write: a non-2xx streaming
+		// response (e.g. an upstream 5xx error body) has a body latency
+		// but is not serving — 0 keeps it out of the session's
+		// AvgTTFTMs and the request sample.
 		var ttftMs float64
-		if parsed.Stream && !tracker.firstByteAt.IsZero() {
+		if parsed.Stream && status >= 200 && status < 300 && !tracker.firstByteAt.IsZero() {
 			ttftMs = float64(tracker.firstByteAt.Sub(start) / time.Millisecond)
 		}
 		tracker.finish(target.Name, r.URL.Path, status, ttftMs, tracker.bytesOut)
@@ -4684,8 +4868,13 @@ func (t *respTracker) Write(b []byte) (int, error) {
 			t.firstByteAt = time.Now()
 			t.bodyByte = true
 			// TTFT is live truth: record it now, while the request is still
-			// decoding, so the dashboard sees it the moment it happens.
-			if t.stream && !t.ttftSent {
+			// decoding, so the dashboard sees it the moment it happens. Only
+			// the first byte of a route-accepted 2xx stream counts: router-
+			// generated error bodies (handleProxyError writes 502/503 through
+			// this same tracker) and upstream non-2xx responses must never
+			// publish a TTFT sample, and an already-finalized sample (finish
+			// ran on the error path) cannot record a second one.
+			if t.stream && !t.ttftSent && !t.recorded && t.status >= 200 && t.status < 300 {
 				t.ttftSent = true
 				metrics.recordFirstByte(t.backend, float64(t.firstByteAt.Sub(t.ttftStart)/time.Millisecond))
 			}

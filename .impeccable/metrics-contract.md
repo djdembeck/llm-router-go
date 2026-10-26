@@ -306,7 +306,10 @@ prefill slots; the panic still propagates to the HTTP server.
 `id` is a process-wide unique counter. Sorted `startMs`
 **ascending** (oldest on top — the stack). Feed cap **256** (oldest evicted
 beyond that); internal live map cap **1024** (evict oldest on insert).
-`ctxTok`/`newTok` are router estimates (see honest boundary).
+`ctxTok` is a router body estimate; **`newTok` is the
+WHOLE-conversation estimate (`estimatePrefillTokens`)** — the same figure
+the large-prefill admission gate throttles on, so the prefill bar measures
+what the gate measures (see honest boundary).
 - `estPrefillMs` — estimated prefill duration in ms: `newTok` at
   `PREFILL_TOKENS_PER_SEC` (default 10000, env-overridable). Class:
   **router-estimate** — render gold + `est`, never blue/real. `0` for
@@ -325,7 +328,7 @@ beyond that); internal live map cap **1024** (evict oldest on insert).
 - `n` — completed requests in the session (incl. rejections); `firstMs`/`lastMs` — first/last request ms.
 - `active` — `liveN > 0` OR `(now − lastMs) < 120s`.
 - `liveN` — in-flight count for this session.
-- `ctxTok`/`newTok`/`cachedTok` — from the **latest** completed (or live) request; `cachedTok = max(0, ctxTok − newTok)`.
+- `ctxTok`/`newTok`/`cachedTok` — from the **latest** completed (or live) request; `cachedTok = max(0, ctxTok − newTok)`. Both a **live** request's `newTok` and a **completed** request's `newTok` are the **whole-conversation** estimate (`estimatePrefillTokens`, the admission-gate figure): accepted requests enter the live registry with it, and finish copies the same value into the completed request and the session aggregates. (The last-message `estimateNewTokens` figure is the burst feed's `newTokensEst` only — it does not appear in this endpoint.)
 - `avgTTFTMs` — mean TTFT over completed **streaming** requests with `ttftMs > 0` (rejections/non-stream excluded).
 - `totalDurS` — Σ durMs over all requests.
 - `tokOutTotal` — Σ tokOut (est, bytesOut/4).
@@ -345,8 +348,14 @@ tokOut ÷ seconds, 0 when durMs=0).
 
 **Est boundary:** ALL token figures in this endpoint are router-side
 **body-based ESTIMATES** (~4 bytes/token): `ctxTok` = Σ message content
-bytes (or prompt bytes) ÷ 4; `newTok` = `estimateNewTokens` (last message
-only for multi-turn); `tokOut` = response body bytes ÷ 4. They are NOT
+bytes (or prompt bytes) ÷ 4; `newTok` = `estimatePrefillTokens`
+(whole conversation, the admission-gate figure) for **both** live and
+completed requests — an accepted/completed request's `newTok` is the
+same whole-conversation figure it entered the live registry with; a
+rejected (429/413) request never enters it and receives the same figure
+directly via finishRejection (the last-message `estimateNewTokens`
+figure appears only as the burst feed's `newTokensEst`); `tokOut` =
+response body bytes ÷ 4. They are NOT
 measured — render with the "est" marker, as in the burst feed.
 
 ## Honest data boundary (binding on both slices)

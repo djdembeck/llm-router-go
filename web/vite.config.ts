@@ -46,7 +46,11 @@ export default defineConfig({
     }),
   ],
   server: {
-    host: "0.0.0.0",
+    // Loopback by default: the /metrics proxy reaches the loopback-only
+    // management listener (METRICS_LISTEN, 127.0.0.1:9100), so binding the
+    // dev server to the LAN would expose an unauthenticated management
+    // surface. Set DEV_HOST=true to serve on all interfaces deliberately.
+    host: process.env.DEV_HOST === "true" ? "0.0.0.0" : "127.0.0.1",
     port: Number(process.env.VITE_PORT) || 5173,
     proxy: {
       "/stats": routerProxy,

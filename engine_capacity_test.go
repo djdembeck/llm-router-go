@@ -18,7 +18,7 @@ func TestVllmKVCapacity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &engineScrape{}
-			s.scrapeBody(parsePromText([]byte(tc.body)))
+			s.scrapeBody([]byte(tc.body))
 			v := s.view
 			if tc.want == 0 {
 				if v.KVCapTok != nil {
@@ -30,7 +30,7 @@ func TestVllmKVCapacity(t *testing.T) {
 			if v.KVUsedTok != nil {
 				t.Fatalf("capacity info invented used tokens: %v", *v.KVUsedTok)
 			}
-			s.scrapeBody(parsePromText([]byte("vllm:num_requests_running 0")))
+			s.scrapeBody([]byte("vllm:num_requests_running 0"))
 			if s.view.KVCapTok != nil {
 				t.Fatal("vanished capacity retained as current")
 			}
@@ -39,7 +39,7 @@ func TestVllmKVCapacity(t *testing.T) {
 	for _, invalid := range []string{"None", "NaN", "+Inf", "-Inf", "-1", "0", "invalid"} {
 		t.Run(invalid, func(t *testing.T) {
 			s := &engineScrape{}
-			s.scrapeBody(parsePromText([]byte(fmt.Sprintf("vllm:cache_config_info{kv_cache_size_tokens=%q} 1", invalid))))
+			s.scrapeBody([]byte(fmt.Sprintf("vllm:cache_config_info{kv_cache_size_tokens=%q} 1", invalid)))
 			if s.view.KVCapTok != nil {
 				t.Fatalf("invalid capacity %q accepted", invalid)
 			}
@@ -54,9 +54,9 @@ func TestVllmKVCapacity(t *testing.T) {
 // sum is covered by "data parallel sum" in TestVllmKVCapacity.
 func TestVllmKVCapacity_SumOverflowStaysFinite(t *testing.T) {
 	s := &engineScrape{}
-	s.scrapeBody(parsePromText([]byte(
+	s.scrapeBody([]byte(
 		`vllm:cache_config_info{engine="0",kv_cache_size_tokens="1e308"} 1` + "\n" +
-			`vllm:cache_config_info{engine="1",kv_cache_size_tokens="1e308"} 1`)))
+			`vllm:cache_config_info{engine="1",kv_cache_size_tokens="1e308"} 1`))
 	if v := s.view.KVCapTok; v != nil {
 		t.Fatalf("overflowed capacity published as %v, want absent", *v)
 	}

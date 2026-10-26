@@ -29,6 +29,13 @@ func Handler() http.Handler {
 		// Unreachable in practice: the embed guarantees build exists.
 		panic(err)
 	}
+	return handlerFor(sub)
+}
+
+// handlerFor builds the SPA handler over an arbitrary static FS. The
+// production Handler wraps the embedded build; tests inject a fixture FS
+// so routing can be exercised without a frontend build present.
+func handlerFor(sub fs.FS) http.Handler {
 	files := http.FileServer(http.FS(sub))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

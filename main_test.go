@@ -369,7 +369,6 @@ func TestLargePrefillGateCountsMultiTurnPrefix(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
-	defer releaseAll()
 
 	var reached atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -378,14 +377,20 @@ func TestLargePrefillGateCountsMultiTurnPrefix(t *testing.T) {
 		<-release
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer upstream.Close()
-
 	origBackends, origSlots, origPrefillSlots := backends, slots, prefillSlots
 	origDurations, origProxies := durations, proxies
+	// First in source = LIFO runs LAST: globals are restored after every
+	// release, so no released handler's deferred cleanup ever touches
+	// restored (nil) globals.
 	defer func() {
 		backends, slots, prefillSlots = origBackends, origSlots, origPrefillSlots
 		durations, proxies = origDurations, origProxies
 	}()
+	defer upstream.Close()
+	// Last in source = LIFO runs FIRST: release the blocked handler
+	// before the server closes, or Close() can wait on the handler
+	// forever if the test fails early.
+	defer releaseAll()
 
 	backends = []Backend{{
 		Name:                        "probe",
@@ -472,20 +477,22 @@ func TestLargePrefillGateCountsMultiTurnPrefix(t *testing.T) {
 
 // TestMultiTurn_AdmissionGateVsTelemetry pins the two deliberately different
 // token semantics for a multi-turn request (cbf987c): the large-prefill
-// ADMISSION gate uses the whole-conversation estimate, while the published
-// telemetry (session live frame, burst newTokensEst) uses the last-message
-// (cached-context) estimate. Unifying the figures in either direction is
-// caught:
+// ADMISSION gate, the session live frame (newTok / estPrefillMs — the
+// queue prefill bar), and the burst newTokensEst each have a defined
+// source: the gate and the session live figure use the WHOLE-conversation
+// estimate (the bar must measure what the gate throttles on); the burst
+// newTokensEst remains the last-message (cached-context) telemetry
+// figure. Drifting the gate or the live figure to the last-message
+// estimate is caught:
 //   - gate on the last message: A's short final turn falls below the
 //     threshold, the slot is kept free, and B is forwarded immediately
 //     (reached == 2 while the gate should be full).
-//   - telemetry on the full conversation: live newTok / estPrefillMs and
-//     burst newTokensEst read the whole-conversation figure.
+//   - live session on the last message: live newTok / estPrefillMs read
+//     2 tokens (0 ms) instead of the whole-conversation 20002 (~2000 ms).
 func TestMultiTurn_AdmissionGateVsTelemetry(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
-	defer releaseAll()
 
 	var reached atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -494,17 +501,23 @@ func TestMultiTurn_AdmissionGateVsTelemetry(t *testing.T) {
 		<-release
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer upstream.Close()
-
 	origBackends, origSlots, origPrefillSlots := backends, slots, prefillSlots
 	origDurations, origProxies, origGpu := durations, proxies, gpu
 	origSessions, origMetrics := sessions, metrics
+	// First in source = LIFO runs LAST: globals are restored after every
+	// release, so no released handler's deferred cleanup ever touches
+	// restored (nil) globals.
 	defer func() {
 		backends, slots, prefillSlots = origBackends, origSlots, origPrefillSlots
 		durations, proxies = origDurations, origProxies
 		gpu = origGpu
 		sessions, metrics = origSessions, origMetrics
 	}()
+	defer upstream.Close()
+	// Last in source = LIFO runs FIRST: release the blocked handler
+	// before the server closes, or Close() can wait on the handler
+	// forever if the test fails early.
+	defer releaseAll()
 
 	backends = []Backend{{
 		Name:                        "probe",
@@ -574,8 +587,10 @@ func TestMultiTurn_AdmissionGateVsTelemetry(t *testing.T) {
 	}
 
 	// TELEMETRY at admission: the session live frame carries the
-	// LAST-MESSAGE estimate. estPrefillMs = NewTok/10000·1000 must be 0 for
-	// 2 tokens; the full-conversation figure would yield ~2000.
+	// WHOLE-CONVERSATION estimate (the same figure the admission gate
+	// throttles on): newTok = 20002, estPrefillMs =
+	// NewTok/10000·1000 = 2000. A last-message figure (2 tokens, 0 ms)
+	// would betray the bar measuring a different estimate than the gate.
 	f := sessions.feed()
 	if len(f.Live) != 1 {
 		t.Fatalf("live = %d, want 1", len(f.Live))
@@ -584,11 +599,11 @@ func TestMultiTurn_AdmissionGateVsTelemetry(t *testing.T) {
 	if l.CtxTok != wantCtx {
 		t.Errorf("live ctxTok = %d, want %d", l.CtxTok, wantCtx)
 	}
-	if l.NewTok != wantNew {
-		t.Errorf("live newTok = %d, want %d (last-message estimate)", l.NewTok, wantNew)
+	if l.NewTok != wantCtx {
+		t.Errorf("live newTok = %d, want %d (whole-conversation estimate)", l.NewTok, wantCtx)
 	}
-	if l.EstPrefillMs != 0 {
-		t.Errorf("estPrefillMs = %d, want 0 (2 new tokens at 10k tok/s)", l.EstPrefillMs)
+	if want := int(float64(wantCtx) / float64(prefillTokensPerSec) * 1000); l.EstPrefillMs != want {
+		t.Errorf("estPrefillMs = %d, want %d (%d new tokens at %d tok/s)", l.EstPrefillMs, want, wantCtx, prefillTokensPerSec)
 	}
 
 	// A second request with the same conversation must QUEUE on the full
@@ -838,6 +853,89 @@ func TestMetrics_TTFT_FirstByteEWMA(t *testing.T) {
 	}
 }
 
+// TestRespTracker_ErrorBodyNoTTFTSample pins the first-byte guard:
+// router-generated error bodies (handleProxyError writes 502/503 through
+// the same tracker, sometimes after finish already recorded the request)
+// and upstream non-2xx bodies must never publish a TTFT sample, while a
+// genuine 2xx stream's first byte still does.
+func TestRespTracker_ErrorBodyNoTTFTSample(t *testing.T) {
+	saveMetrics := metrics
+	metrics = newTestMetrics()
+	t.Cleanup(func() { metrics = saveMetrics })
+
+	saveSessions := sessions
+	sessions = newSessionRegistry()
+	t.Cleanup(func() { sessions = saveSessions })
+
+	tracker := func(code int) *respTracker {
+		rec := httptest.NewRecorder()
+		metrics.recordAccept("b", 0, 0) // the stream was admitted by the route
+		return &respTracker{
+			ResponseWriter: rec,
+			status:         code,
+			wrote:          true, // headers already sent; body bytes land via Write
+			backend:        "b",
+			ttftStart:      time.Now().Add(-50 * time.Millisecond),
+			reqStart:       time.Now().Add(-50 * time.Millisecond),
+			stream:         true,
+		}
+	}
+
+	// 1. Router-generated 503 error body (handleProxyError path).
+	t503 := tracker(503)
+	if _, err := t503.Write([]byte(`{"error":{"stream":true}}`)); err != nil {
+		t.Fatalf("write 503 body: %v", err)
+	}
+	if n := metrics.snapshot("b").TTFTSampleCount; n != 0 {
+		t.Fatalf("ttftSampleCount = %d, want 0 (router error body)", n)
+	}
+
+	// 2. Upstream 5xx body: the stream was admitted, but the first byte
+	// is on a non-2xx status — not a serving TTFT.
+	t500 := tracker(500)
+	if _, err := t500.Write([]byte(`{"error":{"stream":true}}`)); err != nil {
+		t.Fatalf("write 500 body: %v", err)
+	}
+	if n := metrics.snapshot("b").TTFTSampleCount; n != 0 {
+		t.Fatalf("ttftSampleCount = %d, want 0 (upstream 5xx body)", n)
+	}
+
+	// 3. Genuine 2xx stream: first byte IS the TTFT.
+	t200 := tracker(200)
+	if _, err := t200.Write([]byte(`data: {"id": 1}`)); err != nil {
+		t.Fatalf("write 200 body: %v", err)
+	}
+	if n := metrics.snapshot("b").TTFTSampleCount; n != 1 {
+		t.Fatalf("ttftSampleCount = %d, want 1 (genuine streaming first byte)", n)
+	}
+
+	// 4. Session aggregate: the completion path (computeTTFT gate in
+	// handleProxy) passes 0 for the non-2xx body's latency and the body
+	// latency for the 2xx one — sessFeed.AvgTTFTMs must be the 2xx mean,
+	// never polluted by the 5xx body. Same rules as the live sample.
+	id500 := sessions.start("b", "/v1/chat/completions", true, "p0sess012345", 100, 40)
+	t500.reqID = id500
+	t500.finish("b", "/v1/chat/completions", 500, 0, t500.bytesOut)
+
+	id200 := sessions.start("b", "/v1/chat/completions", true, "p0sess012345", 100, 40)
+	t200.reqID = id200
+	t200.finish("b", "/v1/chat/completions", 200,
+		float64(t200.firstByteAt.Sub(t200.reqStart)/time.Millisecond), t200.bytesOut)
+
+	f := sessions.feed()
+	if f.Live == nil || len(f.Sessions) != 1 {
+		t.Fatalf("sessions = %+v, want 1 (completions folded)", f.Sessions)
+	}
+	s := f.Sessions[0]
+	if s.AvgTTFTMs <= 0 {
+		t.Errorf("avgTTFTMs = %v, want >0 (2xx sample only; non-2xx body latency excluded)", s.AvgTTFTMs)
+	}
+	want := float64(t200.firstByteAt.Sub(t200.reqStart) / time.Millisecond)
+	if math.Abs(s.AvgTTFTMs-want) > 0.001 {
+		t.Errorf("avgTTFTMs = %v, want %v (exactly the 2xx sample)", s.AvgTTFTMs, want)
+	}
+}
+
 func TestMetrics_ComputeRates_LiveArrivalWindow(t *testing.T) {
 	m := newTestMetrics()
 
@@ -946,7 +1044,7 @@ vllm:e2e_request_latency_seconds_count 5
 vllm:e2e_request_latency_seconds_sum 12.5
 not_a_number 1.2.3
 `)
-	samples := parsePromText(body)
+	samples, _ := parsePromText(body)
 	byName := map[string][]promSample{}
 	for _, s := range samples {
 		byName[s.name] = append(byName[s.name], s)
@@ -971,43 +1069,88 @@ not_a_number 1.2.3
 
 func TestEngine_ParsePromText_NonFiniteSkipped(t *testing.T) {
 	body := []byte(`
-gpu:util_percent{gpu="0"} NaN
-gpu:util_percent{gpu="1"} +Inf
-gpu:util_percent{gpu="2"} -Inf
-gpu:util_percent{gpu="3"} 55
+DCGM_FI_DEV_GPU_UTIL{UUID="0"} +Inf
+DCGM_FI_DEV_GPU_UTIL{UUID="1"} -Inf
+DCGM_FI_DEV_GPU_UTIL{UUID="2"} 55
 `)
-	samples := parsePromText(body)
-	if len(samples) != 1 || samples[0].labels["gpu"] != "3" || samples[0].value != 55 {
-		t.Fatalf("samples = %+v, want only the finite gpu=3 sample", samples)
+	samples, _ := parsePromText(body)
+	if len(samples) != 1 || samples[0].labels["UUID"] != "2" || samples[0].value != 55 {
+		t.Fatalf("samples = %+v, want only the finite UUID=2 sample", samples)
 	}
 }
 
 func TestEngine_ParsePromText_EscapedLabel(t *testing.T) {
-	body := []byte(`x{model_name="a\"b",engine="0"} 1
+	body := []byte(`vllm:num_requests_running{model_name="a\"b",engine="0"} 1
 `)
-	samples := parsePromText(body)
+	samples, _ := parsePromText(body)
 	if len(samples) != 1 || samples[0].labels["model_name"] != `a"b` {
 		t.Fatalf("escaped label = %+v, want a\"b", samples)
 	}
 }
 
-// TestEngine_ParsePromText_Capped bounds the scan work: a body with far
-// more sample lines than promSampleCap yields exactly promSampleCap
-// samples and stops scanning, so a huge many-line body cannot allocate a
-// chunky whole-body split and keep walking.
+// consumedNameSeq is a repeating rotation of metric names that the scrape
+// actually consumes, for building cap-sized synthetic expositions.
+var consumedNameSeq = []string{
+	"vllm:num_requests_running", "sglang:num_running_reqs",
+	"DCGM_FI_DEV_GPU_UTIL", "nvidia_smi_utilization_gpu_ratio",
+}
+
+// TestEngine_ParsePromText_Capped bounds the retained samples: a body
+// with far more CONSUMED sample lines than promSampleCap yields exactly
+// promSampleCap samples and reports truncation, while samples from
+// families the router does not consume (not in scrapeSamples) are
+// dropped without ever counting against the cap.
 func TestEngine_ParsePromText_Capped(t *testing.T) {
-	// 2x the cap of sample lines, each short.
 	var body bytes.Buffer
+	// 2x the cap of consumed sample lines, interleaved with non-consumed
+	// lines (including a "vllm:" namespace metric nobody reads) that must
+	// not consume cap budget.
 	for i := range promSampleCap * 2 {
-		fmt.Fprintf(&body, "metric_x%d 1\n", i)
+		fmt.Fprintf(&body, "unrelated_x%d 1\nvllm:not_a_consumed_metric{i=\"%d\"} 1\n", i, i)
+		fmt.Fprintf(&body, "%s{i=\"%d\"} 1\n", consumedNameSeq[i%len(consumedNameSeq)], i)
 	}
-	samples := parsePromText(body.Bytes())
+	samples, truncated := parsePromText(body.Bytes())
+	if !truncated {
+		t.Fatal("truncated = false, want true (2x cap of consumed samples)")
+	}
 	if len(samples) != promSampleCap {
 		t.Fatalf("samples = %d, want exactly %d (cap)", len(samples), promSampleCap)
 	}
-	// The first sample must be the first line (ordering preserved).
-	if !strings.HasPrefix(samples[0].name, "metric_x0") {
-		t.Errorf("first sample = %q, want metric_x0", samples[0].name)
+	// No non-consumed name may survive the exact-name filter.
+	for _, sm := range samples {
+		if !isScrapeSample(sm.name) {
+			t.Fatalf("unconsumed sample %q retained", sm.name)
+		}
+	}
+	// The first sample must be the first consumed line (ordering preserved).
+	if samples[0].name != consumedNameSeq[0] {
+		t.Errorf("first sample = %q, want %q", samples[0].name, consumedNameSeq[0])
+	}
+}
+
+// TestEngine_ScrapeBody_TruncationReportsMissing pins the cap semantics at
+// the consumer: a truncated exposition must not publish partial data as
+// ok (running/waiting/num_preemptions understated, _count dropped while
+// _sum kept breaks updateHist baselines) — it must surface as err with
+// missing fields.
+func TestEngine_ScrapeBody_TruncationReportsMissing(t *testing.T) {
+	s := &engineScrape{}
+	var body bytes.Buffer
+	// Fill the cap with CONSUMED-name samples (the junk names from the
+	// pre-filter era no longer count against the cap at all): the
+	// truncation the test pins can only be triggered by samples the
+	// parser retains.
+	for i := range promSampleCap {
+		fmt.Fprintf(&body, "%s{i=\"%d\"} 1\n", consumedNameSeq[i%len(consumedNameSeq)], i)
+	}
+	// The tail series the scrape needs, past the cap: truncated away.
+	body.WriteString("vllm:num_requests_running 7\n")
+	s.scrapeBody(body.Bytes())
+	if s.view.Status != "err" {
+		t.Fatalf("status = %q, want err (truncated exposition)", s.view.Status)
+	}
+	if s.view.Running != 0 {
+		t.Errorf("running = %v, want 0 (truncated scrape publishes nothing)", s.view.Running)
 	}
 }
 
@@ -1038,7 +1181,7 @@ vllm:generation_tokens_total{model_name="m",engine="0"} 500
 vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 10
 vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 2
 `
-	s.scrapeBody(parsePromText([]byte(body)))
+	s.scrapeBody([]byte(body))
 	first := s.view
 	if first.Status != "ok" {
 		t.Fatalf("status = %q, want ok", first.Status)
@@ -1066,7 +1209,7 @@ vllm:kv_cache_usage_perc{model_name="m",engine="1"} 0.4
 vllm:time_to_first_token_seconds_sum{model_name="m",engine="0"} 30
 vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 4
 `
-	s.scrapeBody(parsePromText([]byte(body2)))
+	s.scrapeBody([]byte(body2))
 	if got := s.view.TTFTms; got < 9900 || got > 10100 {
 		t.Errorf("ttftMs = %v, want ~10000 ((30-10)/(4-2) s)", got)
 	}
@@ -1074,7 +1217,7 @@ vllm:time_to_first_token_seconds_count{model_name="m",engine="0"} 4
 	s2body := `
 vllm:prompt_tokens_total{model_name="m",engine="0"} 10
 `
-	s.scrapeBody(parsePromText([]byte(s2body)))
+	s.scrapeBody([]byte(s2body))
 	if s.view.PrefillTokS != 0 {
 		t.Errorf("prefillTokS after counter reset = %v, want 0 (re-baseline)", s.view.PrefillTokS)
 	}
@@ -1099,7 +1242,7 @@ sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank=
 sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="prefill_cache"} 2000
 sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="decode"} 6000
 `
-	s.scrapeBody(parsePromText([]byte(body)))
+	s.scrapeBody([]byte(body))
 	if s.view.Status != "ok" {
 		t.Fatalf("status = %q, want ok", s.view.Status)
 	}
@@ -1124,7 +1267,7 @@ sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank=
 sglang:realtime_tokens_total{model_name="m",engine_type="a",tp_rank="0",pp_rank="0",moe_ep_rank="0",mode="decode"} 18000
 `
 	time.Sleep(300 * time.Millisecond)
-	s.scrapeBody(parsePromText([]byte(body2)))
+	s.scrapeBody([]byte(body2))
 	// Δcompute = 8000, Δcache = 4000, Δdecode = 12000 over ~0.3s.
 	if s.view.PrefillTokS < 20000 || s.view.PrefillTokS > 35000 {
 		t.Errorf("prefillTokS = %v, want ~26666/s compute-only (8000 tokens / ~0.3s)", s.view.PrefillTokS)
@@ -1388,7 +1531,7 @@ vllm:request_prompt_tokens_count{model_name="m",engine="0"} 1
 vllm:request_generation_tokens_sum{model_name="m",engine="0"} 110
 vllm:request_generation_tokens_count{model_name="m",engine="0"} 1
 `
-	s.scrapeBody(parsePromText([]byte(prime)))
+	s.scrapeBody([]byte(prime))
 	// Rewind baselines ~2s and let the wall clock add ~0.2s more: the
 	// deltas span a known ~2.2s interval (jitter ±few %) with no 2s sleep.
 	rewindBaselines(s, 2*time.Second)
@@ -1431,7 +1574,7 @@ vllm:request_prompt_tokens_count{model_name="m",engine="0"} 3
 vllm:request_generation_tokens_sum{model_name="m",engine="0"} 370
 vllm:request_generation_tokens_count{model_name="m",engine="0"} 3
 `
-	s.scrapeBody(parsePromText([]byte(body)))
+	s.scrapeBody([]byte(body))
 	v := s.view
 
 	if v.Status != "ok" || v.Engine != "vllm" {
@@ -1550,7 +1693,7 @@ sglang:prompt_tokens_histogram_count 1
 sglang:generation_tokens_histogram_sum 100
 sglang:generation_tokens_histogram_count 1
 `
-	s.scrapeBody(parsePromText([]byte(prime)))
+	s.scrapeBody([]byte(prime))
 	// Same ~2.2s window as the vLLM test (rewind 2s + 200ms of wall clock).
 	rewindBaselines(s, 2*time.Second)
 	time.Sleep(200 * time.Millisecond)
@@ -1609,7 +1752,7 @@ sglang:prompt_tokens_histogram_count 4
 sglang:generation_tokens_histogram_sum 280
 sglang:generation_tokens_histogram_count 3
 `
-	s.scrapeBody(parsePromText([]byte(body)))
+	s.scrapeBody([]byte(body))
 	v := s.view
 
 	if v.Status != "ok" || v.Engine != "sglang" {
@@ -2984,7 +3127,8 @@ nvidia_smi_utilization_gpu_ratio{gpu="1",name="A100",uuid="GPU-bbb"} 0.5
 nvidia_smi_memory_used_bytes{gpu="1",name="A100",uuid="GPU-bbb"} 1073741824
 nvidia_smi_memory_total_bytes{gpu="1",name="A100",uuid="GPU-bbb"} 2147483648
 `
-	out := parseGPUDevices(parsePromText([]byte(body)))
+	samples, _ := parsePromText([]byte(body))
+	out := parseGPUDevices(samples)
 	if len(out) != 2 {
 		t.Fatalf("devices = %d, want 2", len(out))
 	}
@@ -3012,7 +3156,8 @@ DCGM_FI_DEV_FB_USED{gpu="8",name="Big",UUID="GPU-big"} 1.7e308
 DCGM_FI_DEV_FB_FREE{gpu="8",name="Big",UUID="GPU-big"} 1.7e308
 DCGM_FI_DEV_GPU_UTIL{gpu="7",name="Ok",UUID="GPU-ok"} 42
 `
-	out := parseGPUDevices(parsePromText([]byte(body)))
+	samples, _ := parsePromText([]byte(body))
+	out := parseGPUDevices(samples)
 	byKey := map[string]gpuDeviceFrame{}
 	for _, d := range out {
 		byKey[d.Key] = d
@@ -3077,24 +3222,24 @@ vllm:num_requests_running{model_name="m",engine="0"} 1
 vllm:time_to_first_token_seconds_sum{model_name="m"} 10.0
 vllm:time_to_first_token_seconds_count{model_name="m"} 2
 `
-	s.scrapeBody(parsePromText([]byte(base)))
+	s.scrapeBody([]byte(base))
 	// Interval 1: two new observations -> a mean exists.
 	rewindBaselines(s, 2*time.Second)
-	s.scrapeBody(parsePromText([]byte(`
+	s.scrapeBody([]byte(`
 vllm:num_requests_running{model_name="m",engine="0"} 1
 vllm:time_to_first_token_seconds_sum{model_name="m"} 30.0
 vllm:time_to_first_token_seconds_count{model_name="m"} 4
-`)))
+`))
 	if s.view.TTFTSamples == 0 || s.view.TTFTms == 0 {
 		t.Fatalf("after delta: ttft=%v samples=%d, want a mean and count", s.view.TTFTms, s.view.TTFTSamples)
 	}
 	// Interval 2: the counter is unchanged (d == 0) -> no new data.
 	rewindBaselines(s, 2*time.Second)
-	s.scrapeBody(parsePromText([]byte(`
+	s.scrapeBody([]byte(`
 vllm:num_requests_running{model_name="m",engine="0"} 1
 vllm:time_to_first_token_seconds_sum{model_name="m"} 30.0
 vllm:time_to_first_token_seconds_count{model_name="m"} 4
-`)))
+`))
 	if s.view.TTFTSamples != 0 || s.view.TTFTms != 0 {
 		t.Errorf("idle interval: ttft=%v samples=%d, want 0/0 (no stale mean from the prior interval)", s.view.TTFTms, s.view.TTFTSamples)
 	}
@@ -3107,21 +3252,21 @@ vllm:num_requests_running{model_name="m",engine="0"} 1
 vllm:time_to_first_token_seconds_sum{model_name="m"} 1.0
 vllm:time_to_first_token_seconds_count{model_name="m"} 2
 `
-	s.scrapeBody(parsePromText([]byte(base)))
+	s.scrapeBody([]byte(base))
 	next := `
 vllm:num_requests_running{model_name="m",engine="0"} 1
 vllm:time_to_first_token_seconds_sum{model_name="m"} 1.6
 vllm:time_to_first_token_seconds_count{model_name="m"} 4
 `
 	rewindBaselines(s, 2*time.Second)
-	s.scrapeBody(parsePromText([]byte(next)))
+	s.scrapeBody([]byte(next))
 	if s.view.TTFTSamples == 0 || s.view.TTFTms == 0 {
 		t.Fatalf("after delta: ttft=%v samples=%d, want a mean and count", s.view.TTFTms, s.view.TTFTSamples)
 	}
 	gone := `
 vllm:num_requests_running{model_name="m",engine="0"} 1
 `
-	s.scrapeBody(parsePromText([]byte(gone)))
+	s.scrapeBody([]byte(gone))
 	if s.view.TTFTSamples != 0 || s.view.TTFTms != 0 {
 		t.Errorf("after histogram disappearance: ttft=%v samples=%d, want 0/0 (not a stale mean)", s.view.TTFTms, s.view.TTFTSamples)
 	}
@@ -3132,20 +3277,20 @@ func TestEngine_RecoveryBaselineOnly(t *testing.T) {
 	body := func(v float64) []byte {
 		return []byte(fmt.Sprintf("vllm:prompt_tokens_total{model_name=\"m\"} %v\n", v))
 	}
-	s.scrapeBody(parsePromText(body(100)))
+	s.scrapeBody(body(100))
 	rewindBaselines(s, 2*time.Second)
-	s.scrapeBody(parsePromText(body(140)))
+	s.scrapeBody(body(140))
 	if s.view.DecodeTokS != 0 || s.view.PrefillTokS <= 0 {
 		// prompt tokens feed prefill when no by_source exists.
 		t.Fatalf("after delta prefill=%v, want >0", s.view.PrefillTokS)
 	}
 	s.resetBaselines()
-	s.scrapeBody(parsePromText(body(180)))
+	s.scrapeBody(body(180))
 	if s.view.PrefillTokS != 0 {
 		t.Errorf("first scrape after reset = %v, want 0 (baseline-only)", s.view.PrefillTokS)
 	}
 	rewindBaselines(s, 2*time.Second)
-	s.scrapeBody(parsePromText(body(220)))
+	s.scrapeBody(body(220))
 	if s.view.PrefillTokS <= 0 {
 		t.Errorf("post-recovery delta = %v, want >0", s.view.PrefillTokS)
 	}
@@ -3195,7 +3340,8 @@ DCGM_FI_DEV_GPU_UTIL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fa
 DCGM_FI_DEV_FB_USED{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 52000
 DCGM_FI_DEV_FB_TOTAL{Hostname="fakehost",gpu="1",UUID="GPU-fake-1",modelName="Fake H100"} 81920
 `)
-	out := parseGPUDevices(parsePromText(body))
+	samples, _ := parsePromText(body)
+	out := parseGPUDevices(samples)
 	if len(out) != 2 {
 		t.Fatalf("devices = %d (%+v), want 2", len(out), out)
 	}
@@ -3360,7 +3506,7 @@ sglang:mamba_available_tokens{tp_rank="0"} 200`,
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &engineScrape{}
-			s.scrapeBody(parsePromText([]byte(tc.line + "\n")))
+			s.scrapeBody([]byte(tc.line + "\n"))
 			if s.status != "ok" {
 				t.Fatalf("status = %q, want ok", s.status)
 			}
@@ -3594,7 +3740,7 @@ func TestEngine_ScrapeBySourceOneSided(t *testing.T) {
 			s.counters[key] = 1000
 			s.cTimes[key] = time.Now().Add(-2 * time.Second)
 
-			s.scrapeBody(parsePromText([]byte(tc.body)))
+			s.scrapeBody([]byte(tc.body))
 			v := s.view
 
 			wantRate := func(field string, got float64) {

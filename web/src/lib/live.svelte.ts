@@ -119,9 +119,24 @@ export class LiveStore {
 
   // ── feed ────────────────────────────────────────────────────────────────
 
+  // setFeed assigns the transport/fence. Health reflects CONFIRMED
+  // data, not a transport choice: whenever the selected feed CHANGES
+  // (watchdog re-probe, probe failure, stats fallback), the previous
+  // feed's confirmation no longer describes the new transport, so
+  // health drops back to "offline" until confirmFeed() re-confirms on
+  // the new feed's first validated frame (live for sse, degraded for
+  // stats). Re-selecting the already-selected feed (the per-frame
+  // onFrame call) keeps health untouched.
   private setFeed(f: FeedInfo): void {
+    if (this.feed && (this.feed.name !== f.name || this.feed.kind !== f.kind)) {
+      this.health = "offline";
+    }
     this.feed = f;
-    this.health = f.kind === "stats" ? "degraded" : "live";
+  }
+
+  private confirmFeed(): void {
+    if (!this.feed) return;
+    this.health = this.feed.kind === "stats" ? "degraded" : "live";
   }
 
   private closeEs(): void {
@@ -157,6 +172,7 @@ export class LiveStore {
     }
     this.backendSig = sig;
     this.setFeed(f);
+    this.confirmFeed();
     this.frame = j;
     this.lastFrameMs = Date.now();
     this.lastFrameAt = this.lastFrameMs;
@@ -411,9 +427,19 @@ export class LiveStore {
 
   private async pollStats(): Promise<void> {
     if (this.paused) return;
+    // Capture the selection at poll time: an in-flight poll can outlive a
+    // feed reselection (e.g. SSE restored while /stats was in flight), and
+    // then its confirm must not mark the NEW feed live/degraded before it
+    // has delivered its own validated frame.
+    const atPoll = this.feed;
     const j = await getJSON<StatsResponse>("/stats");
     if (!j || !Array.isArray(j.backends)) return;
     const f = this.statsToFrame(j);
+    // A successful stats poll is confirmed (degraded) data — but only if the
+    // stats feed is still the selected one when the poll completes.
+    if (this.feed?.name === atPoll?.name && this.feed?.kind === atPoll?.kind) {
+      this.confirmFeed();
+    }
     this.frame = f;
     this.lastFrameMs = Date.now();
     this.lastFrameAt = this.lastFrameMs;

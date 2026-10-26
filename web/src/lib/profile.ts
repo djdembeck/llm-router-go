@@ -199,13 +199,17 @@ export function buildLanes(
         }
       }
       if (f.t <= last) continue;
+      const present = new Set<string>();
       for (const d of f.gpuDevices ?? []) {
+        present.add(d.key);
         const lane = devs.get(d.key);
         const v = gpuValue(d, layer);
         if (lane) {
           if (lane.points.length && f.t <= lane.points[lane.points.length - 1].t) continue;
           lane.points.push({ t: f.t, v });
-          lane.current = v ?? lane.current;
+          // A null point is a measured hole: the live edge must not keep
+          // showing the stale value as if the device were still reporting.
+          lane.current = v;
         } else {
           devs.set(d.key, {
             key: d.key,
@@ -218,6 +222,16 @@ export function buildLanes(
             source: d.source || "device",
           });
         }
+      }
+      // Devices known from history but absent (or publishing nothing) in
+      // this frame: push an explicit gap so the chart shows a hole and
+      // the stale value does not linger as a live edge, mirroring the
+      // backend lanes' non-ok handling.
+      for (const [key, lane] of devs) {
+        if (present.has(key)) continue;
+        if (lane.points.length && f.t <= lane.points[lane.points.length - 1].t) continue;
+        lane.points.push({ t: f.t, v: null });
+        lane.current = null;
       }
     }
     return [...devs.values()].sort((a, b) => a.key.localeCompare(b.key));

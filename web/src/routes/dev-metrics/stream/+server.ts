@@ -12,37 +12,48 @@ export const GET: RequestHandler = ({ url, request }) => {
     Math.max(200, Number.isFinite(raw) && raw > 0 ? raw : 500),
   );
 
+  let controller: ReadableStreamDefaultController | undefined;
+  let open = true;
+  let iv: NodeJS.Timeout | number | undefined;
+  const cleanup = (close: boolean) => {
+    if (!open) return;
+    open = false;
+    clearInterval(iv); // no-op when iv is undefined
+    request.signal.removeEventListener("abort", stop);
+    if (close && controller) {
+      try {
+        controller.close();
+      } catch {
+        /* already closed */
+      }
+    }
+  };
+  const send = () => {
+    if (!open || !controller) return;
+    try {
+      controller.enqueue(
+        new TextEncoder().encode(`data: ${JSON.stringify(mockTick())}\n\n`),
+      );
+    } catch {
+      cleanup(false); // enqueue failed: the stream is going, free the interval
+    }
+  };
+  const stop = () => cleanup(true); // request aborted: close the stream + free the interval
+
   return new Response(
     new ReadableStream({
-      start(controller) {
-        let open = true;
-        const send = () => {
-          if (!open) return;
-          try {
-            controller.enqueue(
-              new TextEncoder().encode(`data: ${JSON.stringify(mockTick())}\n\n`),
-            );
-          } catch {
-            open = false;
-          }
-        };
+      start(c) {
+        controller = c;
         send();
-        const iv = setInterval(send, interval);
-        const stop = () => {
-          if (!open) return;
-          open = false;
-          clearInterval(iv);
-          try {
-            controller.close();
-          } catch {
-            /* already closed */
-          }
-        };
+        iv = setInterval(send, interval);
         request.signal.addEventListener("abort", stop);
         // let the dev server process exit without waiting on idle streams
         // (Node returns a Timeout handle; a browser build returns a number)
         if (typeof iv !== "number" && "unref" in iv) iv.unref();
       },
+      // Consumer cancelled the stream (tab close, fetch().cancel()): free
+      // the interval; the stream is already gone, so no close is needed.
+      cancel: () => cleanup(false),
     }),
     {
       headers: {
