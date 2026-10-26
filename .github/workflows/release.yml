@@ -125,10 +125,20 @@ jobs:
           VERSION="${{ steps.version.outputs.new_version }}"
           IMAGE="ghcr.io/djdembeck/llm-router-go:${VERSION}"
 
-          # Skip if image already exists
-          if docker manifest inspect "${IMAGE}" >/dev/null 2>&1; then
-            echo "Docker image ${IMAGE} already exists, skipping"
-            exit 0
+          # The image must represent THIS tag's commit. A pre-existing
+          # image is only trustworthy when the tag points at this run's
+          # SHA (own re-run); a tag moved by a conflicting release run is
+          # a hard error (Oct 2026: a stale transitive v1.0.2 image was
+          # served as the release because existence alone was trusted).
+          git fetch --tags --force origin
+          TAG_SHA=$(git rev-list -n 1 "refs/tags/${VERSION}")
+          if [ "$TAG_SHA" != "$(git rev-parse HEAD)" ]; then
+            if git merge-base --is-ancestor "$TAG_SHA" HEAD; then
+              echo "tag ${VERSION} points at an older commit than this release run; image belongs to that run, skipping build"
+              exit 0
+            fi
+            echo "tag ${VERSION} points at a foreign commit ${TAG_SHA} (expected $(git rev-parse HEAD)); refusing to build"
+            exit 1
           fi
 
           # Build and push

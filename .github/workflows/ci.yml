@@ -137,9 +137,10 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            # No type=semver tags here: a plain main push (dep bump, ops
+            # change) must not pre-cut the *next* ETA version. Version
+            # release tags are created only by release.yml, whose build
+            # step then guarantees the tag's image matches the commit.
             type=sha,enable=${{ github.event_name != 'pull_request' }}
 
       - name: Build and push Docker image
