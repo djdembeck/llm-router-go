@@ -158,7 +158,7 @@ BACKENDS='[
 | `blockOnTier0` | For a secondary backend, block requests when the number of in-flight Tier 0 requests reaches this threshold. `0` disables the check. |
 | `maxQueueDepth` | Maximum pending requests beyond `maxConcurrent`; defaults to `2`. |
 | `maxConcurrentLargePrefill` | Maximum concurrent large-prefill requests. `0` disables large-prefill limiting. |
-| `largePrefillThresholdTokens` | Estimated new-token count that triggers large-prefill logic; defaults to `8192`. |
+| `largePrefillThresholdTokens` | Estimated prompt-token count (whole conversation) that triggers large-prefill logic; defaults to `8192`. |
 
 ### Scalar environment variables
 

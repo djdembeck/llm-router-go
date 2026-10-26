@@ -39,7 +39,7 @@ type Backend struct {
 	BlockOnTier0                int    `json:"blockOnTier0"`                // block when tier0 in-flight >= this; 0 = disabled
 	MaxQueueDepth               int    `json:"maxQueueDepth"`               // queued beyond maxConcurrent before 429 (default 2)
 	MaxConcurrentLargePrefill   int    `json:"maxConcurrentLargePrefill"`   // max concurrent large prefills; 0 = disabled
-	LargePrefillThresholdTokens int    `json:"largePrefillThresholdTokens"` // new-token count to qualify as "large prefill" (default 8192)
+	LargePrefillThresholdTokens int    `json:"largePrefillThresholdTokens"` // estimated prompt tokens to qualify as "large prefill" (default 8192)
 }
 
 // ─── Parsed body (single-pass, heavy fields stay raw) ──────────────────────
@@ -2726,10 +2726,12 @@ func write429(w http.ResponseWriter, reason, backend string, retryAfter int) {
 		reason, backend, retryAfter)
 }
 
-// estimateNewTokens estimates NEW prefill tokens from the parsed body.
-// Multi-turn (>2 messages): only the last message is new input; prior context
-// is assumed cached (radix/prefix cache). ≤2 messages: all content is new.
+// estimateNewTokens estimates NEW prefill tokens for human-facing telemetry
+// ("newTokensEst" in /metrics): multi-turn (>2 messages) counts only the last
+// message, assuming prior context is cached; ≤2 messages count everything.
 // Completions API: the prompt field. ~4 bytes per token (conservative for Qwen).
+// The admission gate deliberately does NOT use this estimate — see
+// estimatePrefillTokens.
 func estimateNewTokens(b *parsedBody) int {
 	if len(b.Messages) > 0 {
 		chars := 0
@@ -2743,6 +2745,25 @@ func estimateNewTokens(b *parsedBody) int {
 		return chars / 4
 	}
 	return rawContentLen(b.Prompt) / 4
+}
+
+// estimatePrefillTokens estimates prompt tokens that may need prefilling.
+// The whole conversation is counted: the router cannot prove that a request's
+// preceding prefix is cached. Prefix caches are keyed by exact token prefixes
+// and can be cold, evicted, or invalidated by an edited turn, so a short final
+// message is not evidence that earlier context will be a cache hit. Aggregate
+// backend cache metrics also say nothing about an individual request.
+// Completions API: the prompt field. ~4 bytes per token (conservative for Qwen).
+func estimatePrefillTokens(b *parsedBody) int {
+	chars := 0
+	if len(b.Messages) > 0 {
+		for _, m := range b.Messages {
+			chars += rawContentLen(m.Content)
+		}
+	} else {
+		chars = rawContentLen(b.Prompt)
+	}
+	return chars / 4
 }
 
 // rawContentLen measures character content from raw JSON without decoding it.
@@ -4460,12 +4481,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// ── Step 3.5: Large prefill throttle ─────────────────────────────────
 	// Limits how many concurrent large prefills a backend processes. A large
-	// prefill is one whose estimated NEW tokens (last message only, not cached
-	// context) exceed the backend's threshold. The slot is released on the
-	// first response byte for streaming requests, or after the estimated
-	// prefill duration (newTokens / PREFILL_TOKENS_PER_SEC) for non-streaming
-	// requests. Small requests skip this entirely. Soft-queued up to maxQueue,
-	// then 429.
+	// prefill is one whose estimated prompt tokens exceed the backend's
+	// threshold. The estimate covers the whole conversation because the router
+	// has no per-request evidence that any prefix is cached; a short final turn
+	// must not exempt a long prompt. The slot is released on the first response
+	// byte for streaming requests, or after the estimated prefill duration
+	// (prefillTokens / PREFILL_TOKENS_PER_SEC) for non-streaming requests.
+	// Small requests skip this entirely. Soft-queued up to maxQueue, then 429.
 	prefillSem := prefillSlots[target.Name]
 	prefillRelease := func() {} // no-op by default
 	if prefillSem != nil {
@@ -4473,12 +4495,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		if threshold == 0 {
 			threshold = 8192
 		}
-		if newTokens >= threshold {
+		prefillTokens := estimatePrefillTokens(&parsed)
+		if prefillTokens >= threshold {
 			pin, pmaxC, pwaiting, _ := prefillSem.snapshot()
 			if pin >= pmaxC {
-				log.Printf("%s %s -> %s (model=%s) queued at prefill (%d/%d, waiting=%d, newTokens=%d)",
+				log.Printf("%s %s -> %s (model=%s) queued at prefill (%d/%d, waiting=%d, prefillTokens=%d)",
 					r.Method, r.URL.Path, target.Name, modelName,
-					pin, pmaxC, pwaiting+1, newTokens)
+					pin, pmaxC, pwaiting+1, prefillTokens)
 			}
 			if !prefillSem.acquire(queueTimeout, cancelCh) {
 				retry := estimateRetryAfter(target.Name)
@@ -4487,8 +4510,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				if pqW >= pqMax {
 					stage = "prefill-queue-full"
 				}
-				log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (newTokens=%d)",
-					r.Method, r.URL.Path, target.Name, modelName, newTokens)
+				log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (prefillTokens=%d)",
+					r.Method, r.URL.Path, target.Name, modelName, prefillTokens)
 				write429(w, stage, target.Name, retry)
 				recordRejection(http.StatusTooManyRequests)
 				return
@@ -4500,7 +4523,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				// generation, so first-byte release would hold the slot through
 				// all of decode. Bound the hold to the estimated prefill duration;
 				// whichever fires first (timer or first byte) wins via the Once.
-				hold := time.Duration(float64(newTokens) / float64(prefillTokensPerSec) * float64(time.Second))
+				hold := time.Duration(float64(prefillTokens) / float64(prefillTokensPerSec) * float64(time.Second))
 				timer := time.AfterFunc(hold, prefillRelease)
 				defer timer.Stop()
 			}
