@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -367,7 +369,9 @@ func TestProxy_Rejection_SessionWholeConversationEstimate(t *testing.T) {
 
 	arrived := make(chan struct{})
 	var arrivedOnce sync.Once
+	var releaseAOnce sync.Once
 	releaseA := make(chan struct{})
+	releaseAAll := func() { releaseAOnce.Do(func() { close(releaseA) }) }
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Pin request A in-flight: holds the single slot so B gets the
 		// 429. Released by the test via releaseA: the alternative (the
@@ -384,6 +388,10 @@ func TestProxy_Rejection_SessionWholeConversationEstimate(t *testing.T) {
 		fmt.Fprint(w, `{"id":"x"}`)
 	}))
 	defer fake.Close()
+	// Deferred after fake.Close(): unwinds the fake's blocked handler
+	// first, so fake.Close() never wedges on the in-flight request; the
+	// routing srv's teardown relies on cancelA() (LIFO: runs first).
+	defer releaseAAll()
 
 	withRouterEnv(t, []Backend{{Name: "m1", URL: fake.URL, Tier: 0, MaxConcurrent: 1}},
 		map[string]int{"m1": 1}, map[string]int{"m1": 1})
@@ -440,6 +448,12 @@ func TestProxy_Rejection_SessionWholeConversationEstimate(t *testing.T) {
 		t.Fatal("request A did not reach the upstream within 2s")
 	}
 
+	// The slot is held here (A blocked in the fake's handler): a
+	// mid-test failure at this moment must fail the test fast.
+	if os.Getenv("MIDFAIL_PROBE") == "1" {
+		t.Fatal("injected mid-test failure while A is in flight")
+	}
+
 	// B: same conversation, same body — waits past queueTimeout -> 429.
 	// The dedicated client (not DefaultClient) so its pooled conn is
 	// closed at teardown and the routing server closes cleanly.
@@ -455,10 +469,8 @@ func TestProxy_Rejection_SessionWholeConversationEstimate(t *testing.T) {
 	if respB.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 (slot exhausted)", respB.StatusCode)
 	}
-	close(releaseA) // done holding the slot; the fake replies, A completes.
-	// (t.Fatal paths exit the process before teardown, so no deferred
-	// release is needed.)
-	cancelA() // retire A's client (response may already be in flight).
+	releaseAAll() // done holding the slot; the fake replies, A completes.
+	cancelA()     // retire A's client (response may already be in flight).
 
 	// Join A's client: its conn is the one that could outlive the test
 	// and block the httptest teardown.
@@ -517,5 +529,26 @@ func TestProxy_Rejection_SessionWholeConversationEstimate(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no 429 sample in the burst ring")
+	}
+}
+
+// TestProxy_Rejection_SessionWholeConversationEstimate_TeardownFailsFast is
+// a re-exec guard for the test above: a mid-test failure while A blocks in
+// the fake's handler must fail the child fast, not wedge — reverting
+// releaseAAll (success-path-only teardown) leaves the fake mid-request, so
+// Close() blocks and only the test timeout fires.
+func TestProxy_Rejection_SessionWholeConversationEstimate_TeardownFailsFast(t *testing.T) {
+	if os.Getenv("MIDFAIL_CHILD") == "1" {
+		return
+	}
+	args := []string{"-test.run=^TestProxy_Rejection_SessionWholeConversationEstimate$", "-test.timeout=8s", "-test.v"}
+	cmd := exec.Command(os.Args[0], args...)
+	cmd.Env = append(os.Environ(), "MIDFAIL_PROBE=1", "MIDFAIL_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("child unexpectedly passed; want the injected mid-test failure")
+	}
+	if strings.Contains(string(out), "test timed out") {
+		t.Fatalf("teardown wedged: child hung instead of failing fast.\n%s", out)
 	}
 }
