@@ -18,7 +18,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          PKGS=$(gh api "user/packages?per_page=100" --jq '.packages[] | select(.name == "llm-router-go")')
+          PKGS=$(gh api "user/packages?per_page=100" -f package_type=DOCKER --jq '.packages[] | select(.name == "llm-router-go")')
           PKG_ID=$(echo "$PKGS" | python3 -c "import json,sys; lines=[l for l in sys.stdin if l.strip()]; print(json.loads(lines[0])['id'] if lines else '')" 2>/dev/null || true)
           if [ -z "$PKG_ID" ]; then
             echo "No docker package found for llm-router-go; nothing to do"
