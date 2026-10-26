@@ -15,7 +15,7 @@ RUN bun install --frozen-lockfile
 COPY web/ ./
 RUN bun run build
 
-FROM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
+FROM golang:1.27-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder
 WORKDIR /src
 COPY go.mod go.sum* ./
 COPY main.go main_test.go ./
@@ -23,6 +23,6 @@ COPY web/embed.go web/embed_stub.go web/
 COPY --from=web /web/build ./web/build
 RUN CGO_ENABLED=0 go build -tags webui -o /router main.go
 
-FROM alpine:3.20
+FROM alpine:3.24
 COPY --from=builder /router /router
 ENTRYPOINT ["/router"]
