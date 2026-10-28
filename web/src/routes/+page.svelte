@@ -191,14 +191,15 @@
     return live.requests;
   });
 
-  // Rejections are grouped in the burst ring by backend; the rail needs the
+  // 429s are grouped in the burst ring by backend; the rail needs the
   // 5-minute count per lane for its saturation cell (lifetime counters cannot
-  // answer "is pressure building now").
+  // answer "is pressure building now"). Only 429s count — burst responses
+  // also carry other >=400 codes, and a 500 is not a saturation signal.
   const rejectMins = $derived.by(() => {
     const cut = now - 5 * 60_000;
     const counts: Record<string, number> = {};
     for (const r of frozenRequests) {
-      if (r.status >= 400 && r.t >= cut) counts[r.backend] = (counts[r.backend] ?? 0) + 1;
+      if (r.status === 429 && r.t >= cut) counts[r.backend] = (counts[r.backend] ?? 0) + 1;
     }
     return counts;
   });
@@ -313,7 +314,7 @@
         onLayer={(id) => (layerId = id)}
       />
 
-      <div class="live-band" bind:this={bandEl}>
+      <div class="live-band" class:log-open={requestLogOpen} bind:this={bandEl}>
         <section class="profile-sheet sheet" aria-label={singleBackend ? "server profile" : "fleet profile"}>
           <FleetProfile
             singleBackend={singleBackendName}
@@ -480,10 +481,20 @@
      flexed to fill so both share the row and meet at the bottom. The offset
      is the band's measured distance from the viewport top, so chrome inserted
      above it (the STALE banner, the history notice, a wrapped server-identity
-     row) shrinks the band instead of pushing it past the fold. */
+     row) shrinks the band instead of pushing it past the fold. The cap only
+     applies while the request log is closed: with the log open the band
+     falls back to auto sizing and the session list's 320px trade lifts the
+     lower band back up, as before the cap. */
   @media (min-width: 1280px) {
-    .live-band {
+    /* Closed log only: with the request log open the band falls back to auto
+       sizing so the historical 560→320 session-list trade lifts the lower
+       band back up. The min-content floor keeps a short viewport from
+       compressing the band below its children's floors (96px plot, 280px
+       list): the band grows past the cap and the page scrolls, instead of
+       the profile foot/ruler painting over .lower. */
+    .live-band:not(.log-open) {
       height: min(643px, calc(100dvh - var(--band-offset, 258px)));
+      min-height: min-content;
     }
   }
   @media (max-width: 1279px) {

@@ -463,13 +463,14 @@
         ctx.arc(x1 - 4, cy, 1.8, 0, Math.PI * 2);
         ctx.fill();
       }
-      // saturation marker: rejections are a capacity figure, so it stays water
-      // (the One Failure Rule keeps vermilion for 5xx/failure only)
+      // saturation marker: 429s are a capacity figure, so they stay water
+      // (the One Failure Rule keeps vermilion for 5xx/failure only). Only
+      // 429s count — a 500 is an error, not saturation.
       if (!lane.isFleet && !lane.isDevice && range === "5m" && laneH > 18) {
         const cut = Date.now() - 5 * 60_000;
         let rej = 0;
         for (const r of requests) {
-          if (r.backend === lane.key && r.status >= 400 && r.t >= cut) rej++;
+          if (r.backend === lane.key && r.status === 429 && r.t >= cut) rej++;
         }
         if (rej > 0) {
           ctx.fillStyle = dim ? rgba(ink3, 0.5) : rgba(water, 0.9);
