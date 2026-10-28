@@ -16,6 +16,42 @@
 
   const live = new LiveStore();
   const history = new HistoryStore();
+  let bandEl: HTMLDivElement | undefined = $state();
+  /**
+   * At >=1280px the live band is capped to the first viewport. The cap is the
+   * band's distance from the viewport top (not a constant per-mode offset), so
+   * chrome that inserts above the band — the STALE banner, the history-feed
+   * notice, a wrapped server-identity row — shrinks the band in place instead
+   * of pushing its bottom past the fold. Sizing stays inert below 1280px, and
+   * the 643px natural cap (CSS) keeps tall windows unchanged.
+   */
+  $effect(() => {
+    const el = bandEl;
+    const mq = window.matchMedia("(min-width: 1280px)");
+    let bandRo: ResizeObserver | null = null;
+    const apply = () => {
+      if (!el) return;
+      // Document-relative top, not viewport-relative: the fold is the first
+      // viewport, and the page scrolls — rect.top alone would grow the band
+      // as the user scrolled down.
+      const top = el.getBoundingClientRect().top + window.scrollY;
+      el.style.setProperty(
+        "--band-offset",
+        mq.matches ? `${Math.ceil(top)}px` : "",
+      );
+    };
+    apply();
+    bandRo = new ResizeObserver(apply);
+    if (el) bandRo.observe(el);
+    // The body covers chrome inserted above the band (STALE banner, notice,
+    // a wrapped identity row); the band itself covers its own padding changes.
+    bandRo.observe(document.body);
+    mq.addEventListener("change", apply);
+    return () => {
+      mq.removeEventListener("change", apply);
+      bandRo?.disconnect();
+    };
+  });
 
   let now = $state(Date.now());
   let selected = $state<string | null>(null);
@@ -155,6 +191,18 @@
     return live.requests;
   });
 
+  // Rejections are grouped in the burst ring by backend; the rail needs the
+  // 5-minute count per lane for its saturation cell (lifetime counters cannot
+  // answer "is pressure building now").
+  const rejectMins = $derived.by(() => {
+    const cut = now - 5 * 60_000;
+    const counts: Record<string, number> = {};
+    for (const r of frozenRequests) {
+      if (r.status >= 400 && r.t >= cut) counts[r.backend] = (counts[r.backend] ?? 0) + 1;
+    }
+    return counts;
+  });
+
   function toggleTheme(): void {
     theme = theme === "night" ? "day" : "night";
     document.documentElement.dataset.theme = theme;
@@ -214,6 +262,7 @@
         feed={live.feed}
         lastFrameAt={live.lastFrameAt}
         {now}
+        {rejectMins}
       />
     {/if}
 
@@ -264,7 +313,7 @@
         onLayer={(id) => (layerId = id)}
       />
 
-      <div class="live-band">
+      <div class="live-band" bind:this={bandEl}>
         <section class="profile-sheet sheet" aria-label={singleBackend ? "server profile" : "fleet profile"}>
           <FleetProfile
             singleBackend={singleBackendName}
@@ -396,11 +445,13 @@
   }
   .profile-sheet {
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
   }
   .profile-sheet :global(.profile) {
     flex: 1 1 auto;
+    min-height: 0;
   }
   .lower {
     display: grid;
@@ -423,21 +474,16 @@
   }
   /* Laptop/desktop (≥1280): the live band must end at the fold so the two
      readings rows above it and the profile+sessions below it read in one
-     glance, and the lower band starts at the fold. The band height is capped at
-     its natural 643px sheet height (so tall windows are unchanged) and shrinks
-     with the viewport when the fold is higher. Inside, the profile plot already
-     flexes; the session list is flexed to fill so both share the row and meet
-     at the bottom. The offset is the measured chrome above the band, which
-     differs per mode (server has an identity row; fleet a rail + taller head). */
+     glance. The band height is capped at its natural 643px sheet height (so
+     tall windows are unchanged) and shrinks with the viewport when the fold
+     is higher. Inside, the profile plot already flexes; the session list is
+     flexed to fill so both share the row and meet at the bottom. The offset
+     is the band's measured distance from the viewport top, so chrome inserted
+     above it (the STALE banner, the history notice, a wrapped server-identity
+     row) shrinks the band instead of pushing it past the fold. */
   @media (min-width: 1280px) {
     .live-band {
       height: min(643px, calc(100dvh - var(--band-offset, 258px)));
-    }
-    .body.single {
-      --band-offset: 258px;
-    }
-    .body.fleet {
-      --band-offset: 213px;
     }
   }
   @media (max-width: 1279px) {

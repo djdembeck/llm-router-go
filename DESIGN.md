@@ -263,9 +263,14 @@ along the bottom.
 The profile is a canvas at least 320px tall (280px at 640–959, 240px below
 640); at ≥1280px the live band is capped at the first-viewport fold — the band
 height is the lesser of its 643px natural sheet height and the remaining
-viewport below the readings rows — so on laptop viewports the profile canvas
-shrinks with the band while the session list flexes in step, and on tall
-windows both keep their natural sizes. The signature chart never leaves dead
+viewport below the readings rows, the offset being the band's measured distance
+from the document top so chrome inserted above the band (the STALE banner, the
+history notice, a wrapped server-identity row) shrinks the band in place
+instead of pushing it past the fold. On laptop viewports the profile canvas
+shrinks with the band — its 320px floor yields to a 96px minimum inside the
+capped range, since head + foot + ruler already claim most of a 768-tall
+band — while the session list flexes in step, and on tall windows both keep
+their natural sizes. The signature chart never leaves dead
 paper inside its frame. Its fleet/device left gutter is 150px (122px below 520px): a 46px lane-label
 column, a 38px scale column, then the plot. The time axis carries 3–6 labels; the lane
 baselines are 1px rules; the scale labels are 10px mono.
@@ -370,7 +375,10 @@ backend.
 - **Requests:** in the 5m range, completed requests ride at each lane's base
   as amber prefill → moss decode segments (2.5px); router rejections are 2px
   vermilion ticks; live admitted requests are a dashed queue lead with an
-  amber bar to now, streaming requests moss.
+  amber bar to now, streaming requests moss. A lane's 5-minute
+  429 count, when non-zero, is footed under its live-edge spot height in
+  water (`429 n`) — rejections are a capacity figure and stay out of vermilion;
+  the same count sits beside the KV bar in the fleet rail's backend row.
 - **Live edge:** a 1px vertical rule, a 4px sand square, and a spot height in
   10px mono at every lane. The header readout mirrors `T HH:MM:SS / KV 78%`.
 - **Cursor:** click or pointer sets a survey cursor; the keyboard uses a

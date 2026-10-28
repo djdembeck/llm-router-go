@@ -463,6 +463,21 @@
         ctx.arc(x1 - 4, cy, 1.8, 0, Math.PI * 2);
         ctx.fill();
       }
+      // saturation marker: rejections are a capacity figure, so it stays water
+      // (the One Failure Rule keeps vermilion for 5xx/failure only)
+      if (!lane.isFleet && !lane.isDevice && range === "5m" && laneH > 18) {
+        const cut = Date.now() - 5 * 60_000;
+        let rej = 0;
+        for (const r of requests) {
+          if (r.backend === lane.key && r.status >= 400 && r.t >= cut) rej++;
+        }
+        if (rej > 0) {
+          ctx.fillStyle = dim ? rgba(ink3, 0.5) : rgba(water, 0.9);
+          ctx.textAlign = "right";
+          ctx.font = `9px ${mono}`;
+          ctx.fillText(`429 ${rej}`, x1 - 2, top + 21);
+        }
+      }
     }
 
     // live edge
@@ -535,7 +550,12 @@
 
   $effect(() => {
     if (!host) return;
-    reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    reduced = motion.matches;
+    // The canvas snap must track the CSS 0.01ms kill even when the OS
+    // preference changes mid-session; a change also triggers a redraw.
+    const onMotion = () => (reduced = motion.matches);
+    motion.addEventListener("change", onMotion);
     const ro = new ResizeObserver((entries) => {
       const box = entries[0]?.contentRect;
       if (box) {
@@ -554,6 +574,7 @@
     );
     io.observe(host);
     return () => {
+      motion.removeEventListener("change", onMotion);
       ro.disconnect();
       io.disconnect();
     };
@@ -656,7 +677,7 @@
         <span>{layer.short} {fmtLayerValue(layer, readoutV)}</span>
         {#if readoutKv != null && layerId !== "kv"}
           <span class="sep">/</span>
-          <span class="muted">KV {fmtPct(readoutKv)}</span>
+          <span class="muted" class:companion={cursor != null}>KV {fmtPct(readoutKv)}</span>
         {/if}
       </span>
       {#if cursor != null}
@@ -844,6 +865,12 @@
     color: var(--ink-2);
     white-space: nowrap;
   }
+  /* Pinned: the mirror KV is the companion invariant, not a second reading.
+     Demote it so TTFT 698ms / KV 698% no longer reads as a duplication. */
+  .readout .companion {
+    font-size: var(--fs-label);
+    color: var(--ink-3);
+  }
   .sep {
     color: var(--ink-3);
     padding: 0 6px;
@@ -852,8 +879,19 @@
   .profile-plot {
     position: relative;
     flex: 1 1 auto;
-    min-height: 320px;
+    min-height: 0;
     min-width: 0;
+  }
+  /* The 320px paper floor holds only where the owner has not capped the live
+     band to the fold; at >=1280 the capped band can be smaller than the stack
+     the floor would demand (320 + head 40 + foot 65 + ruler 52), so the floor
+     moves to 96px — the plot's minimum printable canvas (axis + lane
+     baseline) — and the plot flexes to whatever the band leaves. The session
+     list below keeps its 280px step, so the sheet stays coherent. */
+  @media (min-width: 1280px) {
+    .profile-plot {
+      min-height: 96px;
+    }
   }
   canvas {
     display: block;
@@ -886,7 +924,8 @@
   .summary {
     font-size: var(--fs-label);
     color: var(--ink-2);
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .summary .muted {
     letter-spacing: 0.08em;

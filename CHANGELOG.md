@@ -9,6 +9,10 @@
 * **release:** ops-only commits must never cut a release — `paths-ignore` gains `renovate.json5`, and Renovate's commit prefix is restored to `ci(deps): `
 * **metrics:** retire live requests, release prefill slots, and record request outcomes even when a proxy stream aborts or the client disconnects; preserve HTTP abort behavior instead of leaving phantom sessions
 * **dashboard:** read vLLM's group-aware KV token capacity from `cache_config_info`; show unknown usage as `—` independently of known capacity in live and historical pool readings
+* **dashboard:** keep the first-viewport live band honest at >=1280px — the fold cap measures the band's distance from the document top instead of per-mode constants, so the STALE banner, history notice, or a wrapped server-identity row shrink the band in place instead of pushing the session list past the fold; the profile plot's 320px floor yields to a 96px minimum inside the capped range so the sheet never overflows its band
+* **dashboard:** surface saturation in the first viewport — the fleet rail prints each backend's 5-minute 429 count (water, beside the KV bar) and the Fleet Profile feet each lane's live-edge spot height with a `429 n` figure
+* **dashboard:** stop 200% text-zoom horizontal overflow — readings sublines, the profile summary line, and the top-bar feed line wrap instead of forcing the sheet sideways; the top bar clips and its controls row wraps
+* **dashboard:** track `prefers-reduced-motion` changes mid-session so the canvas live-edge snap keeps mirroring the CSS 0.01ms kill; demote the profile readout's mirrored KV to data-detail type when a cursor is pinned, so the companion invariant no longer reads as a duplicated figure
 
 ### Features
 

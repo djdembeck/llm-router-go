@@ -13,6 +13,7 @@
     feed,
     lastFrameAt,
     now,
+    rejectMins = {},
   }: {
     frame: Frame | null;
     metricFrame?: Frame | null;
@@ -22,6 +23,8 @@
     feed: FeedInfo | null;
     lastFrameAt: number | null;
     now: number;
+    /** 429s per backend in the 5-minute burst window, from the burst ring. */
+    rejectMins?: Record<string, number>;
   } = $props();
 
   const m = $derived(metricFrame ?? frame);
@@ -82,6 +85,9 @@
           </span>
           <span class="kv"><TweenNumber value={kv} format={fmtPct} duration={1600} /></span>
           <span class="queue">q {b.waiting}</span>
+          {#if (rejectMins[b.name] ?? 0) > 0}
+            <span class="rej" title="429 rejections, last 5 min">429 {rejectMins[b.name]}</span>
+          {/if}
         </span>
       </button>
     {:else}
@@ -285,6 +291,11 @@
   .queue {
     min-width: 28px;
     text-align: right;
+  }
+  .rej {
+    min-width: 0;
+    white-space: nowrap;
+    color: var(--water);
   }
   .devices-head {
     border-top: 1px solid var(--rule);

@@ -111,11 +111,13 @@
   .topbar {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: var(--s5);
     min-height: 56px;
     padding: 8px var(--s5);
     border-bottom: 1px solid var(--rule-2);
     background: var(--panel);
+    overflow: clip;
     transition:
       background-color var(--dur) var(--ease-soft),
       border-color var(--dur) var(--ease-soft);
@@ -146,7 +148,9 @@
     min-width: 0;
   }
   .feed {
-    white-space: nowrap;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .controls {
     display: flex;
@@ -167,6 +171,7 @@
     .topbar {
       flex-wrap: wrap;
       gap: var(--s3);
+      overflow: clip;
     }
     .status {
       order: 3;
@@ -174,6 +179,8 @@
     }
     .controls {
       order: 2;
+      flex-wrap: wrap;
+      row-gap: var(--s2);
     }
     .clock {
       display: none;
