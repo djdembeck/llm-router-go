@@ -421,6 +421,25 @@
       grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
     }
   }
+  /* Laptop/desktop (≥1280): the live band must end at the fold so the two
+     readings rows above it and the profile+sessions below it read in one
+     glance, and the lower band starts at the fold. The band height is capped at
+     its natural 643px sheet height (so tall windows are unchanged) and shrinks
+     with the viewport when the fold is higher. Inside, the profile plot already
+     flexes; the session list is flexed to fill so both share the row and meet
+     at the bottom. The offset is the measured chrome above the band, which
+     differs per mode (server has an identity row; fleet a rail + taller head). */
+  @media (min-width: 1280px) {
+    .live-band {
+      height: min(643px, calc(100dvh - var(--band-offset, 258px)));
+    }
+    .body.single {
+      --band-offset: 258px;
+    }
+    .body.fleet {
+      --band-offset: 213px;
+    }
+  }
   @media (max-width: 1279px) {
     .live-band {
       grid-template-columns: minmax(0, 1fr);

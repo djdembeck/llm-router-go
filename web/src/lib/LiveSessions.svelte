@@ -178,6 +178,18 @@
   .sessions.tall .list {
     height: 560px;
   }
+  /* At laptop/desktop widths the owner caps the live band to the fold, so the
+     list flexes to fill it (floor 280px, natural cap 560px) in step with the
+     profile canvas. The log-open 320px and the stacked/phone fixed heights
+     below are untouched. */
+  @media (min-width: 1280px) {
+    .sessions.tall .list {
+      height: auto;
+      flex: 1 1 auto;
+      min-height: 280px;
+      max-height: 560px;
+    }
+  }
   .req {
     display: flex;
     flex-direction: column;
