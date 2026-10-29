@@ -341,11 +341,17 @@
     align-items: center;
     justify-content: space-between;
     gap: var(--s2);
+    min-width: 0;
   }
   .tags {
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    min-width: 0;
+  }
+  .tags .tag {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .tag.window {
     text-transform: none;
@@ -368,6 +374,7 @@
     align-items: center;
     justify-content: space-between;
     gap: var(--s2);
+    flex-wrap: wrap;
     min-width: 0;
     font-size: var(--fs-label);
     line-height: 12px;

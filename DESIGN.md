@@ -261,9 +261,17 @@ it corresponds to a profile layer; the pressed state is a 2px inset sand edge
 along the bottom.
 
 The profile is a canvas at least 320px tall (280px at 640–959, 240px below
-640); it grows to fill the live-band row when the 560px session stack makes
-the sheet taller, so the signature chart never leaves dead paper inside its
-frame. Its fleet/device left gutter is 150px (122px below 520px): a 46px lane-label
+640); at ≥1280px the live band is capped at the first-viewport fold — the band
+height is the lesser of its 643px natural sheet height and the remaining
+viewport below the readings rows, the offset being the band's measured distance
+from the document top so chrome inserted above the band (the STALE banner, the
+history notice, a wrapped server-identity row) shrinks the band in place
+instead of pushing it past the fold. On laptop viewports the profile canvas
+shrinks with the band — its 320px floor yields to a 96px minimum inside the
+capped range, since head + foot + ruler already claim most of a 768-tall
+band — while the session list flexes in step, and on tall windows both keep
+their natural sizes. The signature chart never leaves dead
+paper inside its frame. Its fleet/device left gutter is 150px (122px below 520px): a 46px lane-label
 column, a 38px scale column, then the plot. The time axis carries 3–6 labels; the lane
 baselines are 1px rules; the scale labels are 10px mono.
 
@@ -280,7 +288,8 @@ path column.
 
 Responsive composition is explicit:
 
-- ≥1280: rail 232 + main; profile and sessions side by side.
+- ≥1280: rail 232 + main; profile and sessions side by side; live band ends at
+  the fold (tall windows keep the 643px sheet).
 - 960–1279: rail 200; live band stacks.
 - 640–959: rail becomes a horizontal fleet strip above main; readings 3×2;
   profile 280px.
@@ -366,7 +375,10 @@ backend.
 - **Requests:** in the 5m range, completed requests ride at each lane's base
   as amber prefill → moss decode segments (2.5px); router rejections are 2px
   vermilion ticks; live admitted requests are a dashed queue lead with an
-  amber bar to now, streaming requests moss.
+  amber bar to now, streaming requests moss. A lane's 5-minute
+  429 count, when non-zero, is footed under its live-edge spot height in
+  water (`429 n`) — rejections are a capacity figure and stay out of vermilion;
+  the same count sits beside the KV bar in the fleet rail's backend row.
 - **Live edge:** a 1px vertical rule, a 4px sand square, and a spot height in
   10px mono at every lane. The header readout mirrors `T HH:MM:SS / KV 78%`.
 - **Cursor:** click or pointer sets a survey cursor; the keyboard uses a
@@ -403,10 +415,12 @@ cache-hit rate remains in Backend Detail. A 3px amber track shows queued
 prefill progress or a complete prefill; its note gives the estimated prefill
 time (gold boundary) and flags a queue over 1.5× that estimate. The ticking
 age is a 10px footnote at the right; path and session prefix are only in the
-row title. The list has a fixed height, never a content max: 560px while the request
-log is collapsed (420px under 1200, 360px on phones) and 320px when it is
-open (280px under 1200). Request arrival/completion never resizes the sheet;
-only the log toggle trades the two fixed heights. Token figures wear the row `est` tag; TTFT is measured. Rows
+row title. The list has a fixed height, never a content max: 560px while the request log is collapsed (420px under 1200, 360px on
+phones) and 320px when it is open (280px under 1200). At ≥1280px the owner
+caps the live band to the fold, so the collapsed list instead flexes to fill
+the band — floor 280px, natural cap 560px — and the log-open 320px is
+unaffected. Request arrival/completion never resizes the sheet; only the log
+toggle trades the two heights. Token figures wear the row `est` tag; TTFT is measured. Rows
 preserve identity and move in place; nothing flashes. Empty: `no requests in
 flight`; paused: `paused — no new requests are being read`; stale: `feed
 stale — no new requests are arriving`.

@@ -16,6 +16,42 @@
 
   const live = new LiveStore();
   const history = new HistoryStore();
+  let bandEl: HTMLDivElement | undefined = $state();
+  /**
+   * At >=1280px the live band is capped to the first viewport. The cap is the
+   * band's distance from the viewport top (not a constant per-mode offset), so
+   * chrome that inserts above the band — the STALE banner, the history-feed
+   * notice, a wrapped server-identity row — shrinks the band in place instead
+   * of pushing its bottom past the fold. Sizing stays inert below 1280px, and
+   * the 643px natural cap (CSS) keeps tall windows unchanged.
+   */
+  $effect(() => {
+    const el = bandEl;
+    const mq = window.matchMedia("(min-width: 1280px)");
+    let bandRo: ResizeObserver | null = null;
+    const apply = () => {
+      if (!el) return;
+      // Document-relative top, not viewport-relative: the fold is the first
+      // viewport, and the page scrolls — rect.top alone would grow the band
+      // as the user scrolled down.
+      const top = el.getBoundingClientRect().top + window.scrollY;
+      el.style.setProperty(
+        "--band-offset",
+        mq.matches ? `${Math.ceil(top)}px` : "",
+      );
+    };
+    apply();
+    bandRo = new ResizeObserver(apply);
+    if (el) bandRo.observe(el);
+    // The body covers chrome inserted above the band (STALE banner, notice,
+    // a wrapped identity row); the band itself covers its own padding changes.
+    bandRo.observe(document.body);
+    mq.addEventListener("change", apply);
+    return () => {
+      mq.removeEventListener("change", apply);
+      bandRo?.disconnect();
+    };
+  });
 
   let now = $state(Date.now());
   let selected = $state<string | null>(null);
@@ -155,6 +191,19 @@
     return live.requests;
   });
 
+  // 429s are grouped in the burst ring by backend; the rail needs the
+  // 5-minute count per lane for its saturation cell (lifetime counters cannot
+  // answer "is pressure building now"). Only 429s count — burst responses
+  // also carry other >=400 codes, and a 500 is not a saturation signal.
+  const rejectMins = $derived.by(() => {
+    const cut = now - 5 * 60_000;
+    const counts: Record<string, number> = {};
+    for (const r of frozenRequests) {
+      if (r.status === 429 && r.t >= cut) counts[r.backend] = (counts[r.backend] ?? 0) + 1;
+    }
+    return counts;
+  });
+
   function toggleTheme(): void {
     theme = theme === "night" ? "day" : "night";
     document.documentElement.dataset.theme = theme;
@@ -214,6 +263,7 @@
         feed={live.feed}
         lastFrameAt={live.lastFrameAt}
         {now}
+        {rejectMins}
       />
     {/if}
 
@@ -264,7 +314,7 @@
         onLayer={(id) => (layerId = id)}
       />
 
-      <div class="live-band">
+      <div class="live-band" class:log-open={requestLogOpen} bind:this={bandEl}>
         <section class="profile-sheet sheet" aria-label={singleBackend ? "server profile" : "fleet profile"}>
           <FleetProfile
             singleBackend={singleBackendName}
@@ -396,11 +446,13 @@
   }
   .profile-sheet {
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
   }
   .profile-sheet :global(.profile) {
     flex: 1 1 auto;
+    min-height: 0;
   }
   .lower {
     display: grid;
@@ -419,6 +471,30 @@
   @media (min-width: 1600px) {
     .lower {
       grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    }
+  }
+  /* Laptop/desktop (≥1280): the live band must end at the fold so the two
+     readings rows above it and the profile+sessions below it read in one
+     glance. The band height is capped at its natural 643px sheet height (so
+     tall windows are unchanged) and shrinks with the viewport when the fold
+     is higher. Inside, the profile plot already flexes; the session list is
+     flexed to fill so both share the row and meet at the bottom. The offset
+     is the band's measured distance from the viewport top, so chrome inserted
+     above it (the STALE banner, the history notice, a wrapped server-identity
+     row) shrinks the band instead of pushing it past the fold. The cap only
+     applies while the request log is closed: with the log open the band
+     falls back to auto sizing and the session list's 320px trade lifts the
+     lower band back up, as before the cap. */
+  @media (min-width: 1280px) {
+    /* Closed log only: with the request log open the band falls back to auto
+       sizing so the historical 560→320 session-list trade lifts the lower
+       band back up. The min-content floor keeps a short viewport from
+       compressing the band below its children's floors (96px plot, 280px
+       list): the band grows past the cap and the page scrolls, instead of
+       the profile foot/ruler painting over .lower. */
+    .live-band:not(.log-open) {
+      height: min(643px, calc(100dvh - var(--band-offset, 258px)));
+      min-height: min-content;
     }
   }
   @media (max-width: 1279px) {
