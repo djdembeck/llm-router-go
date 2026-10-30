@@ -13,7 +13,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
-permissions: read-all
+permissions:
+  contents: read
 
 env:
   PR_IS_SAME_REPO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
@@ -43,6 +44,10 @@ jobs:
         run: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
 
   build:
+    # Kept canonically named "Build": main's required status checks pin
+    # this exact check-run name — renaming it strands PRs waiting on the
+    # stale context (happened with the "CI / " prefix stripping and again
+    # with the "(web + Go)" suffix).
     name: Build
     needs: [lint-format]
     runs-on: ubuntu-latest
@@ -57,8 +62,23 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Install frontend dependencies
+        run: cd web && bun install --frozen-lockfile
+
+      - name: Svelte check
+        run: cd web && bun run check
+
+      - name: Build frontend
+        run: cd web && bun run build
+
+      - name: Build Go (stub)
         run: go build ./...
+
+      - name: Build Go (embedded dashboard)
+        run: go build -tags webui ./...
 
   test:
     name: Test
@@ -75,8 +95,26 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Install frontend dependencies
+        run: cd web && bun install --frozen-lockfile
+
+      - name: Build frontend
+        run: cd web && bun run build
+
+      # The webui-tagged tests embed web/build; plain `go test ./...`
+      # above cannot see them (build tag) and would not have the build
+      # tree in the test job, so the dashboard package runs here.
+      - name: Run web tests (embedded build)
+        run: go test -count=1 -tags webui ./web/...
+
       - name: Run tests
-        run: go test ./...
+        run: go test -count=1 ./...
+
+      - name: Run tests (race detector)
+        run: go test -race -count=1 ./...
 
   docker-build:
     name: Build and Push Docker Image
@@ -95,11 +133,11 @@ jobs:
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request' || env.PR_IS_SAME_REPO == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -114,14 +152,15 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            # No type=semver tags here: a plain main push (dep bump, ops
+            # change) must not pre-cut the *next* ETA version. Version
+            # release tags are created only by release.yml, whose build
+            # step then guarantees the tag's image matches the commit.
             type=sha,enable=${{ github.event_name != 'pull_request' }}
 
       - name: Build and push Docker image
         id: docker_build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' || env.PR_IS_SAME_REPO == 'true' }}
@@ -137,29 +176,20 @@ jobs:
         with:
           issue-number: ${{ github.event.pull_request.number }}
           comment-author: 'github-actions[bot]'
-          body-includes: 'Docker Image Ready'
+          body-includes: 'Docker image ready'
 
       - name: Comment PR with image tags
-        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true'
+        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true' && steps.find-comment.outputs.comment-id == ''
         uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
         with:
-          comment-id: ${{ steps.find-comment.outputs.comment-id }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            ## Docker Image Ready
+            ## 🐳 Docker image ready
 
-            The following image tag is available for testing this PR:
+            A test image for this PR is available:
 
-            | Tag | Image |
-            |-----|-------|
-            | `pr-${{ github.event.pull_request.number }}` | `ghcr.io/djdembeck/llm-router-go:pr-${{ github.event.pull_request.number }}` |
-
-            **Note:** This tag is stable for this PR. Each new commit will overwrite this tag with the latest build.
-
-            **To test:**
             ```bash
             docker pull ghcr.io/djdembeck/llm-router-go:pr-${{ github.event.pull_request.number }}
             ```
 
-            Images will be automatically deleted when this PR is merged or closed.
-          edit-mode: replace
+            The `pr-${{ github.event.pull_request.number }}` tag is stable — new commits to this PR overwrite it. The image is deleted automatically when the PR closes.
