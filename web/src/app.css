@@ -39,6 +39,7 @@
   --fs-title: 16px;
   --fs-value: 24px;
   --fs-display: 28px;
+  --lh-label: 12px;
   --lh-tight: 16px;
   --lh-body: 20px;
   --lh-value: 28px;
@@ -154,7 +155,7 @@ a {
 .label {
   font-family: var(--font-ui);
   font-size: var(--fs-label);
-  line-height: var(--lh-tight);
+  line-height: var(--lh-label);
   font-weight: 600;
   letter-spacing: 0.12em;
   text-transform: uppercase;

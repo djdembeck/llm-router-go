@@ -5,7 +5,7 @@
     <path d="M152 104H192L216 128L192 152H152Z"/>
     <path d="M32 144H120L152 176H224V200A24 24 0 0 1 200 224H56A24 24 0 0 1 32 200Z"/>
   </g>
-  <g id="wordmark" fill="#E5F3F1" fill-rule="evenodd" transform="translate(280 88) scale(2)">
+  <g id="wordmark" fill="#A8D8CF" fill-rule="evenodd" transform="translate(280 88) scale(2)">
     <path transform="translate(0 0)" d="M0 0H8V32H28V40H0Z"/>
     <path transform="translate(36 0)" d="M0 0H8V32H28V40H0Z"/>
     <path transform="translate(72 0)" d="M0 40V0H8L24 16L40 0H48V40H40V12L24 28L8 12V40Z"/>

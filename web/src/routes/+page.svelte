@@ -206,7 +206,9 @@
 
   function toggleTheme(): void {
     theme = theme === "night" ? "day" : "night";
-    document.documentElement.dataset.theme = theme;
+    // The bootstrap helper owns the dataset plus the tab icon and browser
+    // chrome, so a themed page never sits under the other sheet's icon.
+    (window as Window & { __lrgSheet?: (t: "night" | "day") => void }).__lrgSheet?.(theme);
     try {
       localStorage.setItem("lrg-theme", theme);
     } catch {

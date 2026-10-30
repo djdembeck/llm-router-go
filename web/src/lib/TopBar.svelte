@@ -46,9 +46,10 @@
   </div>
 
   <div class="status">
-    <span class="chip {health === 'live' ? 'ok' : health === 'degraded' ? 'warn' : 'err'}">
-      {healthLabel}
-    </span>
+    <span
+      class="chip {health === 'live' ? 'ok' : health === 'degraded' ? 'warn' : 'err'}"
+      role="status"
+    >{healthLabel}</span>
     {#if paused}
       <span class="chip warn">PAUSED</span>
     {/if}
@@ -132,7 +133,7 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    min-width: 200px;
+    flex: 0 0 auto;
   }
   .logo {
     display: block;
@@ -143,6 +144,7 @@
   .subtitle {
     color: var(--ink-3);
     letter-spacing: 0.1em;
+    line-height: var(--lh-label);
   }
   .status {
     display: flex;
@@ -176,12 +178,7 @@
       gap: var(--s3);
       overflow: clip;
     }
-    .status {
-      order: 3;
-      flex-basis: 100%;
-    }
     .controls {
-      order: 2;
       flex-wrap: wrap;
       row-gap: var(--s2);
     }
@@ -193,11 +190,11 @@
     .topbar {
       padding: 8px var(--s3);
     }
-    .mark {
-      min-width: 0;
-    }
     .subtitle {
       display: none;
+    }
+    .status {
+      flex-basis: 100%;
     }
     .controls {
       width: 100%;
@@ -208,10 +205,6 @@
       min-height: 44px;
       min-width: 44px;
       padding: 8px 9px;
-    }
-    .feed {
-      white-space: normal;
-      font-size: var(--fs-label);
     }
   }
 </style>
