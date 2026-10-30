@@ -16,6 +16,7 @@
 
 ### Features
 
+* **dashboard:** add approved B3 Flow branding — theme-selected day/night header logo, matching favicons, and README identity, with identifier-only colors that preserve the survey palette and semantic states
 * **dashboard:** automatically focus a one-backend deployment on its server: remove the fleet rail and duplicate aggregate chart lane, reclaim chart width, show compact server details, and omit repeated backend names; preserve fleet comparisons for multi-backend deployments and device-wide GPU telemetry in both modes
 * **dashboard:** replace the fold-sheet UI with the Capacity Survey — readings strip, Fleet Profile (KV ridges, live request bars, survey cursor), live session stack, backend detail, request feed, night/day sheets
 * **dashboard:** smooth the sheet — TTFT/prefill/decode read a 15s mean refreshed every 5s and tween over 1.6s, the KV gauge holds 5s, a continuously gliding live edge, FLIP session rows with no entrance flashes, a stable request table, eased controls, and a night/day cross-fade; reduced-motion paths snap values and zero JS row durations

@@ -132,8 +132,8 @@
     },
     "typographyMeta": {
       "display": {
-        "displayName": "Interface Display",
-        "purpose": "Overpass interface display text; the custom SVG wordmark is not runtime type."
+        "displayName": "Reserved Display",
+        "purpose": "Reserved Overpass display role; no dashboard element currently uses it. The logo is custom SVG artwork, not runtime type."
       },
       "data-value": {
         "displayName": "Data Value",

@@ -229,7 +229,7 @@ does not shift its neighbours.
 
 ### Hierarchy
 
-- **Display** (Overpass 600, 16/20, -0.01em): interface display text; the logo is a custom SVG, not runtime type.
+- **Display** (Overpass 600, 16/20, -0.01em): reserved for display text; no interface element uses it now that the logo is custom SVG artwork.
 - **Data Value** (Mono 500, 24/28, -0.01em, tabular): readings strip values
   and the largest number in a panel.
 - **Panel Value** (Mono 500, 16/20): backend names, table values, session ages.
