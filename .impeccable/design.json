@@ -108,12 +108,32 @@
         "role": "tertiary",
         "displayName": "Day Vermilion",
         "canonical": "#a33a28"
+      },
+      "brand-symbol-day": {
+        "role": "primary",
+        "displayName": "B3 Flow Symbol — Day",
+        "canonical": "#0F766E"
+      },
+      "brand-wordmark-day": {
+        "role": "neutral",
+        "displayName": "B3 Flow Wordmark — Day",
+        "canonical": "#18343A"
+      },
+      "brand-symbol-night": {
+        "role": "primary",
+        "displayName": "B3 Flow Symbol — Night",
+        "canonical": "#5EEAD4"
+      },
+      "brand-wordmark-night": {
+        "role": "neutral",
+        "displayName": "B3 Flow Wordmark — Night",
+        "canonical": "#E5F3F1"
       }
     },
     "typographyMeta": {
       "display": {
-        "displayName": "Wordmark",
-        "purpose": "llm-router-go only; -go in sand."
+        "displayName": "Interface Display",
+        "purpose": "Overpass interface display text; the custom SVG wordmark is not runtime type."
       },
       "data-value": {
         "displayName": "Data Value",
@@ -255,11 +275,12 @@
   ],
   "narrative": {
     "northStar": "The Capacity Survey",
-    "overview": "The fleet is terrain. A dark survey sheet applies level lines, spot heights, grid references, and a marginal scale to live GPU/KV/session telemetry, with a cream day sheet that inverts the same roles. The standard ops shell keeps controls familiar; the world enters through type, palette, density, and the Fleet Profile. Every figure carries its source: router, engine, device, or est. Stale data freezes and says so; missing engine data is hatched, never guessed.",
+    "overview": "The fleet is terrain. A dark survey sheet applies level lines, spot heights, grid references, and a marginal scale to live GPU/KV/session telemetry, with a cream day sheet that inverts the same roles. The standard ops shell keeps controls familiar; the world enters through type, palette, density, and the Fleet Profile. The header uses the approved B3 Flow custom outlined SVG symbol and custom-path wordmark, selected for the active theme and displayed at 30px high. Its four brand colors identify the product only and never encode survey or telemetry status. Every figure carries its source: router, engine, device, or est. Stale data freezes and says so; missing engine data is hatched, never guessed.",
     "keyCharacteristics": [
       "Dark olive-ink survey sheet + paired cream day sheet",
       "Sand level lines, water KV, moss live, amber estimate, vermilion failure",
       "Overpass + Overpass Mono; integer 2px type steps; tabular figures",
+      "B3 Flow custom SVG logo; theme-selected asset, 30px high, brand colors identifier-only",
       "Zero radius, 1px rules, no ambient shadow or glow",
       "Fleet Profile is the only history chart; live sessions sit beside it",
       "Frozen truth on feed loss, explicitly labelled stale"

@@ -26,6 +26,10 @@ colors:
   day-moss: "#476438"
   day-amber: "#8a5a12"
   day-vermilion: "#a33a28"
+  brand-symbol-day: "#0F766E"
+  brand-wordmark-day: "#18343A"
+  brand-symbol-night: "#5EEAD4"
+  brand-wordmark-night: "#E5F3F1"
 typography:
   display:
     fontFamily: "Overpass, system-ui, sans-serif"
@@ -72,7 +76,7 @@ components:
   topbar:
     backgroundColor: "{colors.survey-panel}"
     textColor: "{colors.chalk}"
-    height: "56px"
+    height: "auto"
     padding: "8px 20px"
   button:
     backgroundColor: "transparent"
@@ -120,7 +124,11 @@ in a dim room, with a day sheet that inverts the same roles for daylight.
 The world enters through four carriers only: type, palette, density, and one
 signature move. The shell stays a standard web operations surface — a top
 bar, a fleet rail, ruled tables, segmented controls, a range slider. The
-signature is the **Fleet Profile**: one elevation lane per backend, its KV
+header carries the approved B3 Flow logo: a custom outlined symbol and
+custom-path wordmark, rendered from theme-selected SVG assets at 30px high.
+Its four brand colors identify the product only; they do not replace the
+survey palette or encode health, activity, request, or engine state.
+The signature is the **Fleet Profile**: one elevation lane per backend, its KV
 level drawn as a sand ridge over a water fill, live requests riding below as
 prefill/decode bars, spot heights at the live edge, and a survey cursor that
 scrubs every reading. Lanes are categorical; the sheet never interpolates
@@ -138,6 +146,7 @@ guess.
 - A dark olive-ink survey sheet with a paired cream day sheet
 - Sand level lines, water KV, moss live, amber estimate, vermilion failure
 - Overpass + Overpass Mono; every figure tabular, every type size on an integer 2px step
+- B3 Flow custom SVG logo; theme-selected asset at 30px high; brand colors are identifier-only
 - Sharp corners, 1px rules, no ambient shadow, no glow
 - The Fleet Profile is the history chart; no second chart style competes with it
 - Live sessions sit beside the profile in the first viewport
@@ -165,6 +174,16 @@ primary sheet; day inverts ground and ink while keeping each role.
 - **Amber — Attention / Estimate** (#d6a445, lit #e8c071): the `est` tag,
   the prefill bar, queued/waiting emphasis, and the `PAUSED`/`DEV MOCK`
   chips.
+
+### Brand Identifier
+
+The B3 Flow logo alone uses four additional colors: `brand-symbol-day` and
+`brand-wordmark-day` for the day asset, and `brand-symbol-night` and
+`brand-wordmark-night` for the night asset. The symbol carries the first
+color in each pair; the custom outlined wordmark carries the second. These
+colors are identifier-only: never use them for survey marks, health, activity,
+requests, or engine/telemetry status. The established survey and semantic
+palette remains authoritative everywhere else.
 
 ### Failure
 
@@ -199,7 +218,7 @@ density, type, or the profile's grammar.
 ## Typography
 
 **Display Font:** Overpass (400–700) — a workhorse grotesk with
-transit-signage DNA; the wordmark and all labels.
+transit-signage DNA; used for all interface labels and text.
 **Data Font:** Overpass Mono (400–600) — every number, unit, identifier,
 axis label, and table cell.
 
@@ -210,7 +229,7 @@ does not shift its neighbours.
 
 ### Hierarchy
 
-- **Display** (Overpass 600, 16/20, -0.01em): the wordmark only; `-go` in sand.
+- **Display** (Overpass 600, 16/20, -0.01em): interface display text; the logo is a custom SVG, not runtime type.
 - **Data Value** (Mono 500, 24/28, -0.01em, tabular): readings strip values
   and the largest number in a panel.
 - **Panel Value** (Mono 500, 16/20): backend names, table values, session ages.
@@ -343,12 +362,21 @@ zero duration, and CSS transitions/animations collapse to 0.01ms.
 
 ### Top Bar
 
-The sheet's header. Left: the wordmark (`llm-router-go`, `-go` sand) with a
-10px subtitle. Center-left: health chip (`LIVE` moss, `DEGRADED` amber,
-`OFFLINE` vermilion), optional `PAUSED` and `DEV MOCK` chips, feed source and
-last-data time. Right: wall clock (12px mono), a six-button range segmented
-control, pause/play, and a theme button. Height 56px; 1px rule bottom;
-`survey-panel` ground.
+The sheet's header. Left: the custom outlined B3 Flow SVG wordmark, selected
+for the active theme and displayed at 30px high, with the existing subtitle.
+Its symbol and lettering use the four identifier-only brand colors; the SVG
+is custom path artwork, not rendered with a runtime font. Center-left: health
+chip (`LIVE` moss, `DEGRADED` amber, `OFFLINE` vermilion), optional `PAUSED`
+and `DEV MOCK` chips, feed source and last-data time. Right: wall clock (12px
+mono), a six-button range segmented control, pause/play, and a theme button.
+Minimum height 56px; 1px rule bottom; `survey-panel` ground.
+
+### Brand Logo
+
+B3 Flow is a custom outlined SVG symbol and custom-path wordmark, not a
+runtime font. Use the theme-selected day/night asset at 30px displayed height.
+The symbol and lettering use their separate day/night brand-color roles;
+those identifier colors never communicate survey, telemetry, or status state.
 
 ### Readings Strip
 

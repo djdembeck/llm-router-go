@@ -35,7 +35,13 @@
 
 <header class="topbar">
   <div class="mark">
-    <span class="wordmark">llm-router<span class="suffix">-go</span></span>
+    <img
+      class="logo"
+      src={theme === "night" ? "/logo-dark.svg" : "/logo.svg"}
+      alt="LLM Router"
+      width="992"
+      height="192"
+    />
     <span class="label subtitle">GPU-aware inference routing</span>
   </div>
 
@@ -128,14 +134,11 @@
     gap: 2px;
     min-width: 200px;
   }
-  .wordmark {
-    font-size: var(--fs-title);
-    line-height: var(--lh-body);
-    font-weight: 600;
-    letter-spacing: -0.01em;
-  }
-  .suffix {
-    color: var(--sand);
+  .logo {
+    display: block;
+    align-self: flex-start;
+    width: auto;
+    height: 30px;
   }
   .subtitle {
     color: var(--ink-3);
