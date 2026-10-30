@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [main, develop]
-    tags: ['v*']
     paths-ignore: ['*.md', 'docs/**']
   pull_request:
     paths-ignore: ['*.md', 'docs/**']
@@ -40,7 +39,12 @@ jobs:
         run: go vet ./...
 
       - name: Mod tidy
-        run: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
+        run: |
+          set -euo pipefail
+          go mod tidy
+          files=(go.mod)
+          if [[ -f go.sum ]]; then files+=(go.sum); fi
+          git diff --exit-code -- "${files[@]}"
 
   build:
     name: Build
@@ -78,6 +82,9 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Verify immutable release reservation boundaries
+        run: python3 -m unittest discover -s scripts -p test_release.py
+
   docker-build:
     name: Build and Push Docker Image
     needs: [test]
@@ -110,13 +117,13 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/djdembeck/llm-router-go
+          # CI owns previews; Release alone writes immutable version images.
+          labels: |
+            org.opencontainers.image.version=dev-${{ github.sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=sha,enable=${{ github.event_name != 'pull_request' }}
 
       - name: Build and push Docker image
@@ -124,6 +131,9 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          build-args: |
+            VERSION=dev-${{ github.sha }}
+            GIT_COMMIT=${{ github.sha }}
           push: ${{ github.event_name != 'pull_request' || env.PR_IS_SAME_REPO == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

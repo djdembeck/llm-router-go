@@ -279,7 +279,11 @@ func tier0Inflight() int32 {
 	return total
 }
 
+var version = "dev"
+var gitCommit = "unknown"
+
 func main() {
+	log.Printf("llm-router %s (commit %s)", version, gitCommit)
 	port := flag.Int("port", 80, "listen port")
 	flag.Parse()
 

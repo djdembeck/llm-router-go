@@ -76,6 +76,23 @@ Each backend maintains its own request queue. Requests are routed using an Expon
 ### Large Prefill Detection
 To prevent "head-of-line" blocking caused by massive prompt prefills, the router tracks prefill sizes and limits the number of concurrent large prefill operations per backend.
 
+## Releases
+
+Releases are automatic on promotion to `main` (each `develop` → `main` merge) or via a
+**Run workflow** dispatch with an optional explicit version/bump. The `Release` workflow keeps
+one exact-source semver tag reservation: the version tag points at the frozen commit, is never
+moved, and is reused if a release is re-run for the same source.
+
+- **GitHub Release**: published after the native outputs complete; the existing Annalist App fills notes from the previous published ancestor release, not an unfinished reserved tag.
+- **GHCR image** `ghcr.io/djdembeck/llm-router-go:<version>`: an immutable, digest-pinned build
+  stamped with `org.opencontainers.image.version` / `org.opencontainers.image.revision` labels
+  (also consumed at build time via `main.version` / `main.gitCommit`). Existing images are only
+  accepted after provenance verification; the release workflow is the sole writer of versioned
+  images, while CI publishes branch/preview tags only.
+
+
+Retry the original run to retain its frozen source after main advances. Automatic and manual runs share the non-cancelling native GitHub `queue: max` (up to 100 pending runs); manual-only installations remove the push trigger once. The actual router startup log consumes the selected version and separate source SHA; unconfigured builds report dev/unknown. No source version commits or merge-back are performed, and no mutable latest/major/minor aliases are written. Main protection remains unchanged; develop keeps required CI without base freshness.
+
 ## Building from Source
 
 The project is written in Go and uses only the standard library.
