@@ -2551,6 +2551,9 @@ func tier0Inflight() int32 {
 	return total
 }
 
+var version = "dev"
+var gitCommit = "unknown"
+
 // buildMux assembles the router's external route table. /v1/ is the proxy
 // prefix; /health, /stats, and /v1/models stay public. The telemetry
 // surface (/metrics/*, session data included) lives on a separate
@@ -2587,6 +2590,7 @@ func buildMetricsMux() *http.ServeMux {
 }
 
 func main() {
+	log.Printf("llm-router %s (commit %s)", version, gitCommit)
 	port := flag.Int("port", 80, "listen port")
 	flag.Parse()
 

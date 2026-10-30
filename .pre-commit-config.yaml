@@ -4,10 +4,10 @@ repos:
     hooks:
       - id: go-fmt
         name: Go fmt
+        entry: bash -e -c 'test -z "$(gofmt -l .)"'
         language: system
         pass_filenames: false
         types: [go]
-        entry: bash -c 'out=$(gofmt -l .) && if [ -n "$out" ]; then echo "Unformatted files:$out" && exit 1; fi'
 
       - id: go-vet
         name: Go vet
@@ -18,10 +18,16 @@ repos:
 
       - id: go-mod-tidy
         name: Go mod tidy
+        entry: |
+          bash -c 'set -euo pipefail
+          go mod tidy
+          files=(go.mod)
+          if [[ -f go.sum ]]; then files+=(go.sum); fi
+          git diff --exit-code -- "${files[@]}"
+          '
         language: system
         pass_filenames: false
         types: [go]
-        entry: bash -c 'go mod tidy && git diff --exit-code -- go.mod go.sum'
 
       - id: go-build
         name: Go build
@@ -35,4 +41,4 @@ repos:
         language: system
         pass_filenames: false
         types: [go]
-        entry: go test ./...
+        entry: go test -count=1 ./...
