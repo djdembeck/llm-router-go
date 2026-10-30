@@ -5,7 +5,10 @@ name: Release
 on:
   push:
     branches: [main]
-    paths-ignore: ['*.md', '.github/**']
+    # Ops-only commits must never cut a release: docs, CI workflows, and
+    # Renovate config. (Committing renovate.json5 to main triggered v1.0.3
+    # in Oct 2026 for a no-code change.)
+    paths-ignore: ['*.md', 'docs/**', '.github/**', 'renovate.json5']
   workflow_dispatch:
     inputs:
       version:

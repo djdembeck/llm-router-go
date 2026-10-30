@@ -6,15 +6,15 @@ repos:
         name: Go fmt
         entry: bash -e -c 'test -z "$(gofmt -l .)"'
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
 
       - id: go-vet
         name: Go vet
-        entry: go vet ./...
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
+        entry: go vet ./...
 
       - id: go-mod-tidy
         name: Go mod tidy
@@ -26,19 +26,19 @@ repos:
           git diff --exit-code -- "${files[@]}"
           '
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
 
       - id: go-build
         name: Go build
-        entry: go build ./...
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
+        entry: go build ./...
 
       - id: go-test
         name: Go test
-        entry: go test ./...
         language: system
-        types: [go]
         pass_filenames: false
+        types: [go]
+        entry: go test -count=1 ./...

@@ -8,7 +8,8 @@ concurrency:
   group: pr-cleanup-${{ github.event.pull_request.head.sha }}
   cancel-in-progress: true
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   cleanup-pr-images:
