@@ -1,5 +1,12 @@
 # llm-router-go
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/static/logo-dark.svg">
+    <img src="web/static/logo.svg" alt="LLM Router logo" width="320">
+  </picture>
+</p>
+
 GPU-aware reverse proxy router for vLLM and SGlang LLM inference backends.
 
 llm-router-go sits in front of one or more OpenAI-compatible inference servers and routes requests using GPU utilization, concurrency, queue depth, and latency signals. It is a single Go binary with no external dependencies.
