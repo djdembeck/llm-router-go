@@ -169,3 +169,41 @@ func TestRuntimeStreamDrain(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadServerLimits(t *testing.T) {
+	for _, name := range []string{"READ_HEADER_TIMEOUT", "READ_TIMEOUT", "IDLE_TIMEOUT", "SHUTDOWN_TIMEOUT", "MAX_HEADER_BYTES"} {
+		t.Setenv(name, "")
+	}
+	limits, err := loadServerLimits()
+	if err != nil {
+		t.Fatalf("loadServerLimits: %v", err)
+	}
+	want := serverLimits{readHeader: 10 * time.Second, readBody: 2 * time.Minute, idle: 2 * time.Minute, shutdown: 30 * time.Second, maxHeader: 1 << 20}
+	if limits != want {
+		t.Fatalf("defaults = %+v, want %+v", limits, want)
+	}
+}
+
+func TestLoadServerLimitsInvalid(t *testing.T) {
+	for _, name := range []string{"READ_HEADER_TIMEOUT", "READ_TIMEOUT", "IDLE_TIMEOUT", "SHUTDOWN_TIMEOUT", "MAX_HEADER_BYTES"} {
+		t.Setenv(name, "")
+	}
+	cases := []struct {
+		env, value string
+	}{
+		{"READ_HEADER_TIMEOUT", "0s"},
+		{"READ_TIMEOUT", "not-a-duration"},
+		{"IDLE_TIMEOUT", "-5s"},
+		{"SHUTDOWN_TIMEOUT", "0"},
+		{"MAX_HEADER_BYTES", "0"},
+		{"MAX_HEADER_BYTES", "not-a-number"},
+	}
+	for _, c := range cases {
+		t.Run(c.env+"="+c.value, func(t *testing.T) {
+			t.Setenv(c.env, c.value)
+			if _, err := loadServerLimits(); err == nil {
+				t.Fatalf("loadServerLimits accepted %s=%q", c.env, c.value)
+			}
+		})
+	}
+}

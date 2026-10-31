@@ -2597,7 +2597,7 @@ type serverLimits struct {
 }
 
 func loadServerLimits() (serverLimits, error) {
-	limits := serverLimits{10 * time.Second, 2 * time.Minute, 2 * time.Minute, 30 * time.Second, 1 << 20}
+	limits := serverLimits{readHeader: 10 * time.Second, readBody: 2 * time.Minute, idle: 2 * time.Minute, shutdown: 30 * time.Second, maxHeader: 1 << 20}
 	for _, setting := range []struct {
 		name string
 		dest *time.Duration
