@@ -24,5 +24,11 @@ COPY --from=web /web/build ./web/build
 RUN CGO_ENABLED=0 go build -tags webui -o /router main.go
 
 FROM alpine:3.24
+RUN addgroup -g 10001 router \
+    && adduser -D -H -u 10001 -G router router \
+    && mkdir /data && chown router:router /data
 COPY --from=builder /router /router
+ENV LISTEN_HOST=0.0.0.0
+WORKDIR /data
+USER 10001:10001
 ENTRYPOINT ["/router"]
