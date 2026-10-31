@@ -176,6 +176,11 @@ BACKENDS='[
 | `MAX_GPU_BUDGET` | `4` | Maximum weighted GPU usage while any Tier 0 (King) backend is active. |
 | `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Larger requests receive HTTP `413` with `X-Router-Reason: body-too-large`. |
 | `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput used to bound how long a non-streaming request holds a large-prefill slot. The slot is released after the estimated prefill duration or the first response byte, whichever comes first. This bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
+| `SESSION_ADMISSION` | *(off)* | `on` enables TTL-bounded session admission: each keyed conversation holds one admitted slot per backend until it is released and then idle for `SESSION_IDLE_TTL`. Off and unkeyed traffic keep the legacy per-request behavior exactly. |
+| `SESSION_MAX_ADMITTED` | backend's `maxConcurrent` | Cap on concurrently admitted conversations per backend. Empty inherits each backend's `maxConcurrent` (must be set explicitly for unlimited backends); a nonzero value applies to every backend. |
+| `SESSION_MAX_WAITING` | backend's `maxQueueDepth` (default 2) | Bounded, strictly FIFO admission queue per backend. Empty inherits each backend's `maxQueueDepth`; a nonzero value applies to every backend. Waiting admissions are also bounded by `MAX_QUEUE_TIMEOUT`. |
+| `SESSION_IDLE_TTL` | `5m` | How long a released (idle) lease retains its admitted slot before a newcomer may take it. The expiry timer alone drains the queue; no traffic is required. |
+| `SESSION_KEY_SOURCE` | `prompt_cache_key` | Lease identity source: `prompt_cache_key` (always preferred when present), `user`, or `header:<Name>` for a single named request header. |
 | `HISTORY_PATH` | *(empty)* | Optional file for the dashboard's history rings. Atomic snapshots every minute; empty means memory-only (history resets on restart). |
 | `GPU_METRICS_URL` | *(empty)* | Optional Prometheus text endpoint for device GPU utilization/VRAM/temperature/power (DCGM exporter or nvidia_gpu_exporter). Empty disables device telemetry; engine KV/memory gauges remain available. |
 | `METRICS_LISTEN` | `127.0.0.1:9100` | Address for the management listener that serves the dashboard and the `/metrics/*` endpoints (including in-flight and conversation session data, which is never exposed on the external listener). Point it at a LAN interface to expose the dashboard to that network. |
@@ -201,6 +206,21 @@ The router listens on `:80` by default.
 All other paths are proxied to a selected backend. OpenAI-compatible inference paths, including chat and completion requests, are forwarded after the router applies tier, GPU, concurrency, queue, and large-prefill limits.
 
 Requests rejected because a queue, GPU budget, or prefill limit is full receive `429` with `Retry-After`, `X-Router-Reason`, and `X-Router-Backend` headers. Requests exceeding `MAX_BODY_BYTES` receive `413` with `X-Router-Reason: body-too-large`.
+
+### Session admission
+
+With `SESSION_ADMISSION=on`, admission becomes **conversation-scoped**: a keyed request (its lease id is derived from `prompt_cache_key`, or a configured fallback origin) is granted one admission ticket on the backend that serves it. The ticket covers the full lifetime of the request — upstream queuing, GPU/prefill staging, response streaming, even aborted/cancelled tails — and is released exactly once at handler completion.
+
+What the ticket grants (per backend):
+
+* **Shape:** a set of admitted conversations per backend, bounded by `SESSION_MAX_ADMITTED` (defaults to each backend's own `maxConcurrent`, so with a single backend it mirrors the execution slots).
+* **Queueing:** when the per-backend shape is full, new (new-identity) arrivals wait in a strictly FIFO queue, bounded by `SESSION_MAX_WAITING` (defaults to each backend's `maxQueueDepth`, otherwise 2) and by `MAX_QUEUE_TIMEOUT` for how long they may wait. Exceeding either — the queue is full, or the grace has elapsed — instantiates `429` (`session-admission-queue-full` / `session-admission-timeout`).
+* **TTL retention:** when a conversation's accepted set drops to zero, its lease is not dropped immediately. It enters an *idle* state for `SESSION_IDLE_TTL` (default 5m) during which it continues to occupy its shape and is not re-admitted; a valid idle lease immediately re-admits that identity, so a returning conversation gets back in without spending a new ticket.
+* **Admission safety:** a *new* identity is only admitted when (a) the per-backend shape has room AND (b) no earlier-queued newcomer that holds no lease of its own would be truncated by the new arrival. Same-identity waiters can cut in line behind a blocked waiter (the identity lease is authoritative), but a new identity never gets to cut in line for another newcomer.
+* **Cancellations / timeouts / rejections:** a cancelled client (499) or a queued admission that times out mint *no* lease and take no shape. A request that is rejected *after* admission (tier-0 block, GPU budget, in-flight slot, prefill) holds the ticket until handler completion — the accepted count reflects “in flight at this backend’s slot,” not “upstream is running.”
+* **Scope of admission:** off (`SESSION_ADMISSION` unset or `off`) and keyless traffic (no `prompt_cache_key` — or no source configured) bypass the gate entirely and keep the legacy per-request shape exactly. The key is backend-scoped: the same key on two backends is two distinct leases.
+
+The dashboard’s session feed (`/metrics/stream` and `sessions`) reports `admissionLease` and `admissionIdleSinceMs` per row from the lease map itself, so the live view never claims a lease the registry (a bounded, evictable view) has no record of.
 
 
 ## Dashboard

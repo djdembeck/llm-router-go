@@ -762,6 +762,8 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 	savedDurations := durations
 	savedGpu := gpu
 	savedProxies := proxies
+	savedAdmSettings := sessionAdmissionSettings
+	savedAdmissions := sessionAdmissions
 
 	backends = list
 	slots = make(map[string]*slotManager)
@@ -772,6 +774,10 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 	}
 	gpu = nil
 	proxies = make(map[string]*httputil.ReverseProxy)
+	// Session admission is disabled by default for existing tests; the
+	// TestSessionAdmission* suite opts in by overwriting these afterwards.
+	sessionAdmissionSettings = sessionAdmissionConfig{}
+	sessionAdmissions = nil
 	for _, b := range list {
 		if mx, ok := slotMax[b.Name]; ok && mx > 0 {
 			mq := 2
@@ -788,6 +794,8 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 		durations = savedDurations
 		gpu = savedGpu
 		proxies = savedProxies
+		sessionAdmissionSettings = savedAdmSettings
+		sessionAdmissions = savedAdmissions
 	})
 }
 
