@@ -125,6 +125,16 @@ func saChatBody(model, key, msg string) string {
 	return fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, model, msg)
 }
 
+// saChatStreamBody is saChatBody with stream:true: production releases
+// the large-prefill slot on the first response byte, so a fake upstream
+// that writes no bytes keeps the slot deterministically gated.
+func saChatStreamBody(model, key, msg string) string {
+	if key != "" {
+		return fmt.Sprintf(`{"model":%q,"prompt_cache_key":%q,"stream":true,"messages":[{"role":"user","content":%q}]}`, model, key, msg)
+	}
+	return fmt.Sprintf(`{"model":%q,"stream":true,"messages":[{"role":"user","content":%q}]}`, model, msg)
+}
+
 func saPost(t *testing.T, url, body string) (int, http.Header, string) {
 	t.Helper()
 	resp, err := http.Post(url, "application/json", strings.NewReader(body))
@@ -175,6 +185,74 @@ func newSAServing() *saServing {
 	})
 	s.ts = httptest.NewServer(mux)
 	return s
+}
+
+// saMetricsServing is the serving stack of the REAL management surface:
+// handleProxy + buildMetricsMux on one listener, so a test can drive an
+// admission state through the actual /metrics/sessions endpoint.
+type saMetricsServing struct {
+	ts  *httptest.Server
+	mu  sync.Mutex
+	cv  *sync.Cond
+	cnt int
+}
+
+func newSAServingMux() *saMetricsServing {
+	s := &saMetricsServing{}
+	s.cv = sync.NewCond(&s.mu)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stats", handleStats)
+	mux.Handle("/metrics/", buildMetricsMux())
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.cnt++
+		s.mu.Unlock()
+		handleProxy(w, r)
+		s.mu.Lock()
+		s.cnt--
+		s.cv.Signal()
+		s.mu.Unlock()
+	})
+	s.ts = httptest.NewServer(mux)
+	return s
+}
+
+// saSessionRow fetches the live /metrics/sessions feed and returns the
+// row for id ("absent" if the registry no longer knows it).
+func (s *saMetricsServing) saSessionRow(t *testing.T, id string) *sessFrame {
+	t.Helper()
+	resp, err := http.Get(s.ts.URL + "/metrics/sessions")
+	if err != nil {
+		t.Fatalf("GET /metrics/sessions: %v", err)
+	}
+	defer resp.Body.Close()
+	var feed sessionsFeed
+	if err := json.NewDecoder(resp.Body).Decode(&feed); err != nil {
+		t.Fatalf("decode /metrics/sessions: %v", err)
+	}
+	return saAdmRow(feed, id)
+}
+
+func (s *saMetricsServing) awaitIdle(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.cnt > 0 {
+		remaining := deadline.Sub(time.Now())
+		if remaining <= 0 {
+			t.Fatal("handlers did not drain within timeout")
+			return
+		}
+		notified := make(chan struct{})
+		go func() {
+			time.Sleep(remaining)
+			s.cv.Signal()
+			close(notified)
+		}()
+		s.cv.Wait()
+		<-notified
+	}
 }
 
 func (s *saServing) awaitIdle(t *testing.T, timeout time.Duration) {
@@ -302,12 +380,92 @@ func saWaitIdleLease(t *testing.T, backend, key string) {
 	}
 }
 
+// saPollGPU waits for the GPU budget to reach the expected (used,
+// waiting) pair: a COMPLETING handler's deferred gpu.release lands
+// strictly after the client reads the response, so the transition is
+// asynchronous (same contract as saWaitIdleLease, for the budget).
+func saPollGPU(t *testing.T, gb *gpuBudget, used, waiting int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if u, _, w := gb.snapshot(); u == used && w == waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			u, _, w := gb.snapshot()
+			t.Fatalf("gpu budget = %d/%d, want %d/%d", u, w, used, waiting)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// saPollPrefillSlot waits for the prefill slot state to reach
+// (in, waiting): a slot handoff after a release is asynchronous (the
+// wake, re-acquire, and forward are separate real-time steps), so a
+// fixed sleep after a gate release is a flake window.
+func saPollPrefillSlot(t *testing.T, in, waiting int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		pin, _, pw, _ := prefillSlots["smoke"].snapshot()
+		if int(pin) == in && int(pw) == waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("prefill slots = %d/%d, want %d/%d", pin, pw, in, waiting)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// saPollEngineSeen polls until the fake upstream has forwarded calls
+// in EXACTLY the given key order (oldest first): a deterministic
+// replacement for a fixed sleep after a grant — a granted handler
+// sits at its engine gate until released, so the recorded order is
+// stable once every expected forward has landed.
+func saPollEngineSeen(t *testing.T, e *saGateEngine, order ...string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if got := e.Seen(); len(got) == len(order) {
+			ok := true
+			for i := range order {
+				if got[i] != order[i] {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("engine seen = %v, want order %v", e.Seen(), order)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // saIsolate swaps in a fresh registry/metrics for the test.
 func saIsolate(t *testing.T) {
 	t.Helper()
 	oldSessions, oldMetrics := sessions, metrics
 	sessions, metrics = newSessionRegistry(), newTestMetrics()
 	t.Cleanup(func() { sessions, metrics = oldSessions, oldMetrics })
+}
+
+// saAdmKeyD is saAdmKey with a caller-chosen deadline (the manual clock
+// is the deadline clock; a long test whose advances approach
+// queueTimeout must keep its admission-key references at a short,
+// bounded deadline).
+func saAdmKeyD(t *testing.T, key, backend string, d time.Duration) string {
+	t.Helper()
+	p := &parsedBody{PromptCacheKey: json.RawMessage("\"" + key + "\"")}
+	k := admissionKeyFor(p, httptest.NewRequest("POST", "/v1/chat/completions", nil), backend, "prompt_cache_key", "")
+	if k == "" {
+		t.Fatalf("admissionKeyFor returned empty for %q", key)
+	}
+	return k
 }
 
 func saAdmKey(t *testing.T, key, backend string) string {
@@ -379,19 +537,20 @@ func TestSessionAdmission_ConfigLoader(t *testing.T) {
 		}
 	})
 	t.Run("default-inherit", func(t *testing.T) {
-		// 0 = inherit each backend's maxConcurrent; per-backend resolution
-		// happens in main(), not in the loader.
+		// 0 = inherit each backend's maxConcurrent; waiting -1 is the
+		// inherit sentinel — per-backend resolution happens in main(),
+		// not in the loader.
 		cfg, err := loadSessionAdmissionConfig(saEnv("SESSION_ADMISSION", "on"), limited)
-		if err != nil || cfg.MaxAdmitted != 0 || cfg.MaxWaiting != 4 ||
+		if err != nil || cfg.MaxAdmitted != 0 || cfg.MaxWaiting != -1 ||
 			cfg.IdleTTL != 5*time.Minute || cfg.KeySource != "prompt_cache_key" {
 			t.Fatalf("cfg = %+v, %v", cfg, err)
 		}
 	})
-	t.Run("zero-queue-inherits-2", func(t *testing.T) {
-		cfg, err := loadSessionAdmissionConfig(saEnv("SESSION_ADMISSION", "on"),
-			[]Backend{{Name: "z", MaxConcurrent: 2, MaxQueueDepth: 0}})
-		if err != nil || cfg.MaxWaiting != 2 {
-			t.Fatalf("waiting = %+v %v", cfg, err)
+	t.Run("negative-inherited-waiting", func(t *testing.T) {
+		_, err := loadSessionAdmissionConfig(saEnv("SESSION_ADMISSION", "on"),
+			[]Backend{{Name: "n", MaxConcurrent: 2, MaxQueueDepth: -1}})
+		if err == nil || !strings.Contains(err.Error(), "invalid SESSION_MAX_WAITING") {
+			t.Fatalf("err = %v, want invalid SESSION_MAX_WAITING", err)
 		}
 	})
 	t.Run("explicit-cap-unlimited", func(t *testing.T) {
@@ -1184,6 +1343,369 @@ func TestSessionAdmission_AcceptedLifetimeHold(t *testing.T) {
 	s.awaitIdle(t, 3*time.Second)
 }
 
+// TestSessionAdmission_AcceptedLifetimeGPUQueue is the GPU-queue arm of
+// the accepted-lifetime invariant, with an ACTIVE GPU budget. Topology:
+// tier-0 king K (weight 0; running so t0Inflight > 0, which engages the
+// budget check at zero cost); tier-1 subject "smoke" (weight 1, two
+// running slots, a 1-unit budget, admission cap 2, waiting bound 2).
+//
+//  1. K runs, gated. F (smoke) runs and completes immediately: its
+//     lease idles at t0 (an IDLE lease still occupies a cap slot — the
+//     retention invariant).
+//  2. M is granted the last cap slot, takes the SOLE budget unit and
+//     running slot 1, and is gated upstream.
+//  3. B and C are queued at the admission gate (cap full: idle F +
+//     active M).
+//  4. F's IDLE-LEASE EXPIRY (a timer tick, no traffic) frees a cap slot
+//     → B is granted → and, finding the budget exhausted (M's unit,
+//     M active in the engine gate), QUEUES at it — holding no running
+//     slot (the budget is upstream of the execution slot). C stays
+//     queued and holds no GPU, execution, or prefill permit.
+//  5. A TTL advance while M is accepted (engine gate) and B accepted
+//     (budget queue): both leases stay held with NO idle stamp, the
+//     budget has not moved, and C is still not granted (the cap is
+//     full: idle F + active M).
+//  6. M completes: its idle stamp lands exactly then and the unit
+//     frees → B: unit + slot 1 + engine gate (kept shut). The cap
+//     stays FULL ({M idle}{B active}), so C is still not granted.
+//  7. The next advance fires M's idle-lease EXPIRY → C is granted →
+//     BUDGET-QUEUED behind B (no running slot; the budget is upstream
+//     of the execution slot). B and C both active.
+//  8. B completes at its gate: the unit frees → C: unit + slot 1 +
+//     engine gate (kept shut); B's lease idles exactly then. K
+//     completes (weight 0; the budget is no longer engaged — C is
+//     already past it).
+//  9. C completes at its gate: the FINAL accepted release. B's and
+//     C's idle-stamped leases expire exactly one full TTL later;
+//     forward order [K F M B C]; budget and slots drain to zero —
+//     every permit released exactly once.
+//
+// Clock notes: execution-slot deadlines are WALL (queueTimeout 30s);
+// GPU-budget wait deadlines are WALL (grace 5s) — B's/C's waits stay
+// far under that; the MANUAL clock drives only admission deadlines
+// (queueTimeout 30s from each enqueue) and the idle TTL; B's/C's
+// budget waits are short wall intervals (<1s ≪ the 5s budget grace).
+func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
+	const ttl = time.Second
+	engine := newSAGateEngine()
+	withRouterEnv(t,
+		[]Backend{
+			{Name: "smoke", URL: engine.TS.URL, Tier: 1, GpuWeight: 1, MaxConcurrent: 2, MaxQueueDepth: 4},
+			{Name: "king", URL: engine.TS.URL, Tier: 0, GpuWeight: 0, MaxConcurrent: 2, MaxQueueDepth: 4},
+		},
+		map[string]int{"smoke": 2, "king": 2}, nil)
+	gb := &gpuBudget{max: 1}
+	gb.cond = sync.NewCond(&gb.mu)
+	gpu = gb
+	proxies["smoke"] = newTestProxy(engine.TS.URL)
+	proxies["king"] = newTestProxy(engine.TS.URL)
+	saIsolate(t)
+	c := newSAManualClock()
+	withAdmissionEnv(t, ttl, c, 2, 2)
+	s := newSAServing()
+	t.Cleanup(func() { s.ts.Close() })
+	t.Cleanup(func() { engine.releaseAll() })
+	t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
+
+	url := s.ts.URL + "/v1/chat/completions"
+	kF := saAdmKeyD(t, "F", "smoke", 60*time.Second)
+	kM := saAdmKeyD(t, "M", "smoke", 60*time.Second)
+	kB := saAdmKeyD(t, "B", "smoke", 60*time.Second)
+	kC := saAdmKeyD(t, "C", "smoke", 60*time.Second)
+
+	// 1. K (king) runs, gated. F (smoke) runs and completes immediately.
+	kDone := saPostAsync(t, url, saChatBody("king", "K", "hello"))
+	time.Sleep(100 * time.Millisecond)
+	fDone := make(chan int, 1)
+	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "F", "x")); fDone <- code }()
+	time.Sleep(100 * time.Millisecond)
+	engine.releaseKey("F")
+	if code := <-fDone; code != 200 {
+		t.Fatalf("F = %d", code)
+	}
+	if t0i := tier0Inflight(); t0i != 1 {
+		t.Fatalf("t0Inflight = %d, want 1 (K running)", t0i)
+	}
+	// The idle arm lands strictly after the client read (deferred ticket
+	// release); wait for it — advancing before the arm loses the tick.
+	saWaitIdleLease(t, "smoke", kF)
+	// 2. M: last cap slot + sole budget unit + running slot 1, gated.
+	mDone := saPostAsync(t, url, saChatBody("smoke", "M", "one"))
+	time.Sleep(100 * time.Millisecond)
+	if gUsed, _, gWaiting := gb.snapshot(); gUsed != 1 || gWaiting != 0 {
+		t.Fatalf("M not on the budget: used=%d/1 waiting=%d, want 1/0", gUsed, gWaiting)
+	}
+	// 3. B, C: admission-queued while the cap is full.
+	bDone := saPostAsync(t, url, saChatBody("smoke", "B", "two"))
+	time.Sleep(40 * time.Millisecond)
+	cDone := make(chan int, 1)
+	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "C", "x")); cDone <- code }()
+	time.Sleep(40 * time.Millisecond)
+	if held, _ := sessionAdmissions["smoke"].snapshot(kM); !held {
+		t.Fatal("M lease not held")
+	}
+	if held, _ := sessionAdmissions["smoke"].snapshot(kB); held {
+		t.Fatal("B granted while the cap is full")
+	}
+	if held, _ := sessionAdmissions["smoke"].snapshot(kC); held {
+		t.Fatal("C granted while the cap is full")
+	}
+	if got := engine.Seen(); len(got) != 3 ||
+		!(got[0] == "K" && got[1] == "F" && got[2] == "M") {
+		t.Fatalf("engine seen = %v, want [K F M]", got)
+	}
+
+	// 4. F's idle-lease expiry (timer tick, no traffic) frees a cap
+	// slot → B: then QUEUED AT THE EXHAUSTED BUDGET behind M (used 1,
+	// waiting 1); B holds no running slot (budget upstream of it).
+	c.Advance(2 * ttl)
+	if held, _ := sessionAdmissions["smoke"].snapshot(kB); !held {
+		t.Fatal("B not granted by the idle-lease expiry timer")
+	}
+	saPollGPU(t, gb, 1, 1)             // M (unit) + B (queued).
+	time.Sleep(150 * time.Millisecond) // settle: B's forward at the grant.
+	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
+		t.Fatalf("smoke inFlight = %d, want 1 (M running; B holds no slot while budget-queued)", in)
+	}
+
+	// 5. TTL advance with M accepted (engine gate) and B accepted
+	// (budget queue): both leases held WITH NO IDLE STAMP; C still
+	// not granted and holding no permit.
+	c.Advance(2*ttl + 2*time.Millisecond)
+	for _, k := range []string{kM, kB} {
+		if held, since := sessionAdmissions["smoke"].snapshot(k); !held || !since.IsZero() {
+			t.Fatalf("active lease %s = held %v since %v, want held (no idle stamp)", k, held, since)
+		}
+	}
+	if held, _ := sessionAdmissions["smoke"].snapshot(kC); held {
+		t.Fatal("C granted while M and B are still accepted")
+	}
+	if gUsed, _, gWaiting := gb.snapshot(); gUsed != 1 || gWaiting != 1 {
+		t.Fatalf("budget moved under a TTL advance: used=%d waiting=%d, want 1/1", gUsed, gWaiting)
+	}
+
+	// 6. M completes: its idle stamp lands NOW (one full TTL to
+	// expiry) and the unit frees → B: unit + slot 1 + engine gate
+	// (kept shut). The cap is STILL full ({M idle} + {B active}), so
+	// C stays queued at the gate.
+	engine.releaseKey("M")
+	if code := <-mDone; code != 200 {
+		t.Fatalf("M = %d", code)
+	}
+	saWaitIdleLease(t, "smoke", kM)    // stamp lands exactly at exit.
+	saPollGPU(t, gb, 1, 0)             // B holds the freed unit.
+	time.Sleep(150 * time.Millisecond) // settle: B's forward at the grant.
+	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
+		t.Fatalf("smoke inFlight = %d, want 1 (B running)", in)
+	}
+	if held, _ := sessionAdmissions["smoke"].snapshot(kC); held {
+		t.Fatal("C granted while the cap is full ({M idle}{B active})")
+	}
+
+	// 7. The advance: M's idle-lease EXPIRY frees a cap slot → C is
+	// granted → queues at the exhausted budget behind B (unit) — NO
+	// running slot (budget upstream of it). Both leases active.
+	c.Advance(2*ttl + 2*time.Millisecond)
+	if held, _ := sessionAdmissions["smoke"].snapshot(kM); held {
+		t.Fatal("M idle lease outlived its full idle TTL")
+	}
+	for _, k := range []string{kB, kC} {
+		if held, since := sessionAdmissions["smoke"].snapshot(k); !held || !since.IsZero() {
+			t.Fatalf("active lease %s = held %v since %v, want held (no idle stamp)", k, held, since)
+		}
+	}
+	saPollGPU(t, gb, 1, 1)             // B (unit) + C (queued).
+	time.Sleep(150 * time.Millisecond) // settle: C's forward at the grant.
+	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
+		t.Fatalf("smoke inFlight = %d, want 1 (B running; C budget-queued, no slot)", in)
+	}
+
+	// 8. B completes at its gate: the unit frees → C: unit + slot 1 +
+	// engine gate (kept shut). B's lease idles exactly now.
+	engine.releaseKey("B")
+	if code := <-bDone; code != 200 {
+		t.Fatalf("B = %d", code)
+	}
+	saWaitIdleLease(t, "smoke", kB)                      // B's stamp: idles exactly at exit.
+	saPollGPU(t, gb, 1, 0)                               // C holds the sole unit.
+	saPollEngineSeen(t, engine, "K", "F", "M", "B", "C") // C is at the gate.
+
+	// K completes (king, weight 0) — the budget check no longer
+	// engages for anything afterwards (t0Inflight 0), which is fine:
+	// C is already past it.
+	engine.releaseKey("K")
+	if code := <-kDone; code != 200 {
+		t.Fatalf("K = %d", code)
+	}
+
+	// 9. C completes at its gate: the FINAL accepted release. B and C
+	// leases are idle-stamped; ONE FULL TTL later, both are gone —
+	// the acceptance, not a new arrival, is what delayed them.
+	engine.releaseKey("C")
+	if code := <-cDone; code != 200 {
+		t.Fatalf("C = %d", code)
+	}
+	saWaitIdleLease(t, "smoke", kC)
+	saPollGPU(t, gb, 0, 0) // every permit released exactly once.
+	if in, _, _, _ := slots["smoke"].snapshot(); in != 0 {
+		t.Fatalf("smoke inFlight = %d, want 0", in)
+	}
+	c.Advance(ttl + 2*time.Millisecond)
+	if held, _ := sessionAdmissions["smoke"].snapshot(kB); held {
+		t.Fatal("B lease outlived its full idle TTL")
+	}
+	if held, _ := sessionAdmissions["smoke"].snapshot(kC); held {
+		t.Fatal("C lease outlived its full idle TTL")
+	}
+	saPollEngineSeen(t, engine, "K", "F", "M", "B", "C")
+	s.awaitIdle(t, 3*time.Second)
+}
+
+// TestSessionAdmission_AcceptedLifetimePrefillQueue is the dedicated
+// large-prefill-queue arm: both A requests are large (12 est. tokens >=
+// 8 threshold), so A1 holds the single dedicated prefill slot and A2 —
+// lease-admitted — is QUEUED in the prefill slot's queue behind it.
+// Far past the TTL the lease must not expire while accepted counts are
+// positive; A2 completes in the upstream gate, then the lease idles and
+// expires exactly at a full TTL from the final completion.
+func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
+	// Clock budget: the manual clock drives the production queue-wait
+	// deadlines (queueTimeout 30s) for EVERY queued request — A2's
+	// prefill-slot queue wait, C's admission queue wait. Total advances
+	// stay 2.6s, far under all armed deadlines.
+	const ttl = 200 * time.Millisecond
+	engine := newSAGateEngine()
+	withRouterEnv(t,
+		[]Backend{{
+			Name: "smoke", URL: engine.TS.URL, MaxConcurrent: 2, MaxQueueDepth: 4,
+			MaxConcurrentLargePrefill: 1, LargePrefillThresholdTokens: 8, // 1 slot, 4-deep queue
+		}},
+		map[string]int{"smoke": 2}, nil)
+	prefillSlots["smoke"] = newSlot(1, 4)
+	proxies["smoke"] = newTestProxy(engine.TS.URL)
+	saIsolate(t)
+	c := newSAManualClock()
+	// maxAdmitted = 1: C owns no lease of its own — its single slot is
+	// PERMANENTLY behind A's lease. (With 2 slots C is admitted as a
+	// distinct lease immediately and only slot-blocked — its forward
+	// then races A2's at A1's completion, and the intermediate
+	// "C must not complete" assertions go false-positive under real
+	// time.) 1 slot makes the perimeter scenario true in the first
+	// place: C stays lease-queued until A's lease idles AND expires.
+	withAdmissionEnv(t, ttl, c, 1, 4)
+	s := newSAServing()
+	// Teardown runs LIFO (last cleanup first), so register in the
+	// REVERSE of the desired shutdown order: engine gates open first
+	// (any stuck handler gets its reply immediately), then handler
+	// drain, THEN both servers close. A server Close while a handler
+	// is still mid round-trip waits in wg.Wait for a response that
+	// only releaseAll can produce — a teardown wedge.
+	t.Cleanup(func() { s.ts.Close() })
+	t.Cleanup(func() { engine.TS.Close() })
+	t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
+	t.Cleanup(func() { engine.releaseAll() })
+
+	url := s.ts.URL + "/v1/chat/completions"
+
+	// Streaming: the large-prefill slot is released on the first
+	// response byte only (no estimate timer), and the engine writes no
+	// bytes until its gate opens — the slot hold is deterministic and
+	// controlled by releaseKey below.
+	a1 := strings.Repeat("a", 48) // 12 est. tokens: large
+	done1 := make(chan int, 1)
+	go func() { code, _, _ := saPost(t, url, saChatStreamBody("smoke", "A", a1)); done1 <- code }()
+	time.Sleep(150 * time.Millisecond)
+	done2 := make(chan int, 1)
+	go func() {
+		code, _, _ := saPost(t, url, saChatStreamBody("smoke", "A", strings.Repeat("b", 48)))
+		done2 <- code
+	}()
+	time.Sleep(75 * time.Millisecond)
+	// A1 holds the sole prefill slot; A2 is lease-admitted and QUEUED
+	// in the dedicated prefill slot queue (1 slot, 4-deep queue).
+	if pin, pmax, pw, _ := prefillSlots["smoke"].snapshot(); pin != 1 || pw != 1 {
+		t.Fatalf("prefill slots = %d/%d waiting %d, want 1/%d/1", pin, pmax, pw, pmax)
+	}
+	// C is SMALL (1 est. token < threshold): it queues only on the
+	// execution slots. If C were large it would join A2 in the prefill
+	// slot queue, and the slot manager's notify is not FIFO — a later
+	// waiter can consume the single release token, holding A2's slot
+	// until C's first byte and starving A2 into its queueTimeout 429.
+	cDone := make(chan int, 1)
+	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "C", "c")); cDone <- code }()
+	time.Sleep(30 * time.Millisecond)
+	if held, _ := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "A", "smoke")); !held {
+		t.Fatal("A lease not held while accepted requests are outstanding")
+	}
+
+	// Far past the TTL with A1 accepted (engine gate), A2 accepted and
+	// stuck in the prefill slot queue behind A1's first-byte-gated
+	// hold, and C QUEUED in the admission queue (cap 1: A's lease is
+	// the only occupant): the lease must RETAIN, C must stay queued,
+	// and nothing past the first forward is new — A2 is NOT forwarded
+	// while A1's slot is held.
+	c.Advance(ttl * 10)
+	if held, _ := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "A", "smoke")); !held {
+		t.Fatal("A lease expired while accepted requests are outstanding")
+	}
+	select {
+	case <-cDone:
+		t.Fatal("newcomer C admitted while the lease is active")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := engine.Seen(); len(got) != 1 || got[0] != "A" {
+		t.Fatalf("engine seen = %v, want [A] (A2 prefill-queued is not forwarded)", got)
+	}
+
+	// A1's response byte arrives (the gate opens): its 1.2ms prefill
+	// hold has already released its slot, so A2 acquires it and advances
+	// to its own upstream gate (kept shut).
+	engine.releaseKey("A")
+	if code := <-done1; code != 200 {
+		t.Fatalf("A1 = %d", code)
+	}
+	saPollPrefillSlot(t, 1, 0) // A2's prefill acquisition + handoff
+
+	// A2 is now the ONLY accepted A request, finishing in the upstream
+	// gate. A full TTL has already elapsed since the earlier completion:
+	// still no expiry — the lease is active (count 1), not idle.
+	c.Advance(ttl + 2*time.Millisecond)
+	if held, since := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "A", "smoke")); !held || !since.IsZero() {
+		t.Fatalf("A lease = held %v idle-since %v, want active (no idle stamp)", held, since)
+	}
+	select {
+	case <-cDone:
+		t.Fatal("C admitted while A2 is still accepted (in the upstream gate)")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// A2 completes: NOW the lease idles. Full TTL from here → expiry.
+	engine.releaseKey("A") // A2's gate
+	if code := <-done2; code != 200 {
+		t.Fatalf("A2 = %d", code)
+	}
+	// A2 is the only A request finishing now and the only engine
+	// traffic admitted before A's lease expires: C is ADMISSION-queued
+	// (cap 1, A lease held), so no forward of its can exist yet.
+	saPollEngineSeen(t, engine, "A", "A")
+	saWaitIdleLease(t, "smoke", saAdmKey(t, "A", "smoke"))
+	c.Advance(ttl + 2*time.Millisecond)
+	engine.releaseKey("C")
+	select {
+	case code := <-cDone:
+		if code != 200 {
+			t.Fatalf("C = %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("C not admitted after the full idle TTL from the final completion")
+	}
+	// C is small and admission-queued the whole time: it can only
+	// forward AFTER A's lease expired, i.e. strictly after A2's
+	// forward. Order A, A, C is forced.
+	saPollEngineSeen(t, engine, "A", "A", "C")
+	s.awaitIdle(t, 3*time.Second)
+}
+
 func TestSessionAdmission_TerminalBounds(t *testing.T) {
 	const ttl = 5 * time.Second
 
@@ -1386,6 +1908,152 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 			t.Fatal("aborted request lease outlived its full idle TTL")
 		}
 	})
+
+	t.Run("backend-queue-rejection-idles-lease", func(t *testing.T) {
+		// maxConcurrent 1 + maxQueueDepth 0: the second request (same key)
+		// passes the lease gate, then is hard-rejected at the EXECUTION tier
+		// (slot full, zero queue depth, waiting 0 >= max 0 → literal
+		// "backend-queue-full"). The accepted request terminates with a
+		// rejection — its lease must live out its full idle TTL.
+		engine := newSAGateEngine()
+		withRouterEnv(t,
+			[]Backend{{Name: "bq", URL: engine.TS.URL, MaxConcurrent: 1, MaxQueueDepth: 0}},
+			map[string]int{"bq": 1}, map[string]int{"bq": 0})
+		proxies["bq"] = newTestProxy(engine.TS.URL)
+		saIsolate(t)
+		c := newSAManualClock()
+		withAdmissionEnv(t, ttl, c, 2, 2)
+		s := newSAServing()
+		t.Cleanup(func() { s.ts.Close() })
+		t.Cleanup(func() { engine.releaseAll() })
+		t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
+
+		url := s.ts.URL + "/v1/chat/completions"
+		a1Done := saPostAsync(t, url, saChatBody("bq", "E", "x"))
+		time.Sleep(150 * time.Millisecond) // A1: running slot 1, gated upstream
+		code, hdr, body := saPost(t, url, saChatBody("bq", "E", "y"))
+		if code != http.StatusTooManyRequests || hdr.Get("X-Router-Reason") != "backend-queue-full" {
+			t.Fatalf("A2 = %d %q, want 429 backend-queue-full: %s",
+				code, hdr.Get("X-Router-Reason"), body)
+		}
+		if in, _, _, _ := slots["bq"].snapshot(); in != 1 {
+			t.Fatalf("rejected A2 leaked an execution slot: inFlight=%d", in)
+		}
+		engine.releaseKey("E")
+		if c0 := <-a1Done; c0 != 200 {
+			t.Fatalf("A1 = %d", c0)
+		}
+		// Both completions are drained: the lease carries a single still-
+		// idle accepted release — nothing else may have touched it.
+		s.awaitIdle(t, 3*time.Second)
+		mgr := sessionAdmissions["bq"]
+		kE := saAdmKey(t, "E", "bq")
+		if held, since := mgr.snapshot(kE); !held || since.IsZero() {
+			t.Fatalf("rejected A2's lease = held %v since %v, want idle-holding", held, since)
+		}
+		c.Advance(ttl - time.Millisecond)
+		if held, _ := mgr.snapshot(kE); !held {
+			t.Fatal("lease vanished before its full idle TTL")
+		}
+		c.Advance(2 * time.Millisecond)
+		if held, _ := mgr.snapshot(kE); held {
+			t.Fatal("lease outlived its full idle TTL")
+		}
+	})
+
+	t.Run("unreachable-backend-idles-lease", func(t *testing.T) {
+		// Connection refused after admission: the accepted request
+		// terminates with a 503; the lease idles exactly then and
+		// expires after the full TTL.
+		dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		deadURL := dead.URL
+		dead.Close()
+		withRouterEnv(t,
+			[]Backend{{Name: "dead", URL: deadURL, MaxConcurrent: 2}},
+			map[string]int{"dead": 2}, nil)
+		proxies["dead"] = newTestProxy(deadURL)
+		saIsolate(t)
+		c := newSAManualClock()
+		withAdmissionEnv(t, ttl, c, 1, 2)
+		s := newSAServing()
+		t.Cleanup(func() { s.ts.Close() })
+		t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
+
+		url := s.ts.URL + "/v1/chat/completions"
+		code, hdr, _ := saPost(t, url, saChatBody("dead", "U", "x"))
+		if code != http.StatusServiceUnavailable || hdr.Get("X-Router-Reason") != "backend_unavailable" {
+			t.Fatalf("status = %d reason %q, want 503 backend_unavailable", code, hdr.Get("X-Router-Reason"))
+		}
+		s.awaitIdle(t, 3*time.Second)
+		mgr := sessionAdmissions["dead"]
+		kU := saAdmKey(t, "U", "dead")
+		if held, since := mgr.snapshot(kU); !held || since.IsZero() {
+			t.Fatalf("unreachable request's lease = held %v since %v, want idle-holding", held, since)
+		}
+		c.Advance(ttl - time.Millisecond)
+		if held, _ := mgr.snapshot(kU); !held {
+			t.Fatal("lease vanished before its full idle TTL")
+		}
+		c.Advance(2 * time.Millisecond)
+		if held, _ := mgr.snapshot(kU); held {
+			t.Fatal("lease outlived its full idle TTL")
+		}
+	})
+
+	t.Run("stream-truncated", func(t *testing.T) {
+		// Genuine truncation: the client receives a partial SSE stream
+		// (headers + one event + partial keepalive) and the upstream
+		// connection dies mid-response. Handler finalizes; the ticket
+		// releases exactly once and the lease expires after the TTL.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			fl, _ := w.(http.Flusher)
+			w.Write([]byte("data: {\"delta\":1}\n\n"))
+			fl.Flush()
+			time.Sleep(50 * time.Millisecond)
+			w.Write([]byte("data: keep")) // delivered by server shutdown, not flushed
+		}))
+		defer srv.Close()
+		withRouterEnv(t,
+			[]Backend{{Name: "cut2", URL: srv.URL, MaxConcurrent: 1}},
+			map[string]int{"cut2": 1}, nil)
+		proxies["cut2"] = newTestProxy(srv.URL)
+		saIsolate(t)
+		c := newSAManualClock()
+		withAdmissionEnv(t, ttl, c, 1, 2)
+		s := newSAServing()
+		t.Cleanup(func() { s.ts.Close() })
+		t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
+
+		url := s.ts.URL + "/v1/chat/completions"
+		body := `{"model":"cut2","prompt_cache_key":"ST","stream":true,"messages":[{"role":"user","content":"x"}]}`
+		resp, err := http.Post(url, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+			t.Fatalf("content-type = %q, want text/event-stream", ct)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		// Partial stream: the first event arrived, then the connection
+		// died (server shutdown) before the second one was flushed.
+		if !strings.Contains(string(got), "delta\":1") || strings.Contains(string(got), "data: [DONE]") {
+			t.Fatalf("truncated stream = %q", got)
+		}
+		// The lease idles only at handler completion; wait for drain.
+		s.awaitIdle(t, 3*time.Second)
+		mgr := sessionAdmissions["cut2"]
+		kS := saAdmKey(t, "ST", "cut2")
+		if held, since := mgr.snapshot(kS); !held || since.IsZero() {
+			t.Fatalf("truncated stream: lease = held %v since %v, want idle-holding", held, since)
+		}
+		c.Advance(ttl + 2*time.Millisecond)
+		if held, _ := mgr.snapshot(kS); held {
+			t.Fatal("truncated-stream lease outlived its full idle TTL")
+		}
+	})
 }
 
 // ─── 5. Isolation, observability, routing ─────────────────────────────────
@@ -1402,7 +2070,7 @@ func TestSessionAdmission_BackendIsolationAndQueryModelRouting(t *testing.T) {
 	saIsolate(t)
 	c := newSAManualClock()
 	withAdmissionEnv(t, ttl, c, 1, 2)
-	s := newSAServing()
+	s := newSAServingMux()
 	t.Cleanup(func() { s.ts.Close() })
 	t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
 
@@ -1432,12 +2100,32 @@ func TestSessionAdmission_BackendIsolationAndQueryModelRouting(t *testing.T) {
 	if n2 := sessionAdmissionLeaseCount(t, sessionAdmissions["b2"]); n2 != 1 {
 		t.Fatalf("b2 leases = %d, want 1 (query-model routed)", n2)
 	}
+	// The real management surface (buildMetricsMux on this listener):
+	// b2's accepted request is IN FLIGHT, so its row must report the
+	// active-hold arm — lease held with no idle stamp (idle release
+	// lands only at handler completion).
+	if row := s.saSessionRow(t, saAdmKey(t, "S", "b2")); row == nil ||
+		!row.AdmissionLease || row.AdmissionIdleSinceMs != 0 {
+		t.Fatalf("live b2 row = %+v, want admissionLease=true/0 (active)", row)
+	}
+	// b1 already completed: its row reports the idle-held arm — lease
+	// true with the manual clock's completion timestamp.
+	if row := s.saSessionRow(t, saAdmKey(t, "S", "b1")); row == nil ||
+		!row.AdmissionLease || row.AdmissionIdleSinceMs <= 0 {
+		t.Fatalf("idle b1 row = %+v, want admissionLease=true/nonce", row)
+	}
 	c.Advance(ttl + 2*time.Millisecond)
 	if held, _ := sessionAdmissions["b1"].snapshot(saAdmKey(t, "S", "b1")); held {
 		t.Fatal("b1 lease outlived its full idle TTL")
 	}
 	if held, _ := sessionAdmissions["b2"].snapshot(saAdmKey(t, "S", "b2")); !held {
 		t.Fatal("b2's active lease died under b1's expiry")
+	}
+	// Third endpoint arm: b1's lease expired on the manual clock, so its
+	// row reports the absent arm (false/0) through the live endpoint.
+	if row := s.saSessionRow(t, saAdmKey(t, "S", "b1")); row == nil ||
+		row.AdmissionLease || row.AdmissionIdleSinceMs != 0 {
+		t.Fatalf("expired b1 row = %+v, want admissionLease=false/0", row)
 	}
 
 	// Now b2 completes: ITS lease only becomes idle now, on its own clock.

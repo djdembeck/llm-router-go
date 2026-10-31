@@ -2592,6 +2592,7 @@ func loadSessionAdmissionConfig(getenv func(string) string, backends []Backend) 
 	// maxQueueDepth (0 becomes 2); explicit must be a nonnegative
 	// decimal integer. It bounds queued ADMISSION requests per backend
 	// (distinct-by-arrival), independent of execution queue depth.
+	// -1 is the inherit sentinel; resolved per backend in main().
 	explicitWaiting := -1
 	if v := getenv("SESSION_MAX_WAITING"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -2601,17 +2602,10 @@ func loadSessionAdmissionConfig(getenv func(string) string, backends []Backend) 
 		explicitWaiting = n
 	} else {
 		for _, b := range backends {
-			if mw := b.MaxQueueDepth; mw > 0 {
-				if explicitWaiting == -1 {
-					explicitWaiting = mw
-				}
-			} else if explicitWaiting == -1 {
-				explicitWaiting = 2
+			if b.MaxQueueDepth < 0 {
+				return cfg, fmt.Errorf("invalid SESSION_MAX_WAITING %q", strconv.Itoa(b.MaxQueueDepth))
 			}
 		}
-	}
-	if explicitWaiting == -1 || explicitWaiting < 0 {
-		return cfg, fmt.Errorf("invalid SESSION_MAX_WAITING %q", "")
 	}
 
 	d := 5 * time.Minute
@@ -2854,6 +2848,12 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 		a.mu.Unlock()
 		return nil, errSessionAdmissionQueueFull
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// Do not enqueue an already-cancelled request: no lease, no
+		// terminal publication; the caller returns ctx.Err immediately.
+		a.mu.Unlock()
+		return nil, ctxErr
+	}
 	w := &sessionAdmissionWaiter{
 		key:      key,
 		ctx:      ctx,
@@ -2863,23 +2863,7 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 	}
 	w.el = a.queue.PushBack(w)
 	a.waiting++
-
 	w.timer = a.clock.AfterFunc(grace, func() { a.waiterTimeout(w) })
-	select {
-	case <-ctx.Done():
-		// Do not enqueue an already-cancelled request: no lease, no
-		// terminal publication; the caller returns ctx.Err immediately.
-		a.discardWaiterLocked(w)
-		a.mu.Unlock()
-		return nil, ctx.Err()
-	default:
-		// Watch the request context: a cancelled waiter is unlinked and
-		// the next eligible waiter is served.
-		go func() {
-			<-ctx.Done()
-			a.contextCancelled(ctx, w)
-		}()
-	}
 
 	a.mu.Unlock()
 	select {
@@ -2934,17 +2918,6 @@ func (a *sessionAdmission) blockedByQueueLocked() bool {
 		}
 	}
 	return false
-}
-
-// waiterCancel watches the request context; a cancelled waiter is unlinked
-// and, if it was at the head, unblocks the next eligible waiter.
-func (a *sessionAdmission) contextCancelled(ctx context.Context, w *sessionAdmissionWaiter) {
-	a.mu.Lock()
-	if w.pending {
-		a.failWaiterLocked(w, ctx.Err())
-		a.drainLocked()
-	}
-	a.mu.Unlock()
 }
 
 func (a *sessionAdmission) waiterTimeout(w *sessionAdmissionWaiter) {
@@ -3119,19 +3092,6 @@ func (a *sessionAdmission) failWaiterLocked(w *sessionAdmissionWaiter, err error
 	}
 }
 
-// discardWaiterLocked is the variant for a waiter that never became
-// publishable (context already done at enqueue time).
-func (a *sessionAdmission) discardWaiterLocked(w *sessionAdmissionWaiter) {
-	if w.el != nil {
-		a.queue.Remove(w.el)
-	}
-	w.pending = false
-	if w.timer != nil {
-		w.timer.Stop()
-	}
-	a.waiting--
-}
-
 // rearmIdleLocked arms the full-ttl expiry callback for the given lease;
 // the lease pointer and generation are captured so stale callbacks no-op.
 func (a *sessionAdmission) rearmIdleLocked(l *sessionAdmissionLease) {
@@ -3299,9 +3259,16 @@ func main() {
 			if cap <= 0 {
 				cap = b.MaxConcurrent // loader guarantees positive here
 			}
-			sessionAdmissions[b.Name] = newSessionAdmission(cap, admissionCfg.MaxWaiting, admissionCfg.IdleTTL, nil)
+			waiting := admissionCfg.MaxWaiting
+			if waiting < 0 {
+				waiting = b.MaxQueueDepth
+				if waiting == 0 {
+					waiting = 2
+				}
+			}
+			sessionAdmissions[b.Name] = newSessionAdmission(cap, waiting, admissionCfg.IdleTTL, nil)
 			log.Printf("  session admission: %s cap=%d waiting=%d ttl=%s keySource=%s",
-				b.Name, cap, admissionCfg.MaxWaiting, admissionCfg.IdleTTL, admissionCfg.KeySource)
+				b.Name, cap, waiting, admissionCfg.IdleTTL, admissionCfg.KeySource)
 		}
 	}
 
@@ -5349,16 +5316,17 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			admitStart := time.Now()
 			ticket, aerr := mgr.acquire(r.Context(), admKey, queueTimeout)
 			if aerr != nil {
+				if r.Context().Err() != nil {
+					// Cancellation wins over any concurrent queue deadline:
+					// 499, recorded only — never write to a closed client
+					// and never enter downstream admission.
+					recordRejection(499)
+					return
+				}
 				status := http.StatusTooManyRequests
 				reason := "session-admission-queue-full"
 				if errors.Is(aerr, errSessionAdmissionTimeout) {
 					reason = "session-admission-timeout"
-				} else if r.Context().Err() != nil {
-					// Cancellation: 499, recorded only — never write to a
-					// closed client and never enter downstream admission.
-					status = 499
-					recordRejection(status)
-					return
 				} else {
 					// A non-admission error cannot happen here (the manager
 					// returns only the two sentinels or ctx.Err); treat it
