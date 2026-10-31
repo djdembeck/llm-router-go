@@ -399,7 +399,7 @@ moved, and is reused if a release is re-run for the same source.
   accepted after provenance verification; the release workflow is the sole writer of versioned
   images, while CI publishes branch/preview tags only.
 
-Retry the original run to retain its frozen source after main advances. Automatic and manual runs share the non-cancelling native GitHub `queue: max` (up to 100 pending runs); manual-only installations remove the push trigger once. The actual router startup log consumes the selected version and separate source SHA; unconfigured builds report dev/unknown. No source version commits or merge-back are performed, and no mutable latest/major/minor aliases are written. Main protection remains unchanged; develop keeps required CI without base freshness.
+Retry the original run to retain its frozen source after main advances. Automatic and manual runs share the non-cancelling native GitHub `queue: max` (up to 100 pending runs); manual-only installations remove the push trigger once. The actual router startup log consumes the selected version and separate source SHA; unconfigured builds report dev/unknown. No source version commits or merge-back are performed, and no mutable Docker `latest`/major/minor aliases are written. GitHub's *Latest* release label is independent of Docker aliases: it advances only for a new highest published stable semver release, and completing a delayed lower version never rolls it back. Main protection remains unchanged; develop keeps required CI without base freshness.
 
 ## Building
 

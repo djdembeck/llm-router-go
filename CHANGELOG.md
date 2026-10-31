@@ -4,7 +4,8 @@
 
 ### Bug Fixes
 
-* **release:** never ship a release image from a foreign commit — the release build step verifies the version tag points at the run's commit (ancestor tag skips, foreign tag fails) instead of trusting image existence, and CI no longer cuts `type=semver` release tags on plain main pushes
+* **release:** finalize drafts from the authenticated release listing — `GET releases/tags/{tag}` is a published-release lookup, so the draft create/reuse/publish cycle now matches the paginated authenticated listing by exact `tag_name` (duplicates fail closed, listing auth/server failures propagate without creating) and publishes with `--latest` computed from published non-prerelease semver records so a delayed lower release never rolls back GitHub Latest
+* **release:** keep registry command output in CI errors — failing `docker buildx` invocations now surface their captured stdout and stderr in the CLI error while preserving the manifest-not-found vs auth/transport distinction
 * **ci:** pin the CI build job to the canonical `Build` check-run name — main's required status checks match that exact name, so `Build (web + Go)` would strand every `develop → main` PR waiting for a context that never reports
 * **release:** ops-only commits must never cut a release — `paths-ignore` gains `renovate.json5`, and Renovate's commit prefix is restored to `ci(deps): `
 * **metrics:** retire live requests, release prefill slots, and record request outcomes even when a proxy stream aborts or the client disconnects; preserve HTTP abort behavior instead of leaving phantom sessions

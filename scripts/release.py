@@ -181,36 +181,72 @@ class Repository:
                     "Concurrent reservation points at a different source")
         return tag
 
+    def release_records(self, repository):
+        """Complete authenticated release listing; drafts included, errors propagate.
+
+        GET releases/tags/{tag} is a published-release lookup only, so every
+        draft lifecycle caller must use the paginated listing instead."""
+        records, page = [], 1
+        while True:
+            batch = self.api(f"repos/{repository}/releases?per_page=100&page={page}")
+            require(isinstance(batch, list), f"Unexpected release listing response on page {page}")
+            records.extend(batch)
+            if len(batch) < 100:
+                return records
+            page += 1
+
     def release(self, tag, source, publish=False):
         semver(tag.removeprefix("v"))
         require(isinstance(source, str) and OID.fullmatch(source), "Expected a full commit object ID")
         repository = self.repository()
         require(self.api_tag_target(tag) == source, f"Tag {tag} does not point at the frozen source")
-        try:
-            existing = self.api(f"repos/{repository}/releases/tags/{tag}")
-        except ReleaseError as error:
-            require("HTTP 404" in str(error), str(error))
+        existing = [record for record in self.release_records(repository) if record.get("tag_name") == tag]
+        require(len(existing) <= 1, f"Multiple release records share tag {tag}; failing closed")
+        if not existing:
             require(not publish, "Cannot finalize a missing draft release")
             self.run("gh", "release", "create", tag, "--repo", repository, "--verify-tag", "--draft", "--title", f"Release {tag}", "--notes", "")
             return
-        require(existing["tag_name"] == tag, "Release identity mismatch")
+        existing = existing[0]
         if publish and existing.get("draft"):
-            self.run("gh", "release", "edit", tag, "--repo", repository, "--draft=false", "--latest=false")
+            target = semver(tag.removeprefix("v"))
+            higher_published = any(
+                not record.get("draft") and not record.get("prerelease")
+                and VERSION.fullmatch(str(record.get("tag_name", "")).removeprefix("v"))
+                and semver(str(record.get("tag_name", "")).removeprefix("v")) > target
+                for record in self.release_records(repository))
+            # GitHub Latest is independent of Docker aliases: a new highest
+            # stable release must advance it; a delayed lower release must not
+            # roll it back. Tags outside the numeric X.Y.Z grammar never claim Latest.
+            self.run("gh", "release", "edit", tag, "--repo", repository, "--draft=false",
+                     f"--latest={'true' if not higher_published else 'false'}")
 
 
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
+class RegistryCommandError(ReleaseError):
+    """Failing registry command; captured stdout and stderr reach the CLI error output."""
+
+    def __init__(self, error):
+        self.streams = " ".join(part for part in (
+            (error.stderr or b"").decode(errors="replace").strip(),
+            (error.stdout or b"").decode(errors="replace").strip()) if part)
+        super().__init__(f"registry command failed (exit {error.returncode}): {self.streams}")
+
+
 def registry_run(*args):
-    return subprocess.run(args, check=True, capture_output=True).stdout
+    try:
+        return subprocess.run(args, check=True, capture_output=True).stdout
+    except subprocess.CalledProcessError as error:
+        raise RegistryCommandError(error) from None
 
 
 def inspect(ref, field="Manifest", missing=False):
     try:
         return json.loads(registry_run("docker", "buildx", "imagetools", "inspect", ref,
                               "--format", "{{json ." + field + "}}"))
-    except subprocess.CalledProcessError as error:
-        message = error.stderr.decode(errors="replace").lower()
+    except RegistryCommandError as error:
+        message = error.streams.lower()
         # Only an explicit registry manifest-not-found response permits creation.
         # Authentication, transport, throttling and malformed responses fail closed.
         absent = "manifest unknown" in message or f"{ref.lower()}: not found" in message
