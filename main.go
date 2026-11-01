@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/gob"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"os"
 	"os/signal"
@@ -56,6 +60,10 @@ type parsedBody struct {
 	Messages []rawMessage    `json:"messages"`
 	Prompt   json.RawMessage `json:"prompt"`
 	Stream   bool            `json:"stream"`
+	// Optional stable conversation identities (raw: a new non-string
+	// identity value must not break decoding of unrelated fields).
+	PromptCacheKey json.RawMessage `json:"prompt_cache_key"`
+	User           json.RawMessage `json:"user"`
 }
 
 // ─── Per-backend slot manager ─────────────────────────────────────────────
@@ -2149,6 +2157,12 @@ type sessFrame struct {
 	TokOutTotal int64          `json:"tokOutTotal"`
 	LastStatus  int            `json:"lastStatus"`
 	Reqs        []sessReqFrame `json:"reqs"` // nil unless active+recent+top-20
+	// AdmissionLease: the conversation currently holds a bounded admission
+	// lease (active/accepted-queued = idleSince 0; idle = full-TTL
+	// retention in progress, idleSinceMs = clock time). Absent/expired/
+	// unkeyed/off = false/0. Both fields are always present.
+	AdmissionLease       bool  `json:"admissionLease"`
+	AdmissionIdleSinceMs int64 `json:"admissionIdleSinceMs"`
 }
 
 type sessionsFeed struct {
@@ -2352,7 +2366,9 @@ func (r *sessionRegistry) finishRejection(backend, path, sess string, ctxTok, ne
 // active+recent sessions among the first 20.
 func (r *sessionRegistry) feed() sessionsFeed {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	// NOTE: a single explicit Unlock below — the live/session assembly
+	// runs locked, the lease snapshots (which lock the admission
+	// managers) run UNlocked. No early returns in between.
 	nowMs := time.Now().UnixMilli()
 
 	live := make([]sessLiveFrame, 0, len(r.live))
@@ -2471,6 +2487,27 @@ func (r *sessionRegistry) feed() sessionsFeed {
 		}
 		out = append(out, f)
 	}
+	r.mu.Unlock()
+
+	// Lease status comes from the admission managers, never from this
+	// registry: the bounded live map above may evict records and queued
+	// accepted requests are absent from it entirely, but the lease map is
+	// authoritative. Unlock the registry first so snapshot (which locks
+	// the manager) cannot interleave registry mutation order. Out of
+	// scope: unkeyed/off rows and backends without a manager stay
+	// false/0. This endpoint is a bounded feed, not a lease inventory.
+	for i := range out {
+		mgr, ok := sessionAdmissions[out[i].Backend]
+		if !ok || mgr == nil {
+			continue
+		}
+		if held, idleSince := mgr.snapshot(out[i].ID); held {
+			out[i].AdmissionLease = true
+			if idleSince.UnixMilli() > 0 {
+				out[i].AdmissionIdleSinceMs = idleSince.UnixMilli()
+			}
+		}
+	}
 	return sessionsFeed{T: nowMs, Live: live, Sessions: out}
 }
 
@@ -2502,8 +2539,612 @@ func sessionKeyFor(parsed *parsedBody) string {
 	return fmt.Sprintf("%x", h.Sum(nil))[:12]
 }
 
-// estimateCtxTokens estimates the conversation context (all messages, or
-// the prompt) in tokens, ~4 bytes/token.
+// ─── TTL-bounded session admission ────────────────────────────────────────
+//
+// Stable per-backend conversation leases retain a bounded admitted set
+// across idle gaps: a conversation that completed (or was terminated)
+// holds its admission slot for SESSION_IDLE_TTL before newcomers may take
+// it. Disabled (SESSION_ADMISSION unset) and unkeyed traffic keep the
+// legacy per-request behavior exactly.
+
+type sessionAdmissionConfig struct {
+	Enabled     bool
+	MaxAdmitted int // per-backend cap; 0 until resolved by the loader
+	MaxWaiting  int // distinct-by-arrival queue bound per backend; 0 = reject newcomers
+	IdleTTL     time.Duration
+	KeySource   string // canonical: prompt_cache_key | user | header:<Name>
+	// keyName is the selected header name when KeySource is header:<Name>.
+	keyName string
+}
+
+// loadSessionAdmissionConfig parses the SESSION_* environment. The enabled
+// flag short-circuits: when off, nothing else is parsed, no managers exist.
+func loadSessionAdmissionConfig(getenv func(string) string, backends []Backend) (sessionAdmissionConfig, error) {
+	var cfg sessionAdmissionConfig
+
+	switch v := getenv("SESSION_ADMISSION"); v {
+	case "", "off":
+		return cfg, nil
+	case "on":
+		cfg.Enabled = true
+	default:
+		return cfg, fmt.Errorf("invalid SESSION_ADMISSION %q", v)
+	}
+
+	// SESSION_MAX_ADMITTED: empty inherits each backend's positive
+	// maxConcurrent; explicit must be a positive decimal integer.
+	explicitCap := 0
+	if v := getenv("SESSION_MAX_ADMITTED"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return cfg, fmt.Errorf("invalid SESSION_MAX_ADMITTED %q", v)
+		}
+		explicitCap = n
+	}
+	for _, b := range backends {
+		if explicitCap > 0 {
+			continue
+		}
+		if b.MaxConcurrent <= 0 {
+			return cfg, fmt.Errorf("SESSION_MAX_ADMITTED is required for backend %q with unlimited maxConcurrent", b.Name)
+		}
+	}
+
+	// SESSION_MAX_WAITING: empty inherits each backend's effective
+	// maxQueueDepth (0 becomes 2); explicit must be a nonnegative
+	// decimal integer. It bounds queued ADMISSION requests per backend
+	// (distinct-by-arrival), independent of execution queue depth.
+	// -1 is the inherit sentinel; resolved per backend in main().
+	explicitWaiting := -1
+	if v := getenv("SESSION_MAX_WAITING"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return cfg, fmt.Errorf("invalid SESSION_MAX_WAITING %q", v)
+		}
+		explicitWaiting = n
+	} else {
+		for _, b := range backends {
+			if b.MaxQueueDepth < 0 {
+				return cfg, fmt.Errorf("invalid SESSION_MAX_WAITING %q", strconv.Itoa(b.MaxQueueDepth))
+			}
+		}
+	}
+
+	d := 5 * time.Minute
+	if v := getenv("SESSION_IDLE_TTL"); v != "" {
+		pd, err := time.ParseDuration(v)
+		if err != nil || pd <= 0 {
+			return cfg, fmt.Errorf("invalid SESSION_IDLE_TTL %q", v)
+		}
+		d = pd
+	}
+
+	switch src := getenv("SESSION_KEY_SOURCE"); src {
+	case "":
+		cfg.KeySource = "prompt_cache_key"
+	case "prompt_cache_key", "user":
+		cfg.KeySource = src
+	case "header:":
+		return cfg, fmt.Errorf("invalid SESSION_KEY_SOURCE %q", src)
+	default:
+		if strings.HasPrefix(src, "header:") {
+			name := strings.TrimPrefix(src, "header:")
+			if !isHTTPHeaderToken(name) {
+				return cfg, fmt.Errorf("invalid SESSION_KEY_SOURCE %q", src)
+			}
+			// Lookup is case-insensitive (standard HTTP header API); the
+			// canonical form canonicalizes KEY inside the hashed source.
+			cfg.KeySource = "header:" + textproto.CanonicalMIMEHeaderKey(name)
+			cfg.keyName = textproto.CanonicalMIMEHeaderKey(name)
+		} else {
+			return cfg, fmt.Errorf("invalid SESSION_KEY_SOURCE %q", src)
+		}
+	}
+
+	cfg.MaxAdmitted = explicitCap // 0 → resolved per backend in main
+	cfg.MaxWaiting = explicitWaiting
+	cfg.IdleTTL = d
+	return cfg, nil
+}
+
+// isHTTPHeaderToken reports whether name is a nonempty ASCII HTTP token.
+func isHTTPHeaderToken(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// rawStringIdentity decodes a raw JSON field and returns its exact string
+// value when it is a non-whitespace JSON string; "" otherwise. Raw fields
+// keep a wrong-type/new-shape value from breaking request decoding.
+func rawStringIdentity(raw json.RawMessage) string {
+	if len(raw) == 0 || raw[0] != '"' {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	return s
+}
+
+// admissionKeyFor returns the opaque backend-scoped lease ID for a request
+// or "" when no usable identity exists (off, unkeyed, or missing key).
+// Identity is the exact decoded string (no trim/case-fold), framed with the
+// backend name and selected source; selection is by priority: a usable
+// prompt_cache_key always wins, then the configured fallback (user field or
+// header). Nothing falls back implicitly to message content.
+func admissionKeyFor(parsed *parsedBody, r *http.Request, backend, source, headerName string) string {
+	sourceUsed, key := "", ""
+	if k := rawStringIdentity(parsed.PromptCacheKey); k != "" {
+		sourceUsed, key = "prompt_cache_key", k
+	} else if source == "user" {
+		if k := rawStringIdentity(parsed.User); k != "" {
+			sourceUsed, key = "user", k
+		}
+	} else if source == "header:"+headerName {
+		if k := r.Header.Get(headerName); k != "" && strings.TrimSpace(k) != "" {
+			sourceUsed, key = source, k
+		}
+	}
+	if key == "" {
+		return ""
+	}
+	// Length-framed sha256 (sessionKeyFor's framing pattern), hashed
+	// incrementally: no second body-sized copy is built.
+	h := sha256.New()
+	frame := func(v string) {
+		fmt.Fprintf(h, "%d:", len(v))
+		h.Write([]byte(v))
+	}
+	frame(backend)
+	frame(sourceUsed)
+	frame(key)
+	return "sa:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// admissionClock / admissionTimer make the lease TTL and waiter deadlines
+// controllable in tests. Production delegates to time.
+type admissionTimer interface{ Stop() bool }
+
+type admissionClock interface {
+	Now() time.Time
+	AfterFunc(d time.Duration, f func()) admissionTimer
+}
+
+type productionAdmissionClock struct{}
+
+func (productionAdmissionClock) Now() time.Time { return time.Now() }
+func (productionAdmissionClock) AfterFunc(d time.Duration, f func()) admissionTimer {
+	return time.AfterFunc(d, f)
+}
+
+var (
+	sessionAdmissionSettings sessionAdmissionConfig
+	sessionAdmissions        map[string]*sessionAdmission // per resolved backend name
+)
+
+var (
+	errSessionAdmissionQueueFull = errors.New("session admission queue full")
+	errSessionAdmissionTimeout   = errors.New("session admission timeout")
+)
+
+// sessionAdmissionLease is one admitted identity's accepted set.
+type sessionAdmissionLease struct {
+	key       string
+	count     int // accepted non-terminating requests currently holding the lease
+	idle      bool
+	idleSince time.Time // set when count reaches 0; meaningful only when idle
+	gen       uint64    // bumped by every expiry/rearm; stale callbacks are dropped
+	timer     admissionTimer
+}
+
+// sessionAdmissionWaiter is one queued admission request, FIFO-ordered.
+type sessionAdmissionWaiter struct {
+	key      string
+	ctx      context.Context
+	deadline time.Time  // absolute deadline (arrival + grace)
+	result   chan error // exactly one terminal result
+	el       *list.Element
+	pending  bool
+	timer    admissionTimer
+	ticket   *sessionAdmissionTicket // set under mu when a grant is published
+}
+
+// sessionAdmission is the bounded per-backend lease gate: a lease map
+// (authoritative for capacity) plus a strict-FIFO queue of blocked
+// arrivals. All state moves under mu; timers carry the lease pointer and
+// generation so stale callbacks can no-op.
+type sessionAdmission struct {
+	mu          sync.Mutex
+	maxAdmitted int
+	maxWaiting  int
+	ttl         time.Duration
+	clock       admissionClock
+	leaseMap    map[string]*sessionAdmissionLease
+	queue       *list.List
+	waiting     int
+}
+
+func newSessionAdmission(maxAdmitted, maxWaiting int, ttl time.Duration, clock admissionClock) *sessionAdmission {
+	if clock == nil {
+		clock = productionAdmissionClock{}
+	}
+	return &sessionAdmission{
+		maxAdmitted: maxAdmitted,
+		maxWaiting:  maxWaiting,
+		ttl:         ttl,
+		clock:       clock,
+		leaseMap:    map[string]*sessionAdmissionLease{},
+		queue:       list.New(),
+	}
+}
+
+// acquire blocks until the identity holds a lease, the queue is full, the
+// grace deadline passes, or the context is cancelled. grace <= 0 permits an
+// immediately eligible acquisition and never queues.
+func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.Duration) (*sessionAdmissionTicket, error) {
+	a.mu.Lock()
+	if ctx.Err() != nil {
+		a.mu.Unlock()
+		return nil, ctx.Err()
+	}
+	a.pruneIdleLocked()
+	a.drainLocked()
+
+	// Existing identity: the lease is held regardless of remaining
+	// capacity — retention is the point, and it may arrive even while
+	// newcomers are queued. A DUE idle lease has no retained preference:
+	// prune it and proceed as a fresh admission (it cannot bypass
+	// currently-eligible queued newcomers added afterwards).
+	existing := (*sessionAdmissionLease)(nil)
+	if l, ok := a.leaseMap[key]; ok {
+		if l.idle && !a.clock.Now().Before(l.idleSince.Add(a.ttl)) {
+			if l.timer != nil {
+				l.timer.Stop()
+			}
+			delete(a.leaseMap, key)
+		} else {
+			existing = l
+		}
+	}
+	if existing != nil {
+		existing.count++
+		existing.idle = false
+		existing.idleSince = time.Time{}
+		if existing.timer != nil {
+			existing.timer.Stop()
+			existing.timer = nil
+		}
+		t := ticketFor(a, existing)
+		a.mu.Unlock()
+		return t, nil
+	}
+
+	// Fresh identity: admit now only when capacity exists AND no earlier
+	// eligible newcomer (still queued, no lease of its own) is bypassed.
+	if len(a.leaseMap) < a.maxAdmitted && !a.blockedByQueueLocked() {
+		if ctx.Err() == nil {
+			l := &sessionAdmissionLease{key: key, count: 1}
+			a.leaseMap[key] = l
+			t := ticketFor(a, l)
+			a.mu.Unlock()
+			return t, nil
+		}
+	}
+
+	// Enqueue at the FIFO tail, or reject.
+	if a.waiting >= a.maxWaiting || grace <= 0 {
+		a.mu.Unlock()
+		return nil, errSessionAdmissionQueueFull
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// Do not enqueue an already-cancelled request: no lease, no
+		// terminal publication; the caller returns ctx.Err immediately.
+		a.mu.Unlock()
+		return nil, ctxErr
+	}
+	w := &sessionAdmissionWaiter{
+		key:      key,
+		ctx:      ctx,
+		deadline: a.clock.Now().Add(grace),
+		result:   make(chan error, 1),
+		pending:  true,
+	}
+	w.el = a.queue.PushBack(w)
+	a.waiting++
+	w.timer = a.clock.AfterFunc(grace, func() { a.waiterTimeout(w) })
+
+	a.mu.Unlock()
+	select {
+	case err := <-w.result:
+		if err != nil {
+			return nil, err
+		}
+		// Race: the grant was published, then the context cancelled
+		// before this goroutine woke. Release the ticket exactly once.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			w.ticket.release()
+			return nil, ctxErr
+		}
+		return w.ticket, nil
+	case <-ctx.Done():
+		a.mu.Lock()
+		cancelErr := ctx.Err()
+		wasPending := w.pending
+		t := w.ticket
+		if wasPending {
+			a.failWaiterLocked(w, cancelErr)
+			a.drainLocked()
+		} else if t != nil {
+			// The grant raced the cancellation: the waiter is already
+			// unlinked; retire the published ticket exactly once.
+			w.ticket = nil
+			a.drainLocked()
+		}
+		a.mu.Unlock()
+		if t != nil {
+			t.release()
+		}
+		return nil, cancelErr
+	}
+}
+
+// blockedByQueueLocked reports whether a fresh arrival would bypass an
+// earlier queued newcomer: some pending, live, unexpired waiter that does
+// not already hold a lease (it blocks only while capacity is exhausted).
+func (a *sessionAdmission) blockedByQueueLocked() bool {
+	now := a.clock.Now()
+	for e := a.queue.Front(); e != nil; e = e.Next() {
+		w := e.Value.(*sessionAdmissionWaiter)
+		if !w.pending {
+			continue
+		}
+		if w.ctx.Err() != nil || !now.Before(w.deadline) {
+			continue // dead; purged on the settle pass
+		}
+		if _, held := a.leaseMap[w.key]; !held {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *sessionAdmission) waiterTimeout(w *sessionAdmissionWaiter) {
+	a.mu.Lock()
+	if w.pending {
+		a.failWaiterLocked(w, errSessionAdmissionTimeout)
+		a.drainLocked()
+	}
+	a.mu.Unlock()
+}
+
+// ticketFor ties a lease to a one-release ticket.
+func ticketFor(a *sessionAdmission, l *sessionAdmissionLease) *sessionAdmissionTicket {
+	return &sessionAdmissionTicket{mgr: a, lease: l}
+}
+
+// sessionAdmissionTicket is a single admission grant; release is once-guarded.
+type sessionAdmissionTicket struct {
+	mgr   *sessionAdmission
+	lease *sessionAdmissionLease
+	once  sync.Once
+}
+
+// release returns the lease's accepted count by one; the final release of
+// an identity starts its full-TTL idle expiry. Never starts, stops, or
+// consults anything outside the manager: registry and router globals are
+// deliberately out of reach (lease authority is independent of LiveN).
+func (t *sessionAdmissionTicket) release() {
+	if t == nil || t.mgr == nil {
+		return
+	}
+	t.once.Do(func() {
+		a := t.mgr
+		a.mu.Lock()
+		a.releaseLocked(t.lease)
+		a.mu.Unlock()
+	})
+}
+
+// releaseLocked decrements the accepted count; on the final release it arms
+// the idle expiry. Caller holds mu.
+func (a *sessionAdmission) releaseLocked(l *sessionAdmissionLease) {
+	if l.count > 0 {
+		l.count--
+	}
+	if l.count > 0 {
+		return // accepted count still positive: no TTL
+	}
+	l.idle = true
+	l.idleSince = a.clock.Now()
+	l.gen++
+	a.rearmIdleLocked(l)
+	// A newly idle lease may unblock nothing directly (the queue drains on
+	// any terminal path). drainLocked is a no-op when nothing is eligible.
+	a.drainLocked()
+}
+
+// pruneIdleLocked removes every due idle lease (count 0, now >= idleSince+ttl)
+// under the same lock the arrivals make their grants.
+func (a *sessionAdmission) pruneIdleLocked() {
+	now := a.clock.Now()
+	for k, l := range a.leaseMap {
+		if !l.idle {
+			continue
+		}
+		if now.Sub(l.idleSince) >= a.ttl {
+			if l.timer != nil {
+				l.timer.Stop()
+			}
+			delete(a.leaseMap, k)
+		}
+	}
+}
+
+// drainLocked walks the FIFO in arrival order, granting every eligible
+// waiter: an existing (unexpired) lease grants regardless of remaining
+// identity capacity; a new identity grants only when capacity exists. An
+// ineligible waiter blocks only itself — a later waiter for the same
+// identity remains eligible behind it. Modifying the list while ranging
+// over Start requires re-resolving Front after each removal.
+func (a *sessionAdmission) drainLocked() {
+	for front := a.queue.Front(); front != nil; {
+		w := front.Value.(*sessionAdmissionWaiter)
+		if !w.pending {
+			// Already terminal (cancellation lost the race with a
+			// published grant): unlink and continue.
+			a.queue.Remove(front)
+			front = a.queue.Front()
+			continue
+		}
+		// Cancellation / deadline: unlink, terminate, continue.
+		if ctxErr := w.ctx.Err(); ctxErr != nil {
+			a.failWaiterLocked(w, ctxErr)
+			front = a.queue.Front()
+			continue
+		}
+		if !a.clock.Now().Before(w.deadline) {
+			// Deadline reached: queue timeout (not admitted).
+			a.failWaiterLocked(w, errSessionAdmissionTimeout)
+			front = a.queue.Front()
+			continue
+		}
+		// Grant decision: an existing (unexpired) lease turns around
+		// immediately; a new identity needs a free identity slot.
+		if l, ok := a.leaseMap[w.key]; ok {
+			if l.idle && !a.clock.Now().Before(l.idleSince.Add(a.ttl)) {
+				// Idle lease due: prune it in place; re-decide below as a
+				// new identity.
+				if l.timer != nil {
+					l.timer.Stop()
+				}
+				delete(a.leaseMap, w.key)
+			} else {
+				a.queue.Remove(front)
+				a.grantWaiterLocked(w, l)
+				front = a.queue.Front()
+				continue
+			}
+		}
+		if len(a.leaseMap) < a.maxAdmitted {
+			a.queue.Remove(front)
+			// grantWaiterLocked bumps count to 1: start at 0 so the
+			// grant's single ticket balances.
+			l := &sessionAdmissionLease{key: w.key}
+			a.leaseMap[w.key] = l
+			a.grantWaiterLocked(w, l)
+			front = a.queue.Front()
+			continue
+		}
+		// Blocked here: no lease and identity capacity exhausted. A LATER
+		// waiter for an already-leased identity remains eligible behind
+		// this one, so keep scanning.
+		front = front.Next()
+	}
+}
+
+// grantWaiterLocked publishes the grant and the ticket atomically under mu,
+// then wakes the waiter. The count/ticket is held BEFORE publication so a
+// cancelled acquire walks the once-release path exactly once.
+func (a *sessionAdmission) grantWaiterLocked(w *sessionAdmissionWaiter, l *sessionAdmissionLease) {
+	l.count++
+	l.idle = false
+	l.idleSince = time.Time{}
+	if l.timer != nil {
+		l.timer.Stop()
+	}
+	w.ticket = ticketFor(a, l)
+	w.pending = false
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	a.waiting--
+	select {
+	case w.result <- nil:
+	default:
+		// Already consumed: the acquire goroutine saw ctx.Done racing the
+		// grant and released w.ticket exactly once on its own path.
+	}
+}
+
+// failWaiterLocked terminates a pending waiter with an error and unlinks it.
+func (a *sessionAdmission) failWaiterLocked(w *sessionAdmissionWaiter, err error) {
+	a.queue.Remove(w.el)
+	w.pending = false
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	a.waiting--
+	select {
+	case w.result <- err:
+	default:
+	}
+}
+
+// rearmIdleLocked arms the full-ttl expiry callback for the given lease;
+// the lease pointer and generation are captured so stale callbacks no-op.
+func (a *sessionAdmission) rearmIdleLocked(l *sessionAdmissionLease) {
+	gen := l.gen
+	l.timer = a.clock.AfterFunc(a.ttl, func() { a.idleExpiry(l, gen) })
+}
+
+// idleExpiry is the sole expiry driver: this timer — not new traffic and
+// not metrics polling — wakes the queue when an idle lease's full TTL
+// elapses.
+func (a *sessionAdmission) idleExpiry(lease *sessionAdmissionLease, gen uint64) {
+	a.mu.Lock()
+	cur, ok := a.leaseMap[lease.key]
+	// Same lease, same generation, still idle, full TTL elapsed: due.
+	// Stale callbacks (reactivated/rearmed lease or already pruned) do
+	// nothing.
+	if !ok || cur != lease || lease.gen != gen || !lease.idle {
+		a.mu.Unlock()
+		return
+	}
+	if a.clock.Now().Sub(lease.idleSince) < a.ttl {
+		// Invoked early (remaining-duration rearm): arm for the rest.
+		rem := a.ttl - a.clock.Now().Sub(lease.idleSince)
+		if rem > 0 {
+			lease.timer = a.clock.AfterFunc(rem, func() { a.idleExpiry(lease, lease.gen) })
+			a.mu.Unlock()
+			return
+		}
+	}
+	delete(a.leaseMap, lease.key)
+	lease.timer = nil
+	a.drainLocked()
+	a.mu.Unlock()
+}
+
+// snapshot is the registry-side read: does this key currently hold a
+// lease, active or idle?
+func (a *sessionAdmission) snapshot(key string) (held bool, idleSince time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	l, ok := a.leaseMap[key]
+	if !ok || l.count == 0 && !l.idle {
+		return false, time.Time{}
+	}
+	if l.idle {
+		return true, l.idleSince
+	}
+	return true, time.Time{}
+}
+
+// estimateCtxTokens estimates the conversation context (all messages, or the prompt) in tokens, ~4 bytes/token.
 func estimateCtxTokens(parsed *parsedBody) int {
 	if len(parsed.Messages) > 0 {
 		chars := 0
@@ -2551,6 +3192,75 @@ func tier0Inflight() int32 {
 		}
 	}
 	return total
+}
+
+// metricsAllowedHosts gates the management listener (DNS-rebinding guard).
+// Default: the loopback hosts. METRICS_ALLOWED_HOSTS overrides with a
+// comma-separated list; empty entries are dropped.
+var metricsAllowedHosts = map[string]bool{
+	"127.0.0.1": true,
+	"::1":       true,
+	"localhost": true,
+}
+
+// loadMetricsAllowedHosts parses METRICS_ALLOWED_HOSTS into the Host
+// allowlist for the management listener, validating like the SESSION_*
+// knobs: an explicit value that names no valid Host fails startup.
+// Comma-separated plain Host values (no port, no wildcard); empty
+// string = keep the default loopback allowlist.
+func loadMetricsAllowedHosts(v string) (map[string]bool, error) {
+	if v == "" {
+		return map[string]bool{"127.0.0.1": true, "::1": true, "localhost": true}, nil
+	}
+	hosts := map[string]bool{}
+	for _, h := range strings.Split(v, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(h); err == nil {
+			if host == "" {
+				return nil, fmt.Errorf("invalid METRICS_ALLOWED_HOSTS %q: empty host", v)
+			}
+			h = host
+		}
+		if strings.ContainsAny(h, "* ") {
+			return nil, fmt.Errorf("invalid METRICS_ALLOWED_HOSTS %q: wildcards/spaces not allowed", v)
+		}
+		hosts[normalizeHost(h)] = true
+	}
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("invalid METRICS_ALLOWED_HOSTS %q: no hosts", v)
+	}
+	return hosts, nil
+}
+
+// normalizeHost canonicalizes a Host value for allowlist comparison:
+// hostnames are case-insensitive (lowercase), and bracketed IPv6 literals
+// ("[::1]") are compared bare ("::1").
+func normalizeHost(h string) string {
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	return strings.ToLower(h)
+}
+
+// metricsHostGuard wraps the entire management mux: requests whose Host
+// header (the host part, port stripped) is not in the allowlist get 403.
+// This is the DNS-rebinding guard — a rebinding domain answers requests
+// carrying a non-loopback Host, even against a loopback bind.
+func metricsHostGuard(allowed map[string]bool, next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host := normalizeHost(r.Host)
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = normalizeHost(h)
+		}
+		if !allowed[host] {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
 }
 
 // buildMux assembles the router's external route table. /v1/ is the proxy
@@ -2680,6 +3390,31 @@ func main() {
 	if qt := os.Getenv("MAX_QUEUE_TIMEOUT"); qt != "" {
 		if d, err := time.ParseDuration(qt); err == nil {
 			queueTimeout = d
+		}
+	}
+
+	admissionCfg, err := loadSessionAdmissionConfig(os.Getenv, backends)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	sessionAdmissionSettings = admissionCfg
+	if admissionCfg.Enabled {
+		sessionAdmissions = make(map[string]*sessionAdmission)
+		for _, b := range backends {
+			cap := admissionCfg.MaxAdmitted
+			if cap <= 0 {
+				cap = b.MaxConcurrent // loader guarantees positive here
+			}
+			waiting := admissionCfg.MaxWaiting
+			if waiting < 0 {
+				waiting = b.MaxQueueDepth
+				if waiting == 0 {
+					waiting = 2
+				}
+			}
+			sessionAdmissions[b.Name] = newSessionAdmission(cap, waiting, admissionCfg.IdleTTL, nil)
+			log.Printf("  session admission: %s cap=%d waiting=%d ttl=%s keySource=%s",
+				b.Name, cap, waiting, admissionCfg.IdleTTL, admissionCfg.KeySource)
 		}
 	}
 
@@ -2816,6 +3551,15 @@ func main() {
 		metricsListen = v
 	}
 
+	// DNS-rebinding guard for the management listener: only requests whose
+	// Host header matches an allowlisted host (loopback by default) reach
+	// the management routes; everything else is a 403 at the mux wrapper.
+	hosts, err := loadMetricsAllowedHosts(os.Getenv("METRICS_ALLOWED_HOSTS"))
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	metricsAllowedHosts = hosts
+
 	// Management listener: the embedded SPA dashboard plus the live metrics
 	// feeds, sharing one trust zone — it binds 127.0.0.1 by default
 	// (METRICS_LISTEN) and is pointed at a LAN interface only when the
@@ -2823,7 +3567,7 @@ func main() {
 	// web.Handler() is a 404 stub, so the dashboard route is a no-op there.
 	metricsMux := buildMetricsMux()
 	metricsMux.Handle("/", web.Handler())
-	management := limits.server(metricsListen, metricsMux)
+	management := limits.server(metricsListen, metricsHostGuard(metricsAllowedHosts, metricsMux))
 	go func() {
 		log.Printf("management listener: dashboard + /metrics/* on %s", metricsListen)
 		if err := management.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -4674,7 +5418,18 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Est context tokens (whole conversation/prompt) + the conversation
 	// session id, for the live sessions view. Both are body estimates.
 	ctxTok := estimateCtxTokens(&parsed)
+	// Stable conversation identity: with session admission enabled the
+	// opaque backend-scoped key is BOTH the lease ID and the registry's
+	// sessKey (one row per conversation as history grows), while disabled
+	// and unkeyed traffic keep the legacy 12-hex content digest.
+	var admKey string
+	if sessionAdmissionSettings.Enabled {
+		admKey = admissionKeyFor(&parsed, r, target.Name, sessionAdmissionSettings.KeySource, sessionAdmissionSettings.keyName)
+	}
 	sessKey := sessionKeyFor(&parsed)
+	if admKey != "" {
+		sessKey = admKey
+	}
 	reqContext := requestSample{
 		T:            time.Now(),
 		Start:        reqStart,
@@ -4720,6 +5475,54 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		write429(w, "blocked-by-tier0", target.Name, retry)
 		recordRejection(http.StatusTooManyRequests)
 		return
+	}
+
+	// ── Step 1.5: Session admission (stable conversation leases) ─────────
+	// Enabled + keyed traffic only: unkeyed and disabled requests bypass
+	// this gate entirely (legacy per-request behavior). The lease spans the
+	// whole accepted request — downstream GPU/backend/prefill queueing,
+	// upstream response, client cancellation — and releases exactly once
+	// on completion (including ErrAbortHandler unwinding via the defer).
+	// No grant means no accepted count and no idle lease.
+	if admKey != "" {
+		if mgr := sessionAdmissions[target.Name]; mgr != nil {
+			admitStart := time.Now()
+			ticket, aerr := mgr.acquire(r.Context(), admKey, queueTimeout)
+			if aerr != nil {
+				if r.Context().Err() != nil {
+					// Cancellation wins over any concurrent queue deadline:
+					// 499, recorded only — never write to a closed client
+					// and never enter downstream admission.
+					recordRejection(499)
+					return
+				}
+				reason := "session-admission-queue-full"
+				if errors.Is(aerr, errSessionAdmissionTimeout) {
+					reason = "session-admission-timeout"
+				} else {
+					// A non-admission error cannot happen here (the manager
+					// returns only the two sentinels or ctx.Err); treat it
+					// like queue-full.
+					log.Printf("%s %s -> %s (model=%s) admission error: %v",
+						r.Method, r.URL.Path, target.Name, modelName, aerr)
+				}
+				log.Printf("%s %s -> %s (model=%s) 429: %s (admission wait=%v)",
+					r.Method, r.URL.Path, target.Name, modelName, reason, time.Since(admitStart))
+				write429(w, reason, target.Name, estimateRetryAfter(target.Name))
+				recordRejection(http.StatusTooManyRequests)
+				return
+			}
+			waitMs := float64(time.Since(admitStart) / time.Millisecond)
+			if waitMs > 1 {
+				log.Printf("%s %s -> %s (model=%s) admitted by session lease (wait=%v)",
+					r.Method, r.URL.Path, target.Name, modelName, time.Since(admitStart))
+			}
+			defer ticket.release()
+			// The lease may have waited: re-snapshot tier-0 in-flight so
+			// the GPU-budget decision below does not use the arrival-time
+			// figure. The cross-tier policy check itself is not repeated.
+			t0Inflight = tier0Inflight()
+		}
 	}
 
 	// ── Step 2: GPU budget (only for tier-1 subjects, only when tier-0 active) ──

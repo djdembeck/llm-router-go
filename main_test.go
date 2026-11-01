@@ -21,6 +21,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/djdembeck/llm-router-go/web"
 )
 
 // ---------------------------------------------------------------------------
@@ -762,6 +764,8 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 	savedDurations := durations
 	savedGpu := gpu
 	savedProxies := proxies
+	savedAdmSettings := sessionAdmissionSettings
+	savedAdmissions := sessionAdmissions
 
 	backends = list
 	slots = make(map[string]*slotManager)
@@ -772,6 +776,10 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 	}
 	gpu = nil
 	proxies = make(map[string]*httputil.ReverseProxy)
+	// Session admission is disabled by default for existing tests; the
+	// TestSessionAdmission* suite opts in by overwriting these afterwards.
+	sessionAdmissionSettings = sessionAdmissionConfig{}
+	sessionAdmissions = nil
 	for _, b := range list {
 		if mx, ok := slotMax[b.Name]; ok && mx > 0 {
 			mq := 2
@@ -788,6 +796,8 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 		durations = savedDurations
 		gpu = savedGpu
 		proxies = savedProxies
+		sessionAdmissionSettings = savedAdmSettings
+		sessionAdmissions = savedAdmissions
 	})
 }
 
@@ -4436,4 +4446,175 @@ func TestMetricsStream_IntervalClamp(t *testing.T) {
 			t.Errorf("gap[0] = %v, want ~10s (30s clamps to 10s; unclamped would be >=30s)", d[0])
 		}
 	})
+}
+
+func TestNormalizeHost(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"[::1]", "::1"},
+		{"::1", "::1"},
+		{"LOCALHOST", "localhost"},
+		{"[LOCALHOST]", "localhost"},
+		{"127.0.0.1", "127.0.0.1"},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		if got := normalizeHost(tc.in); got != tc.want {
+			t.Errorf("normalizeHost(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestMetricsHostGuard_HostNormalization(t *testing.T) {
+	allowed, err := loadMetricsAllowedHosts("")
+	if err != nil {
+		t.Fatalf("loadMetricsAllowedHosts(): %v", err)
+	}
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	guard := metricsHostGuard(allowed, next)
+
+	allowedHosts := []string{"localhost:9100", "127.0.0.1", "[::1]", "::1", "LOCALHOST", "[LOCALHOST]", "[::1]:9100"}
+	for _, host := range allowedHosts {
+		req := httptest.NewRequest(http.MethodGet, "/metrics/health", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		guard(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("guard(%q) = %d, want 200", host, rec.Code)
+		}
+	}
+
+	forbiddenHosts := []string{"evil.example.com", "LOCALHOST.evil.example.com", "127.0.0.2"}
+	for _, host := range forbiddenHosts {
+		req := httptest.NewRequest(http.MethodGet, "/metrics/health", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		guard(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("guard(%q) = %d, want 403", host, rec.Code)
+		}
+	}
+}
+
+func TestLoadMetricsAllowedHosts_NormalizesEntries(t *testing.T) {
+	hosts, err := loadMetricsAllowedHosts("[LOCALHOST],127.0.0.1:9100, sub.example.com ")
+	if err != nil {
+		t.Fatalf("loadMetricsAllowedHosts(): %v", err)
+	}
+	want := map[string]bool{"localhost": true, "127.0.0.1": true, "sub.example.com": true}
+	for k := range want {
+		if !hosts[k] {
+			t.Errorf("allowlist missing %q (got %v)", k, hosts)
+		}
+	}
+	if len(hosts) != len(want) {
+		t.Errorf("allowlist = %v, want exactly %v (no unnormalized duplicates)", hosts, want)
+	}
+}
+
+// TestManagementMux_Guard403Host builds the REAL guarded management mux —
+// metricsHostGuard(buildMetricsMux(), metricsAllowedHosts) with the SPA
+// mounted at "/", exactly main()'s composition for the management
+// listener — and asserts a hostile (non-allowlisted) Host gets a 403 from
+// the guard on every route: /metrics/sessions must NOT leak the session
+// JSON, the guard must not be shadowed by the SPA fallback, and the 403s
+// carry guard text (http.Error), not handler JSON. The requests dial the
+// local listener with a req.Host override — the DNS-rebinding shape
+// (loopback bind, untrustworthy Host header). The allowlisted loopback
+// Host reaches the real handlers: /stats is 200 JSON,
+// /metrics/sessions is 200 session-feed JSON, / (SPA) answers without a
+// guard error (200 with the webui tag, 404 on the plain stub — both
+// prove the guard delegated past it).
+func TestManagementMux_Guard403Host(t *testing.T) {
+	// The guard's VIEW of the allowlist: seed one live session row so a
+	// hostile /metrics/sessions caller CAN observe a leak (sessions and
+	// metrics globals are restored by cleanup).
+	saveSessions := sessions
+	saveMetrics := metrics
+	r := newSessionRegistry()
+	id := r.start("b1", "/v1/chat/completions", true, "abcdef012345", 100, 40)
+	r.firstByte(id)
+	sessions = r
+	metrics = newTestMetrics()
+	t.Cleanup(func() { sessions, metrics = saveSessions, saveMetrics })
+
+	allow, err := loadMetricsAllowedHosts("") // the default loopback allowlist
+	if err != nil {
+		t.Fatalf("loadMetricsAllowedHosts(): %v", err)
+	}
+	mux := buildMetricsMux()
+	mux.Handle("/", web.Handler())
+	guard := metricsHostGuard(allow, mux)
+	srv := httptest.NewServer(guard)
+	defer srv.Close()
+
+	// hostGet dials the local server (httptest) but sends the given Host
+	// header — the DNS-rebinding shape: the connection lands on the
+	// loopback bind, ONLY the Host carries the untrustworthy name that
+	// the rebinding domain resolved to this listener.
+	hostGet := func(t *testing.T, host, path string) (*http.Response, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s %s: %v", host, path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, body
+	}
+
+	hostile := "rebind.example.com"
+	for _, p := range []string{
+		"/metrics/sessions", // session data: the DNS-rebinding exposure
+		"/metrics/stream",
+		"/metrics/burst",
+		"/metrics/history",
+		"/stats",
+		"/", // SPA fallback must be guarded too
+	} {
+		resp, body := hostGet(t, hostile, p)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s (hostile) = %d, want 403 from the guard", p, resp.StatusCode)
+		}
+		// The 403 is the guard's http.Error, not a handler: text/plain,
+		// and the session feed's JSON keys are unreachable.
+		if ct := resp.Header.Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+			t.Errorf("%s (hostile) Content-Type = %q, want guard plain text (not handler JSON)", p, ct)
+		}
+		if p == "/metrics/sessions" &&
+			(strings.Contains(string(body), "abcdef012345") ||
+				strings.Contains(string(body), `"sessions"`)) {
+			t.Errorf("hostile /metrics/sessions leaked session data: %s", body)
+		}
+	}
+
+	// Allowlisted loopback Host reaches the handlers.
+	for p, wantJSON := range map[string]string{
+		"/stats":            `"backends"`,
+		"/metrics/sessions": `"sessions"`,
+	} {
+		resp, body := hostGet(t, "localhost", p)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s (allowlisted) = %d, want 200", p, resp.StatusCode)
+		}
+		if !strings.Contains(string(body), wantJSON) {
+			t.Errorf("%s (allowlisted) body %s missing %s", p, body, wantJSON)
+		}
+	}
+	// SPA route: the guard delegated past it (no 403). The plain build
+	// answers 404 from the stub handler; the webui build serves the
+	// shell. Both prove the request reached the handler.
+	spa, _ := hostGet(t, "localhost", "/")
+	if spa.StatusCode == http.StatusForbidden {
+		t.Error("allowlisted SPA request 403'd by the guard")
+	}
+	if spa.StatusCode != http.StatusNotFound && spa.StatusCode != http.StatusOK {
+		t.Errorf("SPA = %d, want 404 (stub) or 200 (webui)", spa.StatusCode)
+	}
 }
