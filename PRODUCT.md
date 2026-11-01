@@ -43,7 +43,7 @@ A scheduler for shared-GPU inference: tiered admission (King/Subject), weighted 
 
 - Name: **llm-router-go**, module `github.com/djdembeck/llm-router-go`, MIT licensed.
 - Docker image at `ghcr.io/djdembeck/llm-router-go`.
-- No logo, formal brand system, or marketing commitments exist.
+- Approved B3 Flow logo: petrol/mint day/night SVG logo and symbol assets, with identifier-only brand colors. No marketing commitments.
 - Gitflow: `develop` integrates, `main` is production; Conventional Commits for PRs.
 
 ## Evidence on Hand

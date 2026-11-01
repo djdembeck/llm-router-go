@@ -17,12 +17,14 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/djdembeck/llm-router-go/web"
@@ -2589,10 +2591,84 @@ func buildMetricsMux() *http.ServeMux {
 	return mux
 }
 
+type serverLimits struct {
+	readHeader time.Duration
+	readBody   time.Duration
+	idle       time.Duration
+	shutdown   time.Duration
+	maxHeader  int
+}
+
+func loadServerLimits() (serverLimits, error) {
+	limits := serverLimits{readHeader: 10 * time.Second, readBody: 2 * time.Minute, idle: 2 * time.Minute, shutdown: 30 * time.Second, maxHeader: 1 << 20}
+	for _, setting := range []struct {
+		name string
+		dest *time.Duration
+	}{
+		{"READ_HEADER_TIMEOUT", &limits.readHeader},
+		{"READ_TIMEOUT", &limits.readBody},
+		{"IDLE_TIMEOUT", &limits.idle},
+		{"SHUTDOWN_TIMEOUT", &limits.shutdown},
+	} {
+		if value := os.Getenv(setting.name); value != "" {
+			duration, err := time.ParseDuration(value)
+			if err != nil || duration <= 0 {
+				return limits, fmt.Errorf("invalid %s %q: must be a positive duration", setting.name, value)
+			}
+			*setting.dest = duration
+		}
+	}
+	if value := os.Getenv("MAX_HEADER_BYTES"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return limits, fmt.Errorf("invalid MAX_HEADER_BYTES %q: must be positive", value)
+		}
+		limits.maxHeader = n
+	}
+	return limits, nil
+}
+
+func (limits serverLimits) server(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr: addr, Handler: handler,
+		ReadHeaderTimeout: limits.readHeader, ReadTimeout: limits.readBody,
+		IdleTimeout: limits.idle, MaxHeaderBytes: limits.maxHeader,
+		// No WriteTimeout: generation and SSE responses may legitimately be long-lived.
+	}
+}
+
+func drainServers(timeout time.Duration, servers ...*http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var pending sync.WaitGroup
+	for _, server := range servers {
+		pending.Add(1)
+		go func(server *http.Server) {
+			defer pending.Done()
+			if err := server.Shutdown(ctx); err != nil {
+				log.Printf("shutdown %s: %v; closing remaining connections", server.Addr, err)
+				_ = server.Close()
+			}
+		}(server)
+	}
+	pending.Wait()
+}
+
 func main() {
 	log.Printf("llm-router %s (commit %s)", version, gitCommit)
+	hostDefault := os.Getenv("LISTEN_HOST")
+	if hostDefault == "" {
+		hostDefault = "127.0.0.1"
+	}
+	host := flag.String("host", hostDefault, "listen host (LISTEN_HOST; default loopback)")
 	port := flag.Int("port", 80, "listen port")
 	flag.Parse()
+	limits, err := loadServerLimits()
+	if err != nil {
+		log.Fatal(err)
+	}
+	stop, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	backendsJSON := os.Getenv("BACKENDS")
 	if backendsJSON == "" {
@@ -2751,9 +2827,10 @@ func main() {
 	// web.Handler() is a 404 stub, so the dashboard route is a no-op there.
 	metricsMux := buildMetricsMux()
 	metricsMux.Handle("/", web.Handler())
+	management := limits.server(metricsListen, metricsMux)
 	go func() {
 		log.Printf("management listener: dashboard + /metrics/* on %s", metricsListen)
-		if err := http.ListenAndServe(metricsListen, metricsMux); err != nil {
+		if err := management.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// The management surface (SPA dashboard, /metrics, /feeds,
 			// /stats) is telemetry; a port collision or other bind failure
 			// must not kill the data plane. Routing keeps serving without
@@ -2772,10 +2849,27 @@ func main() {
 		}
 	}()
 
-	addr := fmt.Sprintf(":%d", *port)
+	addr := net.JoinHostPort(*host, strconv.Itoa(*port))
+	server := limits.server(addr, mux)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
 	log.Printf("vLLM router listening on %s with %d backends (queueTimeout=%s, gpuBudget=%v)",
-		addr, len(backends), queueTimeout, gpu != nil)
-	log.Fatal(http.ListenAndServe(addr, mux))
+		listener.Addr(), len(backends), queueTimeout, gpu != nil)
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	select {
+	case <-stop.Done():
+		log.Printf("shutdown: draining requests for up to %s", limits.shutdown)
+		drainServers(limits.shutdown, server, management)
+		log.Print("shutdown: complete")
+	case err := <-serveDone:
+		drainServers(limits.shutdown, management)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}
 }
 
 // ─── /stats ───────────────────────────────────────────────────────────────

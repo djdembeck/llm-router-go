@@ -26,6 +26,10 @@ colors:
   day-moss: "#476438"
   day-amber: "#8a5a12"
   day-vermilion: "#a33a28"
+  brand-symbol-day: "#0F766E"
+  brand-wordmark-day: "#18343A"
+  brand-symbol-night: "#5EEAD4"
+  brand-wordmark-night: "#A8D8CF"
 typography:
   display:
     fontFamily: "Overpass, system-ui, sans-serif"
@@ -72,7 +76,7 @@ components:
   topbar:
     backgroundColor: "{colors.survey-panel}"
     textColor: "{colors.chalk}"
-    height: "56px"
+    height: "auto"
     padding: "8px 20px"
   button:
     backgroundColor: "transparent"
@@ -120,7 +124,11 @@ in a dim room, with a day sheet that inverts the same roles for daylight.
 The world enters through four carriers only: type, palette, density, and one
 signature move. The shell stays a standard web operations surface — a top
 bar, a fleet rail, ruled tables, segmented controls, a range slider. The
-signature is the **Fleet Profile**: one elevation lane per backend, its KV
+header carries the approved B3 Flow logo: a custom outlined symbol and
+custom-path wordmark, rendered from theme-selected SVG assets at 30px high.
+Its four brand colors identify the product only; they do not replace the
+survey palette or encode health, activity, request, or engine state.
+The signature is the **Fleet Profile**: one elevation lane per backend, its KV
 level drawn as a sand ridge over a water fill, live requests riding below as
 prefill/decode bars, spot heights at the live edge, and a survey cursor that
 scrubs every reading. Lanes are categorical; the sheet never interpolates
@@ -138,6 +146,7 @@ guess.
 - A dark olive-ink survey sheet with a paired cream day sheet
 - Sand level lines, water KV, moss live, amber estimate, vermilion failure
 - Overpass + Overpass Mono; every figure tabular, every type size on an integer 2px step
+- B3 Flow custom SVG logo; theme-selected asset at 30px high; brand colors are identifier-only
 - Sharp corners, 1px rules, no ambient shadow, no glow
 - The Fleet Profile is the history chart; no second chart style competes with it
 - Live sessions sit beside the profile in the first viewport
@@ -165,6 +174,24 @@ primary sheet; day inverts ground and ink while keeping each role.
 - **Amber — Attention / Estimate** (#d6a445, lit #e8c071): the `est` tag,
   the prefill bar, queued/waiting emphasis, and the `PAUSED`/`DEV MOCK`
   chips.
+
+### Brand Identifier
+
+The B3 Flow logo alone uses four additional colors: `brand-symbol-day` and
+`brand-wordmark-day` for the day asset, and `brand-symbol-night` and
+`brand-wordmark-night` for the night asset. The symbol carries the first
+color in each pair; the custom outlined wordmark carries the second. These
+colors are identifier-only: never use them for survey marks, health, activity,
+requests, or engine/telemetry status. The established survey and semantic
+palette remains authoritative everywhere else.
+
+Both wordmarks are a tinted ink, not neutral text, so the lettering carries
+identity on either sheet. Day is a slate-teal at ink weight (#18343A); night
+is its mint-slate inversion (#A8D8CF, 11.3:1 on `ink-ground`). The night value
+must stay clear of `chalk` (#e9e5d8) in lightness — a near-white wordmark
+becomes indistinguishable from body ink and the mark collapses to its symbol —
+and must keep its hue out of water, moss, and amber so it never reads as a
+data class.
 
 ### Failure
 
@@ -199,7 +226,7 @@ density, type, or the profile's grammar.
 ## Typography
 
 **Display Font:** Overpass (400–700) — a workhorse grotesk with
-transit-signage DNA; the wordmark and all labels.
+transit-signage DNA; used for all interface labels and text.
 **Data Font:** Overpass Mono (400–600) — every number, unit, identifier,
 axis label, and table cell.
 
@@ -210,16 +237,16 @@ does not shift its neighbours.
 
 ### Hierarchy
 
-- **Display** (Overpass 600, 16/20, -0.01em): the wordmark only; `-go` in sand.
-- **Data Value** (Mono 500, 24/28, -0.01em, tabular): readings strip values
-  and the largest number in a panel.
-- **Panel Value** (Mono 500, 16/20): backend names, table values, session ages.
+- **Display** (Overpass 600, 16/20, -0.01em): reserved for display text; no interface element uses it now that the logo is custom SVG artwork.
+- **Data Value** (Mono 400, 24/28, -0.01em, tabular): readings strip values;
+  below 640px the same value steps down to 16/20.
 - **Body** (Overpass 400, 14/20): the reading sublines and explanatory copy.
 - **Detail** (Overpass 400, 12/16): data notes, feed metadata, table footers.
 - **Label** (Overpass 600, 10/12, 0.12em, uppercase): section heads, column
   heads, data-class tags, controls.
 - **Data Detail** (Mono 400, 12/16, tabular): axis labels, token figures,
-  secondary measurements.
+  table cells, the session stack, the profile footer, secondary measurements,
+  so ten columns and eight rows fit without a second type step.
 
 ### Named Rules
 
@@ -343,12 +370,42 @@ zero duration, and CSS transitions/animations collapse to 0.01ms.
 
 ### Top Bar
 
-The sheet's header. Left: the wordmark (`llm-router-go`, `-go` sand) with a
-10px subtitle. Center-left: health chip (`LIVE` moss, `DEGRADED` amber,
-`OFFLINE` vermilion), optional `PAUSED` and `DEV MOCK` chips, feed source and
-last-data time. Right: wall clock (12px mono), a six-button range segmented
-control, pause/play, and a theme button. Height 56px; 1px rule bottom;
-`survey-panel` ground.
+The sheet's header. Left: the custom outlined B3 Flow SVG wordmark, selected
+for the active theme and displayed at 30px high, with the existing subtitle.
+Its symbol and lettering use the four identifier-only brand colors; the SVG
+is custom path artwork, not rendered with a runtime font. The mark block is
+content-sized — never a fixed reserve — so no dead paper sits between the
+wordmark and the status cluster. Center-left: health
+chip (`LIVE` moss, `DEGRADED` amber, `OFFLINE` vermilion), optional `PAUSED`
+and `DEV MOCK` chips, feed source and last-data time. Right: wall clock (12px
+mono), a six-button range segmented control, pause/play, and a theme button.
+Minimum height 56px; 1px rule bottom; `survey-panel` ground.
+
+The header wraps by dropping the controls to a second row and keeping the
+status cluster beside the mark, down to 639px where the status takes its own
+row above the controls. Health is never ordered behind the view controls.
+
+The tab icon and browser chrome follow the selected sheet, not the host OS:
+the bootstrap script resolves `lrg-theme` (falling back to
+`prefers-color-scheme`) and repaints `<link rel="icon">` and `theme-color`
+before first paint, and the theme toggle repaints them again. The icon is the
+16px optical drawing (`logo-symbol-small*.svg`): two slabs and a threaded
+arrow with every channel at least 1.5px, because the full symbol's 45° seams
+mush into a dot at tab size.
+
+### Brand Logo
+
+B3 Flow is a custom outlined SVG symbol and custom-path wordmark, not a
+runtime font. Use the theme-selected day/night asset at 30px displayed height.
+The symbol and lettering use their separate day/night brand-color roles;
+those identifier colors never communicate survey, telemetry, or status state.
+
+Three drawings exist. The full lockup (`web/static/logo.svg`,
+`logo-dark.svg`) is the header and README asset. The symbol
+(`assets/logo/logo-symbol*.svg`, 256 viewBox) is the vector master behind the
+512px PNG exports; nothing on the sheet renders it directly. The small drawing
+(`web/static/logo-symbol-small*.svg`, 16 unit grid) is the tab icon at 16–32px,
+where the full symbol's thin seams and 45° arrow close up.
 
 ### Readings Strip
 
@@ -462,7 +519,11 @@ stroke 1.5.
 A 34px band with a 1px vermilion bottom border, an 8px vermilion square,
 `STALE — last data HH:MM:SS · Ns ago`, and `re-arming <feed>` at the right.
 It never fills the row with red. A one-line notice below reports a missing
-history feed without hiding the last series.
+history feed without hiding the last series. The notice is inserted chrome, not
+a reserved slot: when history is healthy it does not exist. Inserting it moves
+the sheet down once, and the fold cap absorbs that by shrinking the band in
+place; reserving a permanent 31px row for a degraded-only state would cost every
+session to spare one.
 
 ### Tables and Browser Surfaces
 

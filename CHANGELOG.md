@@ -4,6 +4,12 @@
 
 ### Bug Fixes
 
+* **runtime:** default native routing to loopback with explicit host opt-in, keep container routing reachable with loopback-published examples, run the image as UID/GID 10001 with writable history storage, bound incoming headers/body and idle connections without response deadlines, and drain both HTTP listeners on SIGTERM/SIGINT before a bounded forced close.
+
+* **dashboard:** keep the mark and the browser chrome honest — the night wordmark becomes a mint-slate ink instead of near-white (it sat at 1.1:1 against chalk, so the lettering dissolved into body text), the tab icon uses a 16px optical drawing instead of the shrunken full symbol, the tab icon and `theme-color` follow the chosen sheet rather than the host OS, and the top bar stops demoting `LIVE` behind the range control at laptop widths; the health chip announces its own changes, and the unreferenced symbol/mono SVGs leave the embedded bundle (the symbol vector master moves to `assets/logo/`)
+* **dashboard:** keep the phone header on the detail token — the feed line reads 12px at every width instead of dropping to 10px below 640px, at no height cost
+* **dashboard:** set label leading to the documented 10/12 token — section heads and column heads rendered 10/16, so the readings strip loses 4px of borrowed air and the label/value step reads sharper
+* **release:** never ship a release image from a foreign commit — the release build step verifies the version tag points at the run's commit (ancestor tag skips, foreign tag fails) instead of trusting image existence, and CI no longer cuts `type=semver` release tags on plain main pushes
 * **release:** finalize drafts from the authenticated release listing — `GET releases/tags/{tag}` is a published-release lookup, so the draft create/reuse/publish cycle now matches the paginated authenticated listing by exact `tag_name` (duplicates fail closed, listing auth/server failures propagate without creating) and publishes with `--latest` computed from published non-prerelease semver records so a delayed lower release never rolls back GitHub Latest
 * **release:** keep registry command output in CI errors — failing `docker buildx` invocations now surface their captured stdout and stderr in the CLI error while preserving the manifest-not-found vs auth/transport distinction
 * **ci:** pin the CI build job to the canonical `Build` check-run name — main's required status checks match that exact name, so `Build (web + Go)` would strand every `develop → main` PR waiting for a context that never reports
@@ -17,6 +23,7 @@
 
 ### Features
 
+* **dashboard:** add approved B3 Flow branding — theme-selected day/night header logo, matching favicons, and README identity, with identifier-only colors that preserve the survey palette and semantic states
 * **dashboard:** automatically focus a one-backend deployment on its server: remove the fleet rail and duplicate aggregate chart lane, reclaim chart width, show compact server details, and omit repeated backend names; preserve fleet comparisons for multi-backend deployments and device-wide GPU telemetry in both modes
 * **dashboard:** replace the fold-sheet UI with the Capacity Survey — readings strip, Fleet Profile (KV ridges, live request bars, survey cursor), live session stack, backend detail, request feed, night/day sheets
 * **dashboard:** smooth the sheet — TTFT/prefill/decode read a 15s mean refreshed every 5s and tween over 1.6s, the KV gauge holds 5s, a continuously gliding live edge, FLIP session rows with no entrance flashes, a stable request table, eased controls, and a night/day cross-fade; reduced-motion paths snap values and zero JS row durations
