@@ -1,89 +1,469 @@
 # llm-router-go
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/static/logo-dark.svg">
+    <img src="web/static/logo.svg" alt="LLM Router logo" width="320">
+  </picture>
+</p>
+
 GPU-aware reverse proxy router for vLLM and SGlang LLM inference backends.
+
+llm-router-go sits in front of one or more OpenAI-compatible inference servers and routes requests using GPU utilization, concurrency, queue depth, and latency signals. It is a single Go binary with no external dependencies.
+
+Use it when several inference backends share GPU hardware and naive load balancing either wastes capacity or lets a large prefill starve smaller requests. Tiered admission, weighted GPU budgets, bounded per-backend queues, and prefill limits keep primary instances responsive while secondary capacity is used deliberately.
+
+## Table of Contents
+
+- [Security](#security)
+- [Background](#background)
+- [Install/Running](#installrunning)
+  - [Docker image](#docker-image)
+  - [Binary install](#binary-install)
+- [Usage](#usage)
+  - [Day-1 quickstart](#day-1-quickstart)
+  - [Use an environment file](#use-an-environment-file)
+- [Configuration](#configuration)
+  - [Backends](#backends)
+  - [Scalar environment variables](#scalar-environment-variables)
+- [API](#api)
+  - [`/health`](#health)
+  - [`/stats`](#stats)
+  - [`/v1/models`](#v1models)
+  - [Proxied requests](#proxied-requests)
+- [Architecture](#architecture)
+  - [Tier system](#tier-system)
+  - [GPU budget and slot managers](#gpu-budget-and-slot-managers)
+  - [Prefill protection and load balancing](#prefill-protection-and-load-balancing)
+- [Building](#building)
+  - [Build the binary](#build-the-binary)
+  - [Build the Docker image](#build-the-docker-image)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Security
 
-This proxy has **no built-in authentication or authorization**. It blindly forwards any request it receives to the configured backends.
+> [!WARNING]
+> This proxy has **no built-in authentication or authorization**. It blindly forwards any request it receives to the configured backends.
+>
+> **Always deploy behind a reverse proxy** (for example, Caddy, Nginx, or Traefik) that handles:
+>
+> - Authentication (API keys, tokens, and similar credentials)
+> - TLS termination
+> - Request validation and rate limiting
+>
+> Do not expose `llm-router-go` directly to untrusted networks.
 
-**Always deploy behind a reverse proxy** (e.g., Caddy, Nginx, Traefik) that handles:
-- Authentication (API keys, tokens, etc.)
-- TLS termination
-- Request validation and rate limiting
+## Background
 
-Do not expose `llm-router-go` directly to untrusted networks.
+When multiple inference backends share GPU resources, request count alone is a poor scheduling signal. A single massive prompt prefill can occupy a GPU and starve smaller requests. Tier 0 (King) backends therefore take priority; Tier 1 (Subject) backends use only the remaining configured GPU budget while a King is active.
 
-## Quick Start
+The router's scheduling controls are deliberately narrow:
 
-Build and run via Docker:
+- **GPU-weighted admission:** `gpuWeight` models the share of a shared GPU consumed by a backend instead of treating every request as equal.
+- **Bounded queues:** each backend has its own concurrency limit and queue. Saturated queues return `429 Too Many Requests` with `Retry-After`.
+- **Large-prefill limits:** request bodies are inspected to estimate new prefill tokens and cap concurrent large prefills per backend.
+- **EWMA durations:** exponentially weighted moving averages guide load balancing without sending a herd of requests to the same backend.
+- **Unified model catalog:** `/v1/models` aggregates model metadata from all configured backends.
+
+## Install/Running
+
+Docker is the fastest path to a running router. The container listens on `0.0.0.0:80` (`LISTEN_HOST=0.0.0.0` in the image) as UID/GID `10001:10001`; the quickstarts publish it only on host loopback. Native binaries default to `127.0.0.1:80`.
+
+For persistent history, mount a directory writable by UID/GID `10001:10001` at `/data` and set `HISTORY_PATH=/data/history.gob`. For example, prepare a dedicated bind directory with `sudo install -d -o 10001 -g 10001 -m 0700 ./router-data`, then add `-v "$PWD/router-data:/data" -e HISTORY_PATH=/data/history.gob` to the run command. Existing bind mounts must permit this identity to create and rename the snapshot file; mounting only a single file prevents atomic replacement. Configuration still comes from environment variables (`--env-file` is read by Docker on the host), not a writable config file. History remains optional, with the existing once-per-minute atomic snapshots and memory-only fallback on write errors. On runtimes that restrict unprivileged ports inside the container, use `-port 8080` after the image name and publish `127.0.0.1:8080:8080` instead.
+
+### Docker image
+
+Pull the pre-built image from GHCR and provide the required `BACKENDS` JSON array:
 
 ```bash
-docker build -t llm-router-go .
-docker run -d -p 80:80 \
+docker run -d --name llm-router-go -p 127.0.0.1:80:80 -p 127.0.0.1:9100:9100 \
   -e BACKENDS='[{"name":"primary","url":"http://vllm-1:8000","maxConcurrent":4,"tier":0}]' \
-  llm-router-go
+  -e METRICS_LISTEN=0.0.0.0:9100 \
+  ghcr.io/djdembeck/llm-router-go
 ```
+
+The backend URL must be reachable from the container. Adjust the published host port when port `80` is already in use. The dashboard and `/metrics/*` live on a separate management listener that binds `127.0.0.1:9100` inside the container by default — unreachable from the host. To serve the dashboard, set `METRICS_LISTEN=0.0.0.0:9100` (or the interface you want it on) and publish the port (`-p 127.0.0.1:9100:9100`): the container-side bind stays `0.0.0.0`, the host-side bind is loopback, so the port reaches the host at `http://127.0.0.1:9100` only and never on the network. Because it carries in-flight and per-conversation session data, if you ever proxy it beyond localhost, put it behind your TLS/auth reverse proxy, the same boundary as the rest of the management surface.
+
+### Binary install
+
+Install the Go command from the module, then provide the same environment variables when you run it:
+
+```bash
+go install github.com/djdembeck/llm-router-go@latest
+```
+
+The resulting `llm-router-go` binary is placed in the Go binary directory (`$GOBIN`, or `$GOPATH/bin` when `GOBIN` is unset).
+
+## Usage
+
+### Day-1 quickstart
+
+Start the pre-built container with one vLLM backend:
+
+```bash
+docker run -d --name llm-router-go -p 127.0.0.1:80:80 -p 127.0.0.1:9100:9100 \
+  -e BACKENDS='[{"name":"primary","url":"http://vllm-1:8000","maxConcurrent":4,"tier":0}]' \
+  -e METRICS_LISTEN=0.0.0.0:9100 \
+  ghcr.io/djdembeck/llm-router-go
+```
+
+The dashboard is on the management listener: `http://127.0.0.1:9100/`.
+
+Check queue, concurrency, latency, and GPU-budget state:
+
+```bash
+curl http://127.0.0.1:80/stats
+```
+
+Send OpenAI-compatible API requests to the router's port. The router selects a backend for paths other than its management endpoints and forwards the request.
+
+### Use an environment file
+
+`.env.example` documents every supported environment variable. Copy it, set the backend URL, and source it before starting the binary:
+
+```bash
+cp .env.example .env
+# Edit .env and set BACKENDS for the inference servers reachable by this process.
+set -a
+. ./.env
+set +a
+llm-router-go
+```
+
+The `.env.example` file contains a minimal backend entry and the default scalar settings. For multiple backends or tiered scheduling, use the full schema below.
 
 ## Configuration
 
-The router is configured entirely via environment variables.
+The router is configured through environment variables plus the existing `-port` flag (default `80`) and `-host` (overrides `LISTEN_HOST`). `BACKENDS` is required; the scalar variables have the defaults shown here. For intentional LAN exposure, choose `LISTEN_HOST=0.0.0.0`, `-host 0.0.0.0`, or a specific interface (IPv6 addresses are supported); place authentication/TLS at the reverse proxy boundary.
 
-### Environment Variables
+Both HTTP listeners bound header reads to 10 seconds, the complete incoming request (headers plus body) to 2 minutes, and idle keep-alive connections to 2 minutes by default. Increase `READ_TIMEOUT` for legitimate slow/large uploads; `MAX_BODY_BYTES` keeps its existing 16 MiB default. There is deliberately no response write timeout: ongoing SSE and long generation responses are not cut off by the incoming-read or keep-alive bounds. Go's header parser permits a small read-ahead allowance beyond `MAX_HEADER_BYTES`; oversized headers receive `431`.
+
+On SIGTERM or SIGINT, both listeners stop accepting requests and drain active requests concurrently for up to `SHUTDOWN_TIMEOUT` (default 30 seconds). Streams finishing within that window complete normally; at the deadline, remaining connections are forcibly closed, canceling upstream requests, then the process exits. Set the supervisor/container stop grace longer than this timeout (for example, `docker stop --time 40 llm-router-go` for the default). Dashboard SSE connections also count as active streams.
+
+### Backends
+
+`BACKENDS` is a JSON array. Each object describes one inference backend. This example includes every supported field:
+
+```bash
+BACKENDS='[
+  {
+    "name": "primary",
+    "url": "http://vllm-1:8000",
+    "maxConcurrent": 4,
+    "tier": 0,
+    "gpuWeight": 1,
+    "blockOnTier0": 0,
+    "maxQueueDepth": 2,
+    "maxConcurrentLargePrefill": 1,
+    "largePrefillThresholdTokens": 8192
+  }
+]'
+```
+
+| Field | Description |
+| :--- | :--- |
+| `name` | Required unique backend identifier. |
+| `url` | Required backend endpoint URL. |
+| `maxConcurrent` | Maximum concurrent requests. `0` means unlimited. |
+| `tier` | Routing priority: `0` is a King and `1` is a Subject. Tier 0 backends take precedence. |
+| `gpuWeight` | GPU cost attributed to this backend while Tier 0 is active. `0` has no GPU-budget cost. |
+| `blockOnTier0` | For a secondary backend, block requests when the number of in-flight Tier 0 requests reaches this threshold. `0` disables the check. |
+| `maxQueueDepth` | Maximum pending requests beyond `maxConcurrent`; defaults to `2`. |
+| `maxConcurrentLargePrefill` | Maximum concurrent large-prefill requests. `0` disables large-prefill limiting. |
+| `largePrefillThresholdTokens` | Estimated prompt-token count (whole conversation) that triggers large-prefill logic; defaults to `8192`. |
+
+### Scalar environment variables
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `BACKENDS` | Required | JSON array of backend server configurations. |
-| `MAX_QUEUE_TIMEOUT` | `30s` | Maximum time a request waits in queue before returning `429 Too Many Requests`. |
-| `MAX_GPU_BUDGET` | `4` | Max weighted GPU usage when any Tier 0 (King) backend is active. |
-| `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Requests exceeding this size receive HTTP `413` with header `X-Router-Reason: body-too-large`. |
-| `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput bounding how long a non-streaming request holds a large-prefill slot, released after the estimated prefill duration (or the first response byte, whichever comes first) rather than held through full generation. Bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
+| `LISTEN_HOST` | `127.0.0.1` (image: `0.0.0.0`) | Data-plane bind host; `-host` overrides it. Port remains controlled by `-port` (default `80`). |
+| `READ_HEADER_TIMEOUT` | `10s` | Maximum incoming header-read duration, both listeners. |
+| `READ_TIMEOUT` | `2m` | Maximum incoming header + body-read duration, not response duration. |
+| `IDLE_TIMEOUT` | `2m` | Maximum idle keep-alive duration, not active stream duration. |
+| `MAX_HEADER_BYTES` | `1048576` (1 MiB) | Header parsing limit, plus Go's read-ahead allowance. |
+| `SHUTDOWN_TIMEOUT` | `30s` | Shared graceful-drain deadline before closing remaining connections. |
+| `MAX_QUEUE_TIMEOUT` | `30s` | Maximum time a request waits in a queue before returning `429 Too Many Requests`. |
+| `MAX_GPU_BUDGET` | `4` | Maximum weighted GPU usage while any Tier 0 (King) backend is active. |
+| `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Larger requests receive HTTP `413` with `X-Router-Reason: body-too-large`. |
+| `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput used to bound how long a non-streaming request holds a large-prefill slot. The slot is released after the estimated prefill duration or the first response byte, whichever comes first. This bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
+| `SESSION_ADMISSION` | *(off)* | `on` enables TTL-bounded session admission: each keyed conversation holds one admitted slot per backend until it is released and then idle for `SESSION_IDLE_TTL`. Off and unkeyed traffic keep the legacy per-request behavior exactly. |
+| `SESSION_MAX_ADMITTED` | backend's `maxConcurrent` | Cap on concurrently admitted conversations per backend. Empty inherits each backend's `maxConcurrent` (must be set explicitly for unlimited backends); a nonzero value applies to every backend. |
+| `SESSION_MAX_WAITING` | backend's `maxQueueDepth` (default 2) | Bounded, strictly FIFO admission queue per backend. Empty inherits each backend's `maxQueueDepth`; an explicit value (including `0`, which rejects newcomers immediately) applies to every backend. Waiting admissions are also bounded by `MAX_QUEUE_TIMEOUT`. |
+| `SESSION_IDLE_TTL` | `5m` | How long a released (idle) lease retains its admitted slot before a newcomer may take it. The expiry timer alone drains the queue; no traffic is required. |
+| `SESSION_KEY_SOURCE` | `prompt_cache_key` | Lease identity source: `prompt_cache_key` (always preferred when present), `user`, or `header:<Name>` for a single named request header. |
+| `HISTORY_PATH` | *(empty)* | Optional file for the dashboard's history rings. Atomic snapshots every minute; empty means memory-only (history resets on restart). |
+| `GPU_METRICS_URL` | *(empty)* | Optional Prometheus text endpoint for device GPU utilization/VRAM/temperature/power (DCGM exporter or nvidia_gpu_exporter). Empty disables device telemetry; engine KV/memory gauges remain available. |
+| `METRICS_LISTEN` | `127.0.0.1:9100` | Address for the management listener that serves the dashboard and the `/metrics/*` endpoints (including in-flight and conversation session data, which is never exposed on the external listener). Point it at a LAN interface to expose the dashboard to that network. |
+| `METRICS_ALLOWED_HOSTS` | `127.0.0.1,::1,localhost` | Comma-separated Host allowlist for the management listener (DNS-rebinding guard): only requests whose `Host` header matches (port stripped) reach the management routes (`/metrics/*`, `/stats`, the web SPA `/`); every other Host is rejected with `403`. Extend with the reverse proxy's funnel domain when the management listener is exposed past loopback. Invalid values fail startup, like the `SESSION_*` knobs. |
 
-### Backends JSON Schema
+## API
 
-Each object in the `BACKENDS` array supports:
+The native router listens on `127.0.0.1:80` by default; `-port` retains its existing meaning. The image explicitly binds `0.0.0.0:80` inside its network namespace.
 
-- `name` (string, required): Unique identifier for the backend.
-- `url` (string, required): Backend endpoint URL.
-- `maxConcurrent` (int): Max concurrent requests. `0` for unlimited.
-- `tier` (int): Routing priority. `0` for King, `1` for Subject.
-- `gpuWeight` (int): GPU cost attributed to this backend when Tier 0 is active.
-- `blockOnTier0` (int): Request block threshold when King backends are saturated. `0` to disable.
-- `maxQueueDepth` (int): Max pending requests. Defaults to `2`.
-- `maxConcurrentLargePrefill` (int): Max concurrent large prefill requests. `0` to disable.
-- `largePrefillThresholdTokens` (int): Token count to trigger large prefill logic. Defaults to `8192`.
+### `/health`
 
-## Endpoints
+`GET /health` returns the plain-text health response `vLLM router OK`.
 
-The router listens on port `:80`.
+### `/stats`
 
-- `/stats`: Returns JSON status of all backends, including queue depths, EWMA durations, and active concurrency.
-- `/v1/models`: Aggregates model information from all configured backends.
-- `/*`: All other paths are proxied to the selected backend based on load balancing logic.
+`GET /stats` returns JSON status for every backend, including in-flight requests, queue depth, prefill queue state, and EWMA duration. The top-level response also reports `gpuUsed`, `gpuBudget`, `gpuWaiting`, and `tier0Inflight`.
+
+### `/v1/models`
+
+`GET /v1/models` queries all configured backends and returns one aggregated model catalog. If a backend cannot provide model metadata, the router returns a fallback entry named for that backend.
+
+### Proxied requests
+
+All other paths are proxied to a selected backend. OpenAI-compatible inference paths, including chat and completion requests, are forwarded after the router applies tier, GPU, concurrency, queue, and large-prefill limits.
+
+Requests rejected because a queue, GPU budget, or prefill limit is full receive `429` with `Retry-After`, `X-Router-Reason`, and `X-Router-Backend` headers. Requests exceeding `MAX_BODY_BYTES` receive `413` with `X-Router-Reason: body-too-large`.
+
+### Session admission
+
+With `SESSION_ADMISSION=on`, admission becomes **conversation-scoped**: a keyed request (its lease id is derived from `prompt_cache_key`, or a configured fallback origin) is granted one admission ticket on the backend that serves it. The ticket covers the full lifetime of the request — upstream queuing, GPU/prefill staging, response streaming, even aborted/cancelled tails — and is released exactly once at handler completion.
+
+What the ticket grants (per backend):
+
+* **Shape:** a set of admitted conversations per backend, bounded by `SESSION_MAX_ADMITTED` (defaults to each backend's own `maxConcurrent`, so with a single backend it mirrors the execution slots).
+* **Queueing:** when the per-backend shape is full, new (new-identity) arrivals wait in a strictly FIFO queue, bounded by `SESSION_MAX_WAITING` (defaults to each backend's `maxQueueDepth`, otherwise 2) and by `MAX_QUEUE_TIMEOUT` for how long they may wait. Exceeding either — the queue is full, or the grace has elapsed — instantiates `429` (`session-admission-queue-full` / `session-admission-timeout`).
+* **TTL retention:** when a conversation's accepted set drops to zero, its lease is not dropped immediately. It enters an *idle* state for `SESSION_IDLE_TTL` (default 5m) during which it continues to occupy its shape and is not re-admitted; a valid idle lease immediately re-admits that identity, so a returning conversation gets back in without spending a new ticket.
+* **Admission safety:** a *new* identity is only admitted when (a) the per-backend shape has room AND (b) no earlier-queued newcomer that holds no lease of its own would be truncated by the new arrival. Same-identity waiters can cut in line behind a blocked waiter (the identity lease is authoritative), but a new identity never gets to cut in line for another newcomer.
+* **Cancellations / timeouts / rejections:** a cancelled client (499) *before* an admission grant, or a queued admission that times out, mint *no* lease and take no shape. A cancellation *after* admission already holds the ticket — handler completion releases it and starts the idle TTL — and a request that is rejected *after* admission (tier-0 block, GPU budget, in-flight slot, prefill) likewise holds its ticket until handler completion; the accepted count reflects “in flight at this backend’s slot,” not “upstream is running.”
+* **Scope of admission:** off (`SESSION_ADMISSION` unset or `off`) and keyless traffic (no `prompt_cache_key` — or no source configured) bypass the gate entirely and keep the legacy per-request shape exactly. The key is backend-scoped: the same key on two backends is two distinct leases.
+
+The session feed served by `GET /metrics/sessions` reports `admissionLease` and `admissionIdleSinceMs` per row from the lease map itself, so the live view never claims a lease the registry (a bounded, evictable view) has no record of. (`/metrics/stream` carries the per-backend and live request state; the admission fields are on the `/metrics/sessions` `sessions[]` rows.)
+
+
+## Dashboard
+
+The router embeds an operations dashboard (SvelteKit, served at `/` by the
+same binary). It is built for the live question first: **what is running, how
+hard are the GPUs working, how fast are prefill/decode/TTFT, and how full is
+the KV cache** — then the same signals over the last 5 minutes to 30 days.
+
+The first viewport is a ruled readings strip (running, waiting, TTFT, prefill,
+decode, KV cache; a device row appears when GPU telemetry is configured), the
+**Fleet Profile** — one elevation lane per backend with its KV level, live
+request bars (prefill/decode), failure ticks, and a survey cursor — and the
+**live session stack** beside it. Below them: backend detail (router slots vs
+engine running/waiting, KV, KV pool, engine memory, TTFT, prefill, decode, hit
+rate), the recent request feed with CSV export, and the history ranges
+(`5m`, `1h`, `6h`, `24h`, `7d`, `30d`). With exactly one configured backend,
+the dashboard automatically becomes a **server survey**: no fleet rail or
+duplicate aggregate lane, one server identity, a wider profile, compact
+server details, and no repeated backend column in the request log. Device
+telemetry stays device-wide, including every reported GPU. Two or more
+backends retain the fleet navigation and comparison tables. Pause, stale
+feeds, and engine scrape failures do not change the layout mode. Five-minute
+deltas use that server's own history, not a retained fleet aggregate; an
+unknown reference stays `—`. If the feed falls back to `/stats`, engine and
+GPU telemetry are labelled unavailable, not disabled or unconfigured.
+
+Every figure carries its data class:
+
+| Tag | Meaning |
+| :--- | :--- |
+| `router` | measured by the router: slots, queue, streaming first-byte TTFT, request/byte rates |
+| `engine` | scraped from the backend's Prometheus `/metrics`: running/waiting, KV, prefill/decode tokens, engine TTFT |
+| `device` | scraped from an optional DCGM / nvidia exporter: device utilization, VRAM, temperature, power |
+| `est` | body-based token estimate (~4 bytes/token), never measured decode |
+
+The dashboard and the metrics endpoints share one dedicated management
+listener — `METRICS_LISTEN` (default `127.0.0.1:9100`) — which is separate
+from the external API listener. Because `/metrics/sessions` exposes
+in-flight and per-conversation request data, that surface binds to the
+loopback interface by default; point `METRICS_LISTEN` at a LAN interface
+only when the deployment boundary (TLS/auth reverse proxy) covers it.
+As a DNS-rebinding guard, the entire management mux (all `/metrics/*`
+routes, `/stats`, and the SPA `/`) enforces a Host allowlist — loopback
+hosts by default, `METRICS_ALLOWED_HOSTS` to extend — and answers any other
+requesting Host with `403`. The external listener keeps `/health`,
+`/stats`, and `/v1/*` only. It reads four endpoints:
+
+| Endpoint | Description |
+| :--- | :--- |
+| `GET /metrics/stream` | SSE feed of full live snapshots every `?interval=` (default `500ms`, clamped `200ms`–`10s`). Per-backend slots, EWMA duration, streaming TTFT (EWMA + latest first-byte), **30s trailing arrival rates**, cumulative counters, engine metrics, GPU budget state, optional `gpuDevices`, and fleet `totals` (including engine-aggregated throughput and KV peak). |
+| `GET /metrics/history` | Server-side time series. `?range=5m\|1h\|6h\|24h\|7d\|30d` (default `1h`), optional repeated `?backend=`. Dense grid-aligned arrays (`t[i] = from + i*stepMs`); a bucket with no samples is `null`, never forward-filled. Includes per-backend series, the fleet aggregate, device series, and router TTFT p50/p95 with the actual sample count and coverage. |
+| `GET /metrics/burst` | The most recent completed requests (bounded ring, capacity `2000`, `?limit=` default `500`), newest last, including router-originated rejections. |
+| `GET /metrics/sessions` | The in-flight request stack plus conversation-grouped sessions (polling endpoint). |
+
+The frontend connects to `/metrics/stream` via `EventSource` and falls back
+to polling `/stats` if the stream is unavailable; `/stats` is served on both
+listeners so the fallback resolves from the dashboard's origin. In
+`bun run dev` with no router
+reachable, a dev-only synthetic feed is used and the top bar marks it
+`DEV MOCK`; the production build never loads it. Rebuilt on every code change
+with `cd web && bun run build` and embedded with the `webui` build tag (the
+Docker image does this automatically; the plain `go build` ships a 404 stub
+for the dashboard until `web/build` exists).
+
+### History
+
+A single sampler goroutine records one coherent fleet snapshot per second,
+independent of dashboard clients, into three rings per series:
+
+| Ring | Step | Retention |
+| :--- | :--- | :--- |
+| raw | 1s | 1 hour |
+| minute rollup | 1m | 7 days |
+| hour rollup | 1h | 30 days |
+
+Rollups store averages for gauges/rates and maxima for KV/TTFT pressure. Set
+`HISTORY_PATH=/data/history.gob` (on a mounted volume) to keep the rings
+across restarts; writes are atomic snapshots every minute. The file is
+ignored if it is unreadable or from a different version. Without it, history
+is memory-only and resets when the process restarts — the live view is never
+affected.
+
+### Engine metrics (v2)
+
+Each backend's engine block is the backend's **own** execution truth scraped
+from its Prometheus `/metrics` at 1s. It carries running/waiting, KV pressure,
+prefill (compute and cache-hit separately), decode throughput, interval
+latency means, lifetime counters, finished-reason breakdown (vLLM), pool
+statistics (SGLang), memory, cache hit rate, and the context/SLO caps. Fields
+an engine does not report render as `null` (`—`). vLLM's
+`cache_config_info{kv_cache_size_tokens="..."}` supplies group-aware KV token
+capacity, summed across data-parallel engines; a missing/invalid capacity
+label leaves it unknown. The pool reads used/capacity independently (for
+example `—/992k`), never inferring used tokens from KV percentage or multiplying
+block count by block size for hybrid models. vLLM does not expose the
+SGLang-specific weight/KV memory gauges; device VRAM and utilization require
+`GPU_METRICS_URL`. Prefill rates can legitimately be zero between prompt
+bursts, even while requests decode. The full field table lives in
+`.impeccable/metrics-contract.md`.
+
+Failure handling is explicit: a 404/405 endpoint is `off` and re-probed every
+30s (fixed, since the route only reappears when the engine restarts with
+metrics enabled); other failures (`401`, `403`, `5xx`, unreachable) are `err`
+with the HTTP status and message and re-probed on the **next 1s tick** — no
+backoff, because they can recover at any moment — while a successful scrape
+clears any backoff. On any failed
+scrape the interval means and rates are zeroed (with their sample counts
+cleared) and every counter/histogram baseline is reset, so the first
+successful scrape after an outage is baseline-only rather than a delta across
+the gap. Gauges keep their last known values for backend detail, but the
+dashboard treats a non-`ok` engine as unavailable — `—` in the live cells and
+hatched in the profile — never as current load.
+
+### Sessions
+
+`GET /metrics/sessions` returns the router's **in-flight request stack**
+(`live`, oldest on top) plus **conversation-grouped sessions** (`sessions`).
+A session is identified by the SHA-1 of the conversation prefix — each
+message's role and content, length-framed, for every message except the last,
+truncated to 12 hex chars. This makes formatting changes harmless and keeps
+different role partitions distinct; identical prefixes from independent
+clients still share a session (there is no client identity in the request).
+With session admission enabled (`SESSION_ADMISSION=on`), keyed requests
+instead use their backend-scoped admission lease id — `sa:` plus a SHA-256
+digest hashed from the keyed identity and the serving backend — as the
+session registry id, so an admission-enabled keyed row is grouped by the
+same key that holds its lease (the legacy 12-hex prefix only appears on
+rows without an admission key, e.g. admission off or unkeyed traffic).
+A new conversation forks at its second turn. Non-chat requests have no
+session id but still appear in `live` and the request feed.
+
+Live entries and admission state are finalized even when an upstream stream
+is truncated or a client disconnects. The request history records `502` for
+an aborted proxy copy or `499` for a client-cancelled request (unless an
+explicit failure status was already recorded); an already-started HTTP
+response is not rewritten. A router restart clears live entries leaked by
+older builds; live requests are not restored from persisted history.
+
+Each session shows its request count, first/last activity, active flag,
+in-flight count, the latest request's context/new/cached token estimates,
+mean streaming TTFT, total duration, total output tokens, and last status;
+recent sessions expand to their last 32 requests. All token figures here are
+**estimates** (body-based, ~4 bytes/token) — see the measurement boundary
+below — never measured decode tokens.
+
+The live stack carries two prefill-progress fields per in-flight request:
+`estPrefillMs` (estimated prefill duration — `newTok` at
+`PREFILL_TOKENS_PER_SEC`, a router estimate, `0` for non-streaming requests
+and zero `newTok`) and `streamMs` (UnixMilli of the first response body byte,
+`0` while still admitted). The dashboard shows an amber prefill bar that
+fills against `estPrefillMs` while the request is admitted and flips to the
+measured first-byte age on first byte.
+
+### Measurement boundary
+
+- **`router` — measured at admission.** Requests, bytes, queue/concurrency/GPU
+  budget state, total-duration EWMA, and streaming first-byte TTFT. `reqRate`,
+  `bytesRate`, and `tokEstRate` are **trailing 30s arrival averages** (300 ×
+  100ms buckets, evaluated every 500ms), not completion deltas; a request
+  contributes from the moment it is admitted and leaves the window after 30s.
+- **`engine` — measured by the engine.** Running/waiting, KV pressure, real
+  prefill/decode token rates, interval latency means, cache hit rate, and
+  pool/memory gauges. `prefillTokS` is **compute-only** for both families;
+  `prefillCacheTokS` is the cache-hit share and `prefillTotalTokS` is their
+  sum. Engine histogram means carry an observation count (`ttftSamples`, ...);
+  zero samples means no data, rendered `—`.
+- **`est` — body-based estimates.** `tokEst*`, session token figures, and
+  `estPrefillMs` are ~4 bytes/token estimates of NEW prefill tokens; they are
+  never presented as measured decode throughput.
+- **`device` — optional and separate.** `GPU_METRICS_URL` points at a
+  Prometheus text endpoint (DCGM exporter or nvidia_gpu_exporter). The router
+  normalizes utilization to 0–100%, memory to MiB, temperature to °C, and
+  power to W, and identifies devices by UUID (or hostname + GPU index). These
+  are device-wide figures and are never attributed to a backend. Without the
+  variable, device panels show an explicit empty state; the router never
+  derives device utilization from engine counters.
+- **GPU budget is not GPU utilization.** `gpuUsed`/`gpuBudget` are the
+  router's weighted admission-budget units. Device utilization comes only
+  from the `device` source.
 
 ## Architecture
 
-`llm-router-go` implements a specialized scheduling layer to optimize GPU utilization across multiple inference servers.
+The application is a single-file Go binary (`main.go`) using only the standard library. It builds without external runtime dependencies.
 
-### Tier System
-Backends are assigned as either **King (Tier 0)** or **Subject (Tier 1)**. Tier 0 backends take precedence; Tier 1 backends are utilized based on available `MAX_GPU_BUDGET` to prevent resource starvation of primary instances.
+### Tier system
 
-### GPU Budget & Slot Manager
-The router tracks weighted GPU usage. When a Tier 0 backend is active, the router enforces a global GPU budget, limiting the concurrency of Tier 1 backends based on their `gpuWeight`.
+Backends are assigned as **King (Tier 0)** or **Subject (Tier 1)**. Tier 0 backends are always admitted with priority. When a Tier 0 request is in flight, Tier 1 admission consumes the remaining `MAX_GPU_BUDGET` according to each backend's `gpuWeight`. When no King is active, the GPU-budget check is not applied.
 
-### Queue & Load Balancing
-Each backend maintains its own request queue. Requests are routed using an Exponentially Weighted Moving Average (EWMA) of request durations to minimize latency and avoid "herd" behavior.
+### GPU budget and slot managers
 
-### Large Prefill Detection
-To prevent "head-of-line" blocking caused by massive prompt prefills, the router tracks prefill sizes and limits the number of concurrent large prefill operations per backend.
+A weighted GPU semaphore models shared GPU capacity. Each backend also has a slot manager with an optional concurrency limit and bounded queue. This keeps one saturated backend from consuming all request capacity and gives callers a bounded wait followed by a useful `429` response.
 
-## Building from Source
+### Prefill protection and load balancing
 
-The project is written in Go and uses only the standard library.
+The router estimates new prefill tokens from request bodies. Backends can cap concurrent large prefills to prevent a massive prompt from blocking smaller requests. Large-prefill slots are bounded using `PREFILL_TOKENS_PER_SEC` for non-streaming requests and release on the first response byte for streaming requests.
+
+Per-backend request durations are tracked with an exponentially weighted moving average (EWMA). Routing uses these durations with current load to reduce latency and avoid herd behavior.
+
+## Building
+
+### Build the binary
+
+The project requires Go 1.25 or newer and uses only the standard library for
+the router itself:
 
 ```bash
-go build -o llm-router-go .
+go build -o llm-router-go .          # dashboard is a 404 stub
+cd web && bun install && bun run build
+go build -tags webui -o llm-router-go .   # embedded dashboard
 ```
+
+Run the resulting binary with `BACKENDS` and any optional environment variables from [Configuration](#configuration). Without `-tags webui` the dashboard path returns 404 (`web/build` is absent); the Docker image and release builds always embed it.
+
+### Build the Docker image
+
+The repository includes a multi-stage Alpine Dockerfile. Build the image locally with:
+
+```bash
+docker build -t llm-router-go .
+```
+
+Run the local image by replacing `ghcr.io/djdembeck/llm-router-go` in the quickstart command with `llm-router-go`.
+
+## Contributing
+
+Use the repository's Gitflow model: `develop` is the integration branch and `main` is the production branch. Use Conventional Commits for pull requests.
+
+Keep the single-file, standard-library architecture intact unless the change requires otherwise. Before opening a pull request, run the repository's formatting, vetting, and test checks (`gofmt`, `go vet`, and `go test`).
 
 ## License
 
-MIT SPDX-License-Identifier: MIT
+This project is licensed under the [MIT License](LICENSE) (SPDX: `MIT`).

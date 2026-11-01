@@ -45,7 +45,7 @@ EXPRS = {
     "lint-format.real": step_if("lint-format", "Check formatting"),
     "build.job": J["build"]["if"],
     "build.gate": step_if("build", "Gate"),
-    "build.real": step_if("build", "Build"),
+    "build.real": step_if("build", "Build Go (stub)"),
     "test.job": J["test"]["if"],
     "test.gate": step_if("test", "Gate"),
     "test.real": step_if("test", "Run tests"),
