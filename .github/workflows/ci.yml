@@ -190,7 +190,10 @@ jobs:
           go-version: stable
 
       - name: Lint workflows with actionlint
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+        run: python3 scripts/check_workflow_lint.py
+
+      - name: Test workflow-lint gate
+        run: python3 scripts/test_check_workflow_lint.py
 
       - name: CI Verify harness
         # Focused harness for the classifier script and the gate expressions
