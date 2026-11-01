@@ -21,7 +21,9 @@ COPY go.mod go.sum* ./
 COPY main.go main_test.go ./
 COPY web/embed.go web/embed_stub.go web/
 COPY --from=web /web/build ./web/build
-RUN CGO_ENABLED=0 go build -tags webui -o /router main.go
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+RUN CGO_ENABLED=0 go build -tags webui -ldflags="-X main.version=${VERSION} -X main.gitCommit=${GIT_COMMIT}" -o /router main.go
 
 FROM alpine:3.24
 RUN addgroup -g 10001 router \
@@ -31,4 +33,8 @@ COPY --from=builder /router /router
 ENV LISTEN_HOST=0.0.0.0
 WORKDIR /data
 USER 10001:10001
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}"
 ENTRYPOINT ["/router"]

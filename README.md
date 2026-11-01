@@ -34,7 +34,8 @@ Use it when several inference backends share GPU hardware and naive load balanci
 - [Architecture](#architecture)
   - [Tier system](#tier-system)
   - [GPU budget and slot managers](#gpu-budget-and-slot-managers)
-  - [Prefill protection and load balancing](#prefill-protection-and-load-balancing)
+   - [Prefill protection and load balancing](#prefill-protection-and-load-balancing)
+- [Releases](#releases)
 - [Building](#building)
   - [Build the binary](#build-the-binary)
   - [Build the Docker image](#build-the-docker-image)
@@ -432,6 +433,22 @@ A weighted GPU semaphore models shared GPU capacity. Each backend also has a slo
 The router estimates new prefill tokens from request bodies. Backends can cap concurrent large prefills to prevent a massive prompt from blocking smaller requests. Large-prefill slots are bounded using `PREFILL_TOKENS_PER_SEC` for non-streaming requests and release on the first response byte for streaming requests.
 
 Per-backend request durations are tracked with an exponentially weighted moving average (EWMA). Routing uses these durations with current load to reduce latency and avoid herd behavior.
+
+## Releases
+
+Releases are automatic on promotion to `main` (each `develop` → `main` merge) or via a
+**Run workflow** dispatch with an optional explicit version/bump. The `Release` workflow keeps
+one exact-source semver tag reservation: the version tag points at the frozen commit, is never
+moved, and is reused if a release is re-run for the same source.
+
+- **GitHub Release**: published after the native outputs complete; the existing Annalist App fills notes from the previous published ancestor release, not an unfinished reserved tag.
+- **GHCR image** `ghcr.io/djdembeck/llm-router-go:<version>`: an immutable, digest-pinned build
+  stamped with `org.opencontainers.image.version` / `org.opencontainers.image.revision` labels
+  (also consumed at build time via `main.version` / `main.gitCommit`). Existing images are only
+  accepted after provenance verification; the release workflow is the sole writer of versioned
+  images, while CI publishes branch/preview tags only.
+
+Retry the original run to retain its frozen source after main advances. Automatic and manual runs share the non-cancelling native GitHub `queue: max` (up to 100 pending runs); manual-only installations remove the push trigger once. The actual router startup log consumes the selected version and separate source SHA; unconfigured builds report dev/unknown. No source version commits or merge-back are performed, and no mutable Docker `latest`/major/minor aliases are written. GitHub's *Latest* release label is independent of Docker aliases: it advances only for a new highest published stable semver release, and completing a delayed lower version never rolls it back. Main protection remains unchanged; develop keeps required CI without base freshness.
 
 ## Building
 

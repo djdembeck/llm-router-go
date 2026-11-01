@@ -3194,6 +3194,9 @@ func tier0Inflight() int32 {
 	return total
 }
 
+var version = "dev"
+var gitCommit = "unknown"
+
 // metricsAllowedHosts gates the management listener (DNS-rebinding guard).
 // Default: the loopback hosts. METRICS_ALLOWED_HOSTS overrides with a
 // comma-separated list; empty entries are dropped.
@@ -3362,6 +3365,7 @@ func drainServers(timeout time.Duration, servers ...*http.Server) {
 }
 
 func main() {
+	log.Printf("llm-router %s (commit %s)", version, gitCommit)
 	hostDefault := os.Getenv("LISTEN_HOST")
 	if hostDefault == "" {
 		hostDefault = "127.0.0.1"
