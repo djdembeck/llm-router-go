@@ -76,9 +76,9 @@ jobs:
                   exit 0
                 fi
                 LOG=$(git log --format=%B "${LATEST_TAG}..HEAD" 2>/dev/null || true)
-                if echo "$LOG" | grep -qE 'BREAKING CHANGE:|^[a-z]+(\([^)]*\))?!: '; then LEVEL=major
-                elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?: '; then LEVEL=minor
-                else LEVEL=patch; fi
+                if echo "$LOG" | grep -qE 'BREAKING CHANGE:|^[a-z]+(\([^)]*\))?!: '; then LEVEL="major"
+                elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?: '; then LEVEL="minor"
+                else LEVEL="patch"; fi
                 ;;
               patch|minor|major) LEVEL="$BUMP_INPUT" ;;
               *) echo "Invalid bump input: ${BUMP_INPUT} (auto|patch|minor|major)"; exit 1 ;;
