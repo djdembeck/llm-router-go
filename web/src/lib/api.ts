@@ -279,6 +279,8 @@ export interface SessionRow {
   lastMs: number;
   active: boolean;
   liveN: number;
+  admissionLease: boolean;
+  admissionIdleSinceMs: number;
   ctxTok: number;
   newTok: number;
   cachedTok: number;

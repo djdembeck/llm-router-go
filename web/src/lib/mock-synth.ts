@@ -884,6 +884,9 @@ export function synthSessions(nowMs: number): SessionsFeed {
       lastMs,
       active,
       liveN: isLive ? 1 : 0,
+      // The mock has no admission simulator: it never invents leases.
+      admissionLease: false,
+      admissionIdleSinceMs: 0,
       ctxTok: latest.ctxTok,
       newTok: latest.newTok,
       cachedTok,

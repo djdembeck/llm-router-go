@@ -294,7 +294,14 @@ single-message conversation uses that message's content) — hex-encoded,
 truncated to **12 chars**. Length framing avoids concatenation collisions
 and keeps role changes distinct. Same conversation prefix → same
 session; a conversation **forks a new session at its second turn** (the
-prefix grows). Non-chat paths (`/v1/completions` with a `prompt` string, or
+prefix grows). With session admission enabled (`SESSION_ADMISSION=on`),
+keyed requests instead use their backend-scoped admission lease id —
+`sa:` plus a SHA-256 digest hashed from the keyed identity and the
+serving backend, stable across the session's growth — as the session
+row id, so an admission-enabled keyed row is grouped by the same key
+that holds its lease (the legacy 12-char prefix only appears on rows
+without an admission key, e.g. admission off or unkeyed traffic).
+Non-chat paths (`/v1/completions` with a `prompt` string, or
 unparseable bodies) get `sess: ""` — the request still appears in `live`
 but is excluded from `sessions`.
 
@@ -334,6 +341,9 @@ what the gate measures (see honest boundary).
 - `tokOutTotal` — Σ tokOut (est, bytesOut/4).
 - `lastStatus` — latest request status (rejections count).
 - `reqs` — last **32** completed requests, **oldest first**, included ONLY for sessions that are active (liveN>0) OR have `lastMs` within **60s**, AND within the **first 20** sessions after sorting; otherwise `null`.
+- **Additive telemetry fields** (always present; safe to ignore on older consumers):
+  - `admissionLease` — `true` when this conversation currently holds a TTL-bounded session-admission lease (requires a session with an admission key; `false` when admission is off, unkeyed, or the lease expired).
+  - `admissionIdleSinceMs` — Unix-millisecond timestamp (wall clock — `time.Now()` in production; the manual clock is an injectable test implementation, not the production source) when the lease went idle (0 while the lease is active/accepted-queued; >0 while idle-retaining its slot for `SESSION_IDLE_TTL`).
 - Sort: **active first, then `lastMs` descending**. Feed cap **100** (least-recent evicted); internal store cap **512** (LRU by `lastMs`).
 
 **Rejections (429/413)** never enter `live` — they bypass it and are folded
