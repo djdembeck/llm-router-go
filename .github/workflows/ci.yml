@@ -129,7 +129,7 @@ jobs:
             else
               while IFS= read -r -d '' path; do
                 case "$path" in
-                  .github/workflows/*.yml|.github/workflows/*.yaml|.ci-verify/*) WORKFLOW=true ;;
+                  .github/workflows/*.yml|.github/workflows/*.yaml|.ci-verify/*|scripts/check_workflow_lint.py|scripts/test_check_workflow_lint.py) WORKFLOW=true ;;
                   web/embed.go|web/embed_stub.go) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
                   *_test.go) LINT=true; TEST=true ;;
                   web/src/*|web/package.json|web/bun.lock|web/vite.config.ts|web/svelte.config.js|web/tsconfig.json) BUILD=true; DOCKER=true ;;
