@@ -68,14 +68,16 @@ The router's scheduling controls are deliberately narrow:
 
 ## Install/Running
 
-Docker is the fastest path to a running router. The container listens on port `80`.
+Docker is the fastest path to a running router. The container listens on `0.0.0.0:80` (`LISTEN_HOST=0.0.0.0` in the image) as UID/GID `10001:10001`; the quickstarts publish it only on host loopback. Native binaries default to `127.0.0.1:80`.
+
+For persistent history, mount a directory writable by UID/GID `10001:10001` at `/data` and set `HISTORY_PATH=/data/history.gob`. For example, prepare a dedicated bind directory with `sudo install -d -o 10001 -g 10001 -m 0700 ./router-data`, then add `-v "$PWD/router-data:/data" -e HISTORY_PATH=/data/history.gob` to the run command. Existing bind mounts must permit this identity to create and rename the snapshot file; mounting only a single file prevents atomic replacement. Configuration still comes from environment variables (`--env-file` is read by Docker on the host), not a writable config file. History remains optional, with the existing once-per-minute atomic snapshots and memory-only fallback on write errors. On runtimes that restrict unprivileged ports inside the container, use `-port 8080` after the image name and publish `127.0.0.1:8080:8080` instead.
 
 ### Docker image
 
 Pull the pre-built image from GHCR and provide the required `BACKENDS` JSON array:
 
 ```bash
-docker run -d --name llm-router-go -p 80:80 -p 127.0.0.1:9100:9100 \
+docker run -d --name llm-router-go -p 127.0.0.1:80:80 -p 127.0.0.1:9100:9100 \
   -e BACKENDS='[{"name":"primary","url":"http://vllm-1:8000","maxConcurrent":4,"tier":0}]' \
   -e METRICS_LISTEN=0.0.0.0:9100 \
   ghcr.io/djdembeck/llm-router-go
@@ -100,7 +102,7 @@ The resulting `llm-router-go` binary is placed in the Go binary directory (`$GOB
 Start the pre-built container with one vLLM backend:
 
 ```bash
-docker run -d --name llm-router-go -p 80:80 -p 127.0.0.1:9100:9100 \
+docker run -d --name llm-router-go -p 127.0.0.1:80:80 -p 127.0.0.1:9100:9100 \
   -e BACKENDS='[{"name":"primary","url":"http://vllm-1:8000","maxConcurrent":4,"tier":0}]' \
   -e METRICS_LISTEN=0.0.0.0:9100 \
   ghcr.io/djdembeck/llm-router-go
@@ -133,7 +135,11 @@ The `.env.example` file contains a minimal backend entry and the default scalar 
 
 ## Configuration
 
-The router is configured entirely through environment variables. `BACKENDS` is required; the scalar variables have the defaults shown here.
+The router is configured through environment variables plus the existing `-port` flag (default `80`) and `-host` (overrides `LISTEN_HOST`). `BACKENDS` is required; the scalar variables have the defaults shown here. For intentional LAN exposure, choose `LISTEN_HOST=0.0.0.0`, `-host 0.0.0.0`, or a specific interface (IPv6 addresses are supported); place authentication/TLS at the reverse proxy boundary.
+
+Both HTTP listeners bound header reads to 10 seconds, the complete incoming request (headers plus body) to 2 minutes, and idle keep-alive connections to 2 minutes by default. Increase `READ_TIMEOUT` for legitimate slow/large uploads; `MAX_BODY_BYTES` keeps its existing 16 MiB default. There is deliberately no response write timeout: ongoing SSE and long generation responses are not cut off by the incoming-read or keep-alive bounds. Go's header parser permits a small read-ahead allowance beyond `MAX_HEADER_BYTES`; oversized headers receive `431`.
+
+On SIGTERM or SIGINT, both listeners stop accepting requests and drain active requests concurrently for up to `SHUTDOWN_TIMEOUT` (default 30 seconds). Streams finishing within that window complete normally; at the deadline, remaining connections are forcibly closed, canceling upstream requests, then the process exits. Set the supervisor/container stop grace longer than this timeout (for example, `docker stop --time 40 llm-router-go` for the default). Dashboard SSE connections also count as active streams.
 
 ### Backends
 
@@ -172,6 +178,12 @@ BACKENDS='[
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `BACKENDS` | Required | JSON array of backend server configurations. |
+| `LISTEN_HOST` | `127.0.0.1` (image: `0.0.0.0`) | Data-plane bind host; `-host` overrides it. Port remains controlled by `-port` (default `80`). |
+| `READ_HEADER_TIMEOUT` | `10s` | Maximum incoming header-read duration, both listeners. |
+| `READ_TIMEOUT` | `2m` | Maximum incoming header + body-read duration, not response duration. |
+| `IDLE_TIMEOUT` | `2m` | Maximum idle keep-alive duration, not active stream duration. |
+| `MAX_HEADER_BYTES` | `1048576` (1 MiB) | Header parsing limit, plus Go's read-ahead allowance. |
+| `SHUTDOWN_TIMEOUT` | `30s` | Shared graceful-drain deadline before closing remaining connections. |
 | `MAX_QUEUE_TIMEOUT` | `30s` | Maximum time a request waits in a queue before returning `429 Too Many Requests`. |
 | `MAX_GPU_BUDGET` | `4` | Maximum weighted GPU usage while any Tier 0 (King) backend is active. |
 | `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Larger requests receive HTTP `413` with `X-Router-Reason: body-too-large`. |
@@ -188,7 +200,7 @@ BACKENDS='[
 
 ## API
 
-The router listens on `:80` by default.
+The native router listens on `127.0.0.1:80` by default; `-port` retains its existing meaning. The image explicitly binds `0.0.0.0:80` inside its network namespace.
 
 ### `/health`
 
