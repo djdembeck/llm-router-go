@@ -184,6 +184,7 @@ BACKENDS='[
 | `HISTORY_PATH` | *(empty)* | Optional file for the dashboard's history rings. Atomic snapshots every minute; empty means memory-only (history resets on restart). |
 | `GPU_METRICS_URL` | *(empty)* | Optional Prometheus text endpoint for device GPU utilization/VRAM/temperature/power (DCGM exporter or nvidia_gpu_exporter). Empty disables device telemetry; engine KV/memory gauges remain available. |
 | `METRICS_LISTEN` | `127.0.0.1:9100` | Address for the management listener that serves the dashboard and the `/metrics/*` endpoints (including in-flight and conversation session data, which is never exposed on the external listener). Point it at a LAN interface to expose the dashboard to that network. |
+| `METRICS_ALLOWED_HOSTS` | `127.0.0.1,::1,localhost` | Comma-separated Host allowlist for the management listener (DNS-rebinding guard): only requests whose `Host` header matches (port stripped) reach the management routes (`/metrics/*`, `/stats`, the web SPA `/`); every other Host is rejected with `403`. Extend with the reverse proxy's funnel domain when the management listener is exposed past loopback. Invalid values fail startup, like the `SESSION_*` knobs. |
 
 ## API
 
@@ -217,10 +218,10 @@ What the ticket grants (per backend):
 * **Queueing:** when the per-backend shape is full, new (new-identity) arrivals wait in a strictly FIFO queue, bounded by `SESSION_MAX_WAITING` (defaults to each backend's `maxQueueDepth`, otherwise 2) and by `MAX_QUEUE_TIMEOUT` for how long they may wait. Exceeding either — the queue is full, or the grace has elapsed — instantiates `429` (`session-admission-queue-full` / `session-admission-timeout`).
 * **TTL retention:** when a conversation's accepted set drops to zero, its lease is not dropped immediately. It enters an *idle* state for `SESSION_IDLE_TTL` (default 5m) during which it continues to occupy its shape and is not re-admitted; a valid idle lease immediately re-admits that identity, so a returning conversation gets back in without spending a new ticket.
 * **Admission safety:** a *new* identity is only admitted when (a) the per-backend shape has room AND (b) no earlier-queued newcomer that holds no lease of its own would be truncated by the new arrival. Same-identity waiters can cut in line behind a blocked waiter (the identity lease is authoritative), but a new identity never gets to cut in line for another newcomer.
-* **Cancellations / timeouts / rejections:** a cancelled client (499) or a queued admission that times out mint *no* lease and take no shape. A request that is rejected *after* admission (tier-0 block, GPU budget, in-flight slot, prefill) holds the ticket until handler completion — the accepted count reflects “in flight at this backend’s slot,” not “upstream is running.”
+* **Cancellations / timeouts / rejections:** a cancelled client (499) *before* an admission grant, or a queued admission that times out, mint *no* lease and take no shape. A cancellation *after* admission already holds the ticket — handler completion releases it and starts the idle TTL — and a request that is rejected *after* admission (tier-0 block, GPU budget, in-flight slot, prefill) likewise holds its ticket until handler completion; the accepted count reflects “in flight at this backend’s slot,” not “upstream is running.”
 * **Scope of admission:** off (`SESSION_ADMISSION` unset or `off`) and keyless traffic (no `prompt_cache_key` — or no source configured) bypass the gate entirely and keep the legacy per-request shape exactly. The key is backend-scoped: the same key on two backends is two distinct leases.
 
-The dashboard’s session feed (`/metrics/stream` and `sessions`) reports `admissionLease` and `admissionIdleSinceMs` per row from the lease map itself, so the live view never claims a lease the registry (a bounded, evictable view) has no record of.
+The session feed served by `GET /metrics/sessions` reports `admissionLease` and `admissionIdleSinceMs` per row from the lease map itself, so the live view never claims a lease the registry (a bounded, evictable view) has no record of. (`/metrics/stream` carries the per-backend and live request state; the admission fields are on the `/metrics/sessions` `sessions[]` rows.)
 
 
 ## Dashboard
@@ -262,9 +263,12 @@ listener — `METRICS_LISTEN` (default `127.0.0.1:9100`) — which is separate
 from the external API listener. Because `/metrics/sessions` exposes
 in-flight and per-conversation request data, that surface binds to the
 loopback interface by default; point `METRICS_LISTEN` at a LAN interface
-only when the deployment boundary (TLS/auth reverse proxy) covers it. The
-external listener keeps `/health`, `/stats`, and `/v1/*` only. It reads four
-endpoints:
+only when the deployment boundary (TLS/auth reverse proxy) covers it.
+As a DNS-rebinding guard, the entire management mux (all `/metrics/*`
+routes, `/stats`, and the SPA `/`) enforces a Host allowlist — loopback
+hosts by default, `METRICS_ALLOWED_HOSTS` to extend — and answers any other
+requesting Host with `403`. The external listener keeps `/health`,
+`/stats`, and `/v1/*` only. It reads four endpoints:
 
 | Endpoint | Description |
 | :--- | :--- |
@@ -341,6 +345,12 @@ message's role and content, length-framed, for every message except the last,
 truncated to 12 hex chars. This makes formatting changes harmless and keeps
 different role partitions distinct; identical prefixes from independent
 clients still share a session (there is no client identity in the request).
+With session admission enabled (`SESSION_ADMISSION=on`), keyed requests
+instead use their backend-scoped admission lease id — `sa:` plus a SHA-256
+digest hashed from the keyed identity and the serving backend — as the
+session registry id, so an admission-enabled keyed row is grouped by the
+same key that holds its lease (the legacy 12-hex prefix only appears on
+rows without an admission key, e.g. admission off or unkeyed traffic).
 A new conversation forks at its second turn. Non-chat requests have no
 session id but still appear in `live` and the request feed.
 

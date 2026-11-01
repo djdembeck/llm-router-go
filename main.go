@@ -3142,6 +3142,7 @@ func (a *sessionAdmission) snapshot(key string) (held bool, idleSince time.Time)
 	return true, time.Time{}
 }
 
+// estimateCtxTokens estimates the conversation context (all messages, or the prompt) in tokens, ~4 bytes/token.
 func estimateCtxTokens(parsed *parsedBody) int {
 	if len(parsed.Messages) > 0 {
 		chars := 0
@@ -3189,6 +3190,75 @@ func tier0Inflight() int32 {
 		}
 	}
 	return total
+}
+
+// metricsAllowedHosts gates the management listener (DNS-rebinding guard).
+// Default: the loopback hosts. METRICS_ALLOWED_HOSTS overrides with a
+// comma-separated list; empty entries are dropped.
+var metricsAllowedHosts = map[string]bool{
+	"127.0.0.1": true,
+	"::1":       true,
+	"localhost": true,
+}
+
+// loadMetricsAllowedHosts parses METRICS_ALLOWED_HOSTS into the Host
+// allowlist for the management listener, validating like the SESSION_*
+// knobs: an explicit value that names no valid Host fails startup.
+// Comma-separated plain Host values (no port, no wildcard); empty
+// string = keep the default loopback allowlist.
+func loadMetricsAllowedHosts(v string) (map[string]bool, error) {
+	if v == "" {
+		return map[string]bool{"127.0.0.1": true, "::1": true, "localhost": true}, nil
+	}
+	hosts := map[string]bool{}
+	for _, h := range strings.Split(v, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(h); err == nil {
+			if host == "" {
+				return nil, fmt.Errorf("invalid METRICS_ALLOWED_HOSTS %q: empty host", v)
+			}
+			h = host
+		}
+		if strings.ContainsAny(h, "* ") {
+			return nil, fmt.Errorf("invalid METRICS_ALLOWED_HOSTS %q: wildcards/spaces not allowed", v)
+		}
+		hosts[normalizeHost(h)] = true
+	}
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("invalid METRICS_ALLOWED_HOSTS %q: no hosts", v)
+	}
+	return hosts, nil
+}
+
+// normalizeHost canonicalizes a Host value for allowlist comparison:
+// hostnames are case-insensitive (lowercase), and bracketed IPv6 literals
+// ("[::1]") are compared bare ("::1").
+func normalizeHost(h string) string {
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	return strings.ToLower(h)
+}
+
+// metricsHostGuard wraps the entire management mux: requests whose Host
+// header (the host part, port stripped) is not in the allowlist get 403.
+// This is the DNS-rebinding guard — a rebinding domain answers requests
+// carrying a non-loopback Host, even against a loopback bind.
+func metricsHostGuard(allowed map[string]bool, next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host := normalizeHost(r.Host)
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = normalizeHost(h)
+		}
+		if !allowed[host] {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
 }
 
 // buildMux assembles the router's external route table. /v1/ is the proxy
@@ -3405,6 +3475,15 @@ func main() {
 		metricsListen = v
 	}
 
+	// DNS-rebinding guard for the management listener: only requests whose
+	// Host header matches an allowlisted host (loopback by default) reach
+	// the management routes; everything else is a 403 at the mux wrapper.
+	hosts, err := loadMetricsAllowedHosts(os.Getenv("METRICS_ALLOWED_HOSTS"))
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	metricsAllowedHosts = hosts
+
 	// Management listener: the embedded SPA dashboard plus the live metrics
 	// feeds, sharing one trust zone — it binds 127.0.0.1 by default
 	// (METRICS_LISTEN) and is pointed at a LAN interface only when the
@@ -3412,9 +3491,10 @@ func main() {
 	// web.Handler() is a 404 stub, so the dashboard route is a no-op there.
 	metricsMux := buildMetricsMux()
 	metricsMux.Handle("/", web.Handler())
+	metricsHandler := metricsHostGuard(metricsAllowedHosts, metricsMux)
 	go func() {
 		log.Printf("management listener: dashboard + /metrics/* on %s", metricsListen)
-		if err := http.ListenAndServe(metricsListen, metricsMux); err != nil {
+		if err := http.ListenAndServe(metricsListen, metricsHandler); err != nil {
 			// The management surface (SPA dashboard, /metrics, /feeds,
 			// /stats) is telemetry; a port collision or other bind failure
 			// must not kill the data plane. Routing keeps serving without
@@ -5323,7 +5403,6 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 					recordRejection(499)
 					return
 				}
-				status := http.StatusTooManyRequests
 				reason := "session-admission-queue-full"
 				if errors.Is(aerr, errSessionAdmissionTimeout) {
 					reason = "session-admission-timeout"
@@ -5334,12 +5413,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 					log.Printf("%s %s -> %s (model=%s) admission error: %v",
 						r.Method, r.URL.Path, target.Name, modelName, aerr)
 				}
-				if status == http.StatusTooManyRequests {
-					log.Printf("%s %s -> %s (model=%s) 429: %s (admission wait=%v)",
-						r.Method, r.URL.Path, target.Name, modelName, reason, time.Since(admitStart))
-					write429(w, reason, target.Name, estimateRetryAfter(target.Name))
-					recordRejection(http.StatusTooManyRequests)
-				}
+				log.Printf("%s %s -> %s (model=%s) 429: %s (admission wait=%v)",
+					r.Method, r.URL.Path, target.Name, modelName, reason, time.Since(admitStart))
+				write429(w, reason, target.Name, estimateRetryAfter(target.Name))
+				recordRejection(http.StatusTooManyRequests)
 				return
 			}
 			waitMs := float64(time.Since(admitStart) / time.Millisecond)

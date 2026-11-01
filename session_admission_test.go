@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -135,26 +137,48 @@ func saChatStreamBody(model, key, msg string) string {
 	return fmt.Sprintf(`{"model":%q,"stream":true,"messages":[{"role":"user","content":%q}]}`, model, msg)
 }
 
-func saPost(t *testing.T, url, body string) (int, http.Header, string) {
-	t.Helper()
+// saPostOut carries one POST's outcome; the returned err != nil means the
+// transport or the body read failed (no status code exists).
+type saPostOut struct {
+	code int
+	hdr  http.Header
+	body string
+}
+
+// saPostOutDo is the low-level POST: transport and read errors are
+// reported to the CALLER (never t.Fatalf inside a goroutine — that would
+// leave saPostAsync callers hanging on the result channel without a test
+// failure on the test goroutine).
+func saPostOutDo(url, body string) (saPostOut, error) {
 	resp, err := http.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
-		t.Fatalf("POST: %v", err)
+		return saPostOut{}, fmt.Errorf("POST: %w", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, resp.Header, string(data)
+	data, rerr := io.ReadAll(resp.Body)
+	return saPostOut{code: resp.StatusCode, hdr: resp.Header, body: string(data)}, rerr
+}
+
+func saPost(t *testing.T, url, body string) (int, http.Header, string) {
+	t.Helper()
+	out, err := saPostOutDo(url, body)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return out.code, out.hdr, out.body
 }
 
 // saPostAsync issues the request on a goroutine: required for gated
 // engines (the upstream response only lands once the test releases the
-// gate, so a synchronous POST would deadlock the test).
+// gate, so a synchronous POST would deadlock the test). Transport/read
+// errors travel through the channel as status 0; the test goroutine
+// converts them into t.Fatal (0 never matches an expected 2xx/4xx).
 func saPostAsync(t *testing.T, url, body string) chan int {
 	t.Helper()
 	out := make(chan int, 1)
 	go func() {
-		code, _, _ := saPost(t, url, body)
-		out <- code
+		res, _ := saPostOutDo(url, body)
+		out <- res.code
 	}()
 	return out
 }
@@ -177,11 +201,17 @@ func newSAServing() *saServing {
 		s.mu.Lock()
 		s.cnt++
 		s.mu.Unlock()
+		// Deferred decrement: handleProxy unwinds via http.ErrAbortHandler
+		// when a committed proxy copy is interrupted (client/upstream died
+		// mid-stream) — the std server recovers that panic, so the counter
+		// must decrement in the abort path too, or awaitIdle hangs.
+		defer func() {
+			s.mu.Lock()
+			s.cnt--
+			s.cv.Signal()
+			s.mu.Unlock()
+		}()
 		handleProxy(w, r)
-		s.mu.Lock()
-		s.cnt--
-		s.cv.Signal()
-		s.mu.Unlock()
 	})
 	s.ts = httptest.NewServer(mux)
 	return s
@@ -207,11 +237,15 @@ func newSAServingMux() *saMetricsServing {
 		s.mu.Lock()
 		s.cnt++
 		s.mu.Unlock()
+		// Deferred decrement — same http.ErrAbortHandler contract as
+		// newSAServing.
+		defer func() {
+			s.mu.Lock()
+			s.cnt--
+			s.cv.Signal()
+			s.mu.Unlock()
+		}()
 		handleProxy(w, r)
-		s.mu.Lock()
-		s.cnt--
-		s.cv.Signal()
-		s.mu.Unlock()
 	})
 	s.ts = httptest.NewServer(mux)
 	return s
@@ -446,26 +480,56 @@ func saPollEngineSeen(t *testing.T, e *saGateEngine, order ...string) {
 	}
 }
 
+// saPollAdmittedLeases polls until the per-backend manager holds EXACTLY
+// `want` admitted leases (len(leaseMap)): the deterministic replacement for a
+// fixed sleep after an admission grant — a lease appears only once the
+// granted handler's admission lands, so the count is stable once reached.
+func saPollAdmittedLeases(t *testing.T, backend string, want int) {
+	t.Helper()
+	m := sessionAdmissions[backend]
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		got := len(m.leaseMap)
+		m.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admission leases = %d, want %d", got, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// saPollAdmissionWaiting polls until the per-backend manager's FIFO
+// admission queue holds EXACTLY `want` distinct-waiters (mgr.waiting): the
+// deterministic replacement for a fixed sleep after a reject/queue
+// transition. waiting counts queued (not yet admitted) requests.
+func saPollAdmissionWaiting(t *testing.T, backend string, want int) {
+	t.Helper()
+	m := sessionAdmissions[backend]
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		got := m.waiting
+		m.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admission waiting = %d, want %d", got, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // saIsolate swaps in a fresh registry/metrics for the test.
 func saIsolate(t *testing.T) {
 	t.Helper()
 	oldSessions, oldMetrics := sessions, metrics
 	sessions, metrics = newSessionRegistry(), newTestMetrics()
 	t.Cleanup(func() { sessions, metrics = oldSessions, oldMetrics })
-}
-
-// saAdmKeyD is saAdmKey with a caller-chosen deadline (the manual clock
-// is the deadline clock; a long test whose advances approach
-// queueTimeout must keep its admission-key references at a short,
-// bounded deadline).
-func saAdmKeyD(t *testing.T, key, backend string, d time.Duration) string {
-	t.Helper()
-	p := &parsedBody{PromptCacheKey: json.RawMessage("\"" + key + "\"")}
-	k := admissionKeyFor(p, httptest.NewRequest("POST", "/v1/chat/completions", nil), backend, "prompt_cache_key", "")
-	if k == "" {
-		t.Fatalf("admissionKeyFor returned empty for %q", key)
-	}
-	return k
 }
 
 func saAdmKey(t *testing.T, key, backend string) string {
@@ -488,8 +552,9 @@ func saAdmRow(f sessionsFeed, id string) *sessFrame {
 }
 
 // saHTTPSetup wires a real router listener, a gated engine, and admission
-// env for backend "smoke" (maxConcurrent 2, queue 4). Cleanup LIFO:
-// drain handlers → release engine gates → close the server.
+// env for backend "smoke" (maxConcurrent 2, queue 4). Cleanup LIFO
+// (last registered runs first): drain handlers → release engine gates →
+// close the engine server → close the router server.
 func saHTTPSetup(t *testing.T, ttl time.Duration, cap, waiting int) (*saServing, *saGateEngine, *saManualClock) {
 	t.Helper()
 	engine := newSAGateEngine()
@@ -502,6 +567,7 @@ func saHTTPSetup(t *testing.T, ttl time.Duration, cap, waiting int) (*saServing,
 	withAdmissionEnv(t, ttl, c, cap, waiting)
 	s := newSAServing()
 	t.Cleanup(func() { s.ts.Close() })
+	t.Cleanup(func() { engine.TS.Close() }) // LIFO: after handler drain + gate release
 	t.Cleanup(func() { engine.releaseAll() })
 	t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
 	return s, engine, c
@@ -855,6 +921,86 @@ func TestSessionAdmission_FIFOOrderWithoutTraffic(t *testing.T) {
 	}
 }
 
+// TestSessionAdmission_FIFOSingleExpiry tightens the no-traffic FIFO test to
+// ONE expiry at a time: B's retention lease expires first and ALONE frees
+// exactly one slot — the queue head C (enqueued before D) is the only grant,
+// and D provably stays queued; A's later expiry (armed one manual-millisecond
+// later, so its deadline is strictly separated from B's) then proceeds D,
+// while C's freshly admitted lease is certified still idle-held.
+func TestSessionAdmission_FIFOSingleExpiry(t *testing.T) {
+	const ttl = 10 * time.Second
+	c := newSAManualClock()
+	a := newSessionAdmission(2, 5, ttl, c)
+	ctx := context.Background()
+
+	waitingNow := func() int {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.waiting
+	}
+	waitFor := func(what string, n int) {
+		deadline := time.Now().Add(2 * time.Second)
+		for waitingNow() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s (waiting=%d, want %d)", what, waitingNow(), n)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	tB, _ := a.acquire(ctx, "kB", time.Minute)
+	tB.release() // idle at T0; expiry armed at T0+ttl
+	T1 := c.Now()
+	c.Advance(time.Millisecond) // no timer is due
+	tA, _ := a.acquire(ctx, "kA", time.Minute)
+	tA.release() // idle at T0+1ms; expiry armed AFTER B's
+	if !c.Now().After(T1) {
+		t.Fatal("manual clock did not advance")
+	}
+
+	cOut := make(chan *sessionAdmissionTicket, 1)
+	go func() { tk, _ := a.acquire(ctx, "kC", time.Minute); cOut <- tk }()
+	waitFor("C queued", 1)
+	dOut := make(chan *sessionAdmissionTicket, 1)
+	go func() { tk, _ := a.acquire(ctx, "kD", time.Minute); dOut <- tk }()
+	waitFor("D queued", 2)
+
+	// First tick: only B is due (T0+ttl). Exactly one slot frees; the
+	// queue head C — confirmed enqueued before D — is the ONLY grant.
+	c.Advance(ttl - time.Millisecond)
+	select {
+	case tk := <-cOut:
+		tk.release() // C idles now at T0+ttl, timer T0+ttl+ttl
+	case <-time.After(2 * time.Second):
+		t.Fatal("queue head C not admitted by the single B-expiry tick")
+	}
+	select {
+	case <-dOut:
+		t.Fatal("D admitted on B's single expiry — FIFO order broken")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if held, since := a.snapshot("kC"); !held || since.IsZero() {
+		t.Fatalf("C lease = held %v since %v, want idle-held", held, since)
+	}
+
+	// Second tick: A at T0+ttl+1ms is the ONLY other due timer — C's own
+	// expiry sits a full TTL (10s) away. D proceeds on the freed slot, and
+	// C's lease survives the tick.
+	c.Advance(2 * time.Millisecond)
+	select {
+	case tk := <-dOut:
+		tk.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("D not admitted after the second expiry tick")
+	}
+	if held, since := a.snapshot("kC"); !held || since.IsZero() {
+		t.Fatalf("C lease outlived... = held %v since %v, want still idle-held", held, since)
+	}
+	if held, _ := a.snapshot("kA"); held {
+		t.Fatal("A lease back after its expiry")
+	}
+}
+
 func TestSessionAdmission_FIFOSameIdentityPastBlocked(t *testing.T) {
 	// C/D/C with cap 1: D blocks on the full lease; the LATER C (same
 	// identity) slips past D to the held lease and is granted. D's
@@ -868,16 +1014,25 @@ func TestSessionAdmission_FIFOSameIdentityPastBlocked(t *testing.T) {
 	tC1, _ := a.acquire(ctx, "kC", time.Minute)
 	dOut := make(chan error, 1)
 	go func() { _, e := a.acquire(ctx, "kD", time.Minute); dOut <- e }()
-	cOut := make(chan *sessionAdmissionTicket, 1)
+	type cResult struct {
+		tk *sessionAdmissionTicket
+		e  error
+	}
+	cOut := make(chan cResult, 1)
 	go func() {
 		t3, e := a.acquire(ctx, "kC", time.Minute)
-		cOut <- t3
-		_ = e
+		cOut <- cResult{t3, e}
 	}()
 	time.Sleep(50 * time.Millisecond)
 	select {
-	case tk := <-cOut:
-		tk.release()
+	case res := <-cOut:
+		if res.e != nil {
+			t.Fatalf("later C acquire: %v", res.e)
+		}
+		if res.tk == nil {
+			t.Fatal("later C acquire: nil ticket")
+		}
+		res.tk.release()
 	case <-time.After(2 * time.Second):
 		t.Fatal("later C not granted past blocked D")
 	}
@@ -1150,7 +1305,7 @@ func TestSessionAdmission_HTTPIdleRetentionAndHolderBypass(t *testing.T) {
 	// C blocks on the admission gate: it must hold no GPU, execution, or
 	// prefill permit.
 	cDone := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "C", "hello")); cDone <- code }()
+	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "C", "hello")); cDone <- out.code }()
 	time.Sleep(200 * time.Millisecond)
 	if st, err := http.Get(s.ts.URL + "/stats"); err == nil {
 		sb, _ := io.ReadAll(st.Body)
@@ -1223,7 +1378,7 @@ func TestSessionAdmission_HOLPHolderRetention(t *testing.T) {
 	// C queues against the two retained idle leases. A's next turn must
 	// reach the fake upstream while the cap is occupied and C is queued.
 	cDone := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "C", "hello")); cDone <- code }()
+	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "C", "hello")); cDone <- out.code }()
 	turn2 := saPostAsync(t, url, saChatBody("smoke", "A", "turn two"))
 	time.Sleep(150 * time.Millisecond)
 	// Turn 1's gate opens: the returning holder COMPLETES before the
@@ -1271,28 +1426,45 @@ func TestSessionAdmission_HOLPHolderRetention(t *testing.T) {
 }
 
 func TestSessionAdmission_AcceptedLifetimeHold(t *testing.T) {
+	// maxAdmitted 1: A's single lease is the WHOLE admitted set, so C
+	// cannot be admitted at all while any accepted A request is
+	// outstanding or the idle TTL is in flight — C is ADMISSION-queued,
+	// not merely slot-blocked. (With cap 2 C is its own lease, only
+	// slot-blocked, and the lease-retention clause is unexercised.)
 	const ttl = 3 * time.Second
-	s, engine, c := saHTTPSetup(t, ttl, 2, 4)
+	s, engine, c := saHTTPSetup(t, ttl, 1, 4)
 	url := s.ts.URL + "/v1/chat/completions"
 
 	// A1 takes an execution slot; A2 (same key) is lease-admitted and
 	// QUEUED at the backend slot (maxConcurrent 2 both run; the second one
 	// stays a QUEUED ACCEPTED request: admitted, not yet running).
 	a1Done := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "A", "one")); a1Done <- code }()
-	time.Sleep(100 * time.Millisecond)
+	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "A", "one")); a1Done <- out.code }()
+	saPollEngineSeen(t, engine, "A")
 	a2Done := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "A", "two")); a2Done <- code }()
-	time.Sleep(100 * time.Millisecond)
+	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "A", "two")); a2Done <- out.code }()
+	saPollEngineSeen(t, engine, "A", "A")
 	cDone := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "C", "x")); cDone <- code }()
+	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "C", "x")); cDone <- out.code }()
 
-	// Far past the TTL: two outstanding accepted A requests hold the
-	// lease; C (new identity) must not be invested.
-	c.Advance(ttl * 10)
+	// C (new identity, cap 1) must be admission-queued BEHIND A's held
+	// lease — its forward cannot exist, and the manager reports exactly
+	// one admitted lease (A) and one queued admission (C).
+	saPollAdmittedLeases(t, "smoke", 1)
+	saPollAdmissionWaiting(t, "smoke", 1)
+	if held, _ := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "C", "smoke")); held {
+		t.Fatal("newcomer C minted/immediately admitted a lease at cap 1")
+	}
+
+	// Two outstanding accepted A requests hold the ACTIVE lease. An
+	// active lease never expires, so a short probe advance (kept far
+	// below C's queueTimeout admission deadline, or it would 429) is all
+	// the clock certificate the checkpoints need: C stays in the queue.
+	c.Advance(ttl / 10)
 	if n := len(engine.Seen()); n != 2 {
 		t.Fatalf("engine seen = %v, want two A requests", engine.Seen())
 	}
+	saPollAdmissionWaiting(t, "smoke", 1)
 	select {
 	case <-cDone:
 		t.Fatal("newcomer C admitted while accepted A requests are outstanding")
@@ -1308,7 +1480,8 @@ func TestSessionAdmission_AcceptedLifetimeHold(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("A1 did not complete")
 	}
-	c.Advance(ttl * 10)
+	c.Advance(ttl / 10)
+	saPollAdmissionWaiting(t, "smoke", 1)
 	select {
 	case <-cDone:
 		t.Fatal("C admitted while A2 still runs")
@@ -1408,16 +1581,16 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 	t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
 
 	url := s.ts.URL + "/v1/chat/completions"
-	kF := saAdmKeyD(t, "F", "smoke", 60*time.Second)
-	kM := saAdmKeyD(t, "M", "smoke", 60*time.Second)
-	kB := saAdmKeyD(t, "B", "smoke", 60*time.Second)
-	kC := saAdmKeyD(t, "C", "smoke", 60*time.Second)
+	kF := saAdmKey(t, "F", "smoke")
+	kM := saAdmKey(t, "M", "smoke")
+	kB := saAdmKey(t, "B", "smoke")
+	kC := saAdmKey(t, "C", "smoke")
 
 	// 1. K (king) runs, gated. F (smoke) runs and completes immediately.
 	kDone := saPostAsync(t, url, saChatBody("king", "K", "hello"))
 	time.Sleep(100 * time.Millisecond)
 	fDone := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "F", "x")); fDone <- code }()
+	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "F", "x")); fDone <- out.code }()
 	time.Sleep(100 * time.Millisecond)
 	engine.releaseKey("F")
 	if code := <-fDone; code != 200 {
@@ -1439,7 +1612,7 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 	bDone := saPostAsync(t, url, saChatBody("smoke", "B", "two"))
 	time.Sleep(40 * time.Millisecond)
 	cDone := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "C", "x")); cDone <- code }()
+	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "C", "x")); cDone <- out.code }()
 	time.Sleep(40 * time.Millisecond)
 	if held, _ := sessionAdmissions["smoke"].snapshot(kM); !held {
 		t.Fatal("M lease not held")
@@ -1613,7 +1786,7 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	// controlled by releaseKey below.
 	a1 := strings.Repeat("a", 48) // 12 est. tokens: large
 	done1 := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatStreamBody("smoke", "A", a1)); done1 <- code }()
+	go func() { out, _ := saPostOutDo(url, saChatStreamBody("smoke", "A", a1)); done1 <- out.code }()
 	time.Sleep(150 * time.Millisecond)
 	done2 := make(chan int, 1)
 	go func() {
@@ -1632,7 +1805,7 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	// waiter can consume the single release token, holding A2's slot
 	// until C's first byte and starving A2 into its queueTimeout 429.
 	cDone := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "C", "c")); cDone <- code }()
+	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "C", "c")); cDone <- out.code }()
 	time.Sleep(30 * time.Millisecond)
 	if held, _ := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "A", "smoke")); !held {
 		t.Fatal("A lease not held while accepted requests are outstanding")
@@ -1713,10 +1886,13 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 		s, engine, c := saHTTPSetup(t, ttl, 1, 1)
 		url := s.ts.URL + "/v1/chat/completions"
 		aDone := saPostAsync(t, url, saChatBody("smoke", "A", "x"))
-		time.Sleep(150 * time.Millisecond)
+		// A's lease must be ADMITTED (not merely sent) before B can be
+		// proven to sit in the queue, and B must be QUEUE-FULL-occupied
+		// before C's hard-reject POST — poll the manager, never sleep.
+		saPollAdmittedLeases(t, "smoke", 1)
 		bDone := make(chan int, 1)
-		go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "B", "x")); bDone <- code }()
-		time.Sleep(150 * time.Millisecond)
+		go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "B", "x")); bDone <- out.code }()
+		saPollAdmissionWaiting(t, "smoke", 1)
 		// The depth-1 admission queue is occupied by B: C is hard-rejected
 		// with the exact reason.
 		code, hdr, body := saPost(t, url, saChatBody("smoke", "C", "x"))
@@ -1741,7 +1917,9 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 		// (still queued) proceeds and opens its OWN upstream gate — release
 		// it before the test ends.
 		c.Advance(ttl + 2*time.Millisecond)
-		time.Sleep(100 * time.Millisecond)
+		// B's grant is a real-time async hop (wake → handler → forward):
+		// wait for the forward to land upstream before releasing its gate.
+		saPollEngineSeen(t, engine, "A", "B")
 		engine.releaseKey("B")
 		if c1 := <-bDone; c1 != 200 {
 			t.Fatalf("B = %d", c1)
@@ -1753,17 +1931,27 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 		_ = s
 		url := s.ts.URL + "/v1/chat/completions"
 		aDone := make(chan int, 1)
-		go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "A", "x")); aDone <- code }()
+		go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "A", "x")); aDone <- out.code }()
 		time.Sleep(150 * time.Millisecond)
-		bDone := make(chan int, 1)
-		go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "B", "x")); bDone <- code }()
+		bDone := make(chan saPostOut, 1)
+		go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "B", "x")); bDone <- out }()
 		time.Sleep(150 * time.Millisecond)
 		// B's admission deadline (queueTimeout on the manual clock).
 		c.Advance(queueTimeout + time.Second)
 		select {
-		case code := <-bDone:
-			if code != http.StatusTooManyRequests {
-				t.Fatalf("B = %d, want 429", code)
+		case out := <-bDone:
+			if out.code != http.StatusTooManyRequests {
+				t.Fatalf("B = %d, want 429", out.code)
+			}
+			// The exact reason, from the router's 429 JSON body (error.type),
+			// not just the status: queue-full and timeout both 429.
+			var body struct {
+				Err struct {
+					Type string `json:"type"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(out.body), &body); err != nil || body.Err.Type != "session-admission-timeout" {
+				t.Fatalf("B reason = %q (%v), want session-admission-timeout", body.Err.Type, err)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("B did not time out")
@@ -1779,7 +1967,7 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 		s, engine, _ := saHTTPSetup(t, ttl, 1, 2)
 		url := s.ts.URL + "/v1/chat/completions"
 		aDone := make(chan int, 1)
-		go func() { code, _, _ := saPost(t, url, saChatBody("smoke", "A", "x")); aDone <- code }()
+		go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "A", "x")); aDone <- out.code }()
 		time.Sleep(150 * time.Millisecond)
 		ctx, cancel := context.WithCancel(context.Background())
 		req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(saChatBody("smoke", "B", "x")))
@@ -2002,17 +2190,34 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 
 	t.Run("stream-truncated", func(t *testing.T) {
 		// Genuine truncation: the client receives a partial SSE stream
-		// (headers + one event + partial keepalive) and the upstream
-		// connection dies mid-response. Handler finalizes; the ticket
-		// releases exactly once and the lease expires after the TTL.
+		// (headers + one flushed event) and the upstream connection dies
+		// mid-response (hijacked + closed, no grace shutdown involved).
+		// Handler finalizes; the ticket releases exactly once and the
+		// lease expires after the TTL.
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			io.Copy(io.Discard, r.Body)
 			w.Header().Set("Content-Type", "text/event-stream")
 			fl, _ := w.(http.Flusher)
 			w.Write([]byte("data: {\"delta\":1}\n\n"))
 			fl.Flush()
-			time.Sleep(50 * time.Millisecond)
-			w.Write([]byte("data: keep")) // delivered by server shutdown, not flushed
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			// Linger 0 makes Close() send an RST: the client's mid-stream
+			// read fails with a real transport error (a bare FIN would be
+			// a legal EOF for an unchunked response, indistinguishable
+			// from completion). The reverse proxy unwinds with
+			// http.ErrAbortHandler on that error — the standard server
+			// recovers it and the test mux's deferred counter drains.
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetLinger(0)
+			}
+			conn.Close()
 		}))
 		defer srv.Close()
 		withRouterEnv(t,
@@ -2036,11 +2241,16 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 			t.Fatalf("content-type = %q, want text/event-stream", ct)
 		}
-		got, _ := io.ReadAll(resp.Body)
-		// Partial stream: the first event arrived, then the connection
-		// died (server shutdown) before the second one was flushed.
-		if !strings.Contains(string(got), "delta\":1") || strings.Contains(string(got), "data: [DONE]") {
-			t.Fatalf("truncated stream = %q", got)
+		got, rerr := io.ReadAll(resp.Body)
+		// The read must observably end in the truncation: a transport
+		// failure/early EOF, never a clean completion — and the
+		// delivered bytes are the partial stream (first event present,
+		// no [DONE], no keepalive continuation).
+		if rerr == nil {
+			t.Fatalf("mid-stream read completed cleanly (%q), want a read error", got)
+		}
+		if !strings.Contains(string(got), `delta":1`) || strings.Contains(string(got), "data: [DONE]") {
+			t.Fatalf("truncated stream = %q (read err: %v)", got, rerr)
 		}
 		// The lease idles only at handler completion; wait for drain.
 		s.awaitIdle(t, 3*time.Second)
@@ -2079,7 +2289,7 @@ func TestSessionAdmission_BackendIsolationAndQueryModelRouting(t *testing.T) {
 	// b1 gets "S" via the client key; b2 gets "S" via query-model routing
 	// (no model field) — a DIFFERENT backend scope, so a different lease.
 	done1 := make(chan int, 1)
-	go func() { code, _, _ := saPost(t, url, saChatBody("b1", "S", "x")); done1 <- code }()
+	go func() { out, _ := saPostOutDo(url, saChatBody("b1", "S", "x")); done1 <- out.code }()
 	time.Sleep(150 * time.Millisecond)
 	engine.releaseKey("S") // b1's gate (it arrived first)
 	select {
@@ -2169,6 +2379,232 @@ func TestSessionAdmission_BackendIsolationAndQueryModelRouting(t *testing.T) {
 	}
 	if held, _ := sessionAdmissions["b2"].snapshot(saAdmKey(t, "Z", "b2")); !held {
 		t.Fatal("b2 active lease died under b1's expiry")
+	}
+}
+
+// TestSessionAdmission_429EnvelopeParity asserts, at the HTTP layer, the
+// FULL standard 429 shape for BOTH session-admission rejection reasons —
+// not just the status and the reason field the shorter terminal-bounds
+// asserts check: JSON content type, X-Router-Reason, X-Router-Backend,
+// Retry-After, and a JSON body whose type/backend/retry_after fields
+// mirror the header values — matching the other 429s in this router
+// (blocked-by-tier0, backend-full, …), which all go through write429.
+func TestSessionAdmission_429EnvelopeParity(t *testing.T) {
+	const ttl = 5 * time.Second
+	check := func(t *testing.T, code int, hdr http.Header, body, wantReason string) {
+		t.Helper()
+		if code != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429 (%s): %s", code, wantReason, body)
+		}
+		if ct := hdr.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", ct)
+		}
+		if reason := hdr.Get("X-Router-Reason"); reason != wantReason {
+			t.Errorf("X-Router-Reason = %q, want %s", reason, wantReason)
+		}
+		if be := hdr.Get("X-Router-Backend"); be != "smoke" {
+			t.Errorf("X-Router-Backend = %q, want smoke", be)
+		}
+		if ra := hdr.Get("Retry-After"); ra == "" {
+			t.Error("Retry-After header missing")
+		}
+		var env struct {
+			Err struct {
+				Type       string `json:"type"`
+				Message    string `json:"message"`
+				Backend    string `json:"backend"`
+				RetryAfter int    `json:"retry_after"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(body), &env); err != nil {
+			t.Fatalf("body %q is not the 429 JSON envelope: %v", body, err)
+		}
+		if env.Err.Type != wantReason {
+			t.Errorf("body type = %q, want %s", env.Err.Type, wantReason)
+		}
+		if env.Err.Backend != "smoke" {
+			t.Errorf("body backend = %q, want smoke", env.Err.Backend)
+		}
+		// retry_after mirrors the Retry-After header (both come from the
+		// same estimateRetryAfter value in write429).
+		var ra int
+		if _, err := fmt.Sscanf(hdr.Get("Retry-After"), "%d", &ra); err != nil ||
+			env.Err.RetryAfter != ra {
+			t.Errorf("body retry_after = %d vs header %q", env.Err.RetryAfter, hdr.Get("Retry-After"))
+		}
+		if env.Err.Message != "backend at capacity" {
+			t.Errorf("body message = %q, want the standard 429 message", env.Err.Message)
+		}
+	}
+
+	t.Run("queue-full", func(t *testing.T) {
+		s, engine, c := saHTTPSetup(t, ttl, 1, 1)
+		url := s.ts.URL + "/v1/chat/completions"
+		aDone := saPostAsync(t, url, saChatBody("smoke", "A", "x"))
+		saPollAdmittedLeases(t, "smoke", 1)
+		// Depth-1 queue: B queues, C is immediately full — reject #1.
+		bDone := make(chan int, 1)
+		go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "B", "x")); bDone <- out.code }()
+		saPollAdmissionWaiting(t, "smoke", 1)
+		code, hdr, body := saPost(t, url, saChatBody("smoke", "C", "x"))
+		check(t, code, hdr, body, "session-admission-queue-full")
+		// A's completion idles its lease (cap 1 retains it for the full
+		// TTL): B is admitted only on the clock-driven expiry, not the
+		// completion itself. Consume A's client response so its deferred
+		// ticket release can land before the idle arm is awaited.
+		engine.releaseKey("A")
+		if cA := <-aDone; cA != 200 {
+			t.Fatalf("A = %d, want 200", cA)
+		}
+		saWaitIdleLease(t, "smoke", saAdmKey(t, "A", "smoke"))
+		c.Advance(ttl + 2*time.Millisecond)
+		// B's grant is a real-time async hop (wake → forward): wait for
+		// B's forward to land upstream, then open ITS gate.
+		saPollEngineSeen(t, engine, "A", "B")
+		engine.releaseKey("B")
+		select {
+		case code := <-bDone:
+			if code != 200 {
+				t.Errorf("B after expiry = %d, want 200", code)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("B not admitted after the cap lease expired")
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		s, engine, c := saHTTPSetup(t, ttl, 1, 2)
+		url := s.ts.URL + "/v1/chat/completions"
+		saPostAsync(t, url, saChatBody("smoke", "A", "x"))
+		saPollAdmittedLeases(t, "smoke", 1)
+		// B queues; its queueTimeout admission deadline (manual clock)
+		// passes with no slot freed: the admission-timeout 429. The
+		// request runs on a GOROUTINE — the envelope (headers + body)
+		// is only written once the manual clock's Advance fires the
+		// deadline, and that Advance belongs to the test goroutine, so
+		// a synchronous POST would deadlock it.
+		outCh := make(chan saPostOut, 1)
+		go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "B", "x")); outCh <- out }()
+		saPollAdmissionWaiting(t, "smoke", 1)
+		c.Advance(queueTimeout + time.Millisecond)
+		var out saPostOut
+		select {
+		case out = <-outCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("B did not time out")
+		}
+		check(t, out.code, out.hdr, out.body, "session-admission-timeout")
+		engine.releaseAll()
+	})
+}
+
+// TestSessionAdmission_BypassBodyByteIdentity asserts that the admission
+// gate NEVER reserializes the request: in the disabled (off) and unkeyed
+// bypasses the fake upstream receives the request body byte-for-byte
+// equal to the submitted bytes. The payload carries whitespace and
+// opaque nested fields, so even a re-encode that preserves all VALUES
+// (reordered keys, compacted spacing, dropped unknown fields) is caught.
+// Both the non-streaming and streaming paths are covered: the router
+// forwards bodies on both (stream:true is an upstream body field, not a
+// router decision) — only the serving stack differs (a fresh router
+// listener per subtest, since the admission env is a process global).
+func TestSessionAdmission_BypassBodyByteIdentity(t *testing.T) {
+	const payload = `{"model": "b",
+	"prompt_cache_key": " conv key ",
+	"messages": [{"role": "user",
+	               "content": "ops  space  $€œ"}],
+	"opaque": {"nested": [1, 2, {"k": null, "s": "  keep  "}],
+	            "list": []}}`
+
+	capture := func(t *testing.T) (*httptest.Server, func(), chan []byte) {
+		t.Helper()
+		gotCh := make(chan []byte, 1)
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The exact bytes the router handed to the forwarder: the
+			// client submits `body`, so any asymmetry here is reserialize
+			// drift in the router's read -> forward path.
+			b, _ := io.ReadAll(r.Body)
+			select {
+			case gotCh <- b:
+			default:
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"ok":true}`)
+		}))
+		return up, up.Close, gotCh
+	}
+
+	for _, tc := range []struct {
+		name   string
+		keyed  bool // admission enabled with a key (must stay bypassed: cap 1 but two forwards)
+		stream bool
+	}{
+		{name: "off-nonstream", keyed: false, stream: false},
+		{name: "off-stream", keyed: false, stream: true},
+		{name: "unkeyed-nonstream", keyed: true, stream: false},
+		{name: "unkeyed-stream", keyed: true, stream: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, upClose, gotCh := capture(t)
+			name := "by"
+			body := payload
+			if tc.name == "off-nonstream" || tc.name == "off-stream" {
+				// Disabled: the body KEEPS its prompt_cache_key — the
+				// gate must ignore it entirely (legacy per-request path).
+			} else {
+				// Unkeyed bypass: the body has NO prompt_cache_key, so
+				// the enabled gate has no lease identity — it must let
+				// BOTH requests forward (a keyed body would queue the
+				// second behind the first's retained lease at cap 1).
+				body = strings.Replace(payload, `"prompt_cache_key": " conv key ",
+`, "", 1)
+			}
+			if tc.stream {
+				body = strings.Replace(body, `"messages"`, `"stream": true, "messages"`, 1)
+			}
+			withRouterEnv(t, []Backend{{Name: name, URL: up.URL, MaxConcurrent: 2}},
+				map[string]int{name: 2}, nil)
+			proxies[name] = newTestProxy(up.URL)
+			saIsolate(t)
+			if tc.keyed {
+				c := newSAManualClock()
+				withAdmissionEnv(t, 5*time.Second, c, 1, 2)
+			}
+			s := newSAServing()
+			t.Cleanup(func() { s.ts.Close() })
+			t.Cleanup(upClose)
+			t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
+
+			for range 2 {
+				done := make(chan int, 1)
+				go func() { out, _ := saPostOutDo(s.ts.URL+"/v1/chat/completions", body); done <- out.code }()
+				select {
+				case got := <-gotCh:
+					if !bytes.Equal(got, []byte(body)) {
+						t.Fatalf("forwarded body drifts from submission:\n got: %s\nwant: %s", got, body)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("upstream never received the request")
+				}
+				select {
+				case code := <-done:
+					if code != 200 {
+						t.Fatalf("status = %d, want 200", code)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("request did not complete")
+				}
+			}
+			// Bypass certification: with the gate ENABLED (armed) and
+			// an UNKEYED body (cap 1), the second request was not
+			// queued behind the first — no queueing, no lease: the
+			// unkeyed path never entered the admission gate.
+			if m, ok := sessionAdmissions[name]; ok {
+				if n := sessionAdmissionLeaseCount(t, m); n != 0 {
+					t.Fatalf("bypass minted %d leases", n)
+				}
+			}
+		})
 	}
 }
 
