@@ -7,13 +7,17 @@ name: CI
 # job-level-skipped: a job skipped by a job-level `if` is recorded with
 # check-run conclusion "skipped", and the main-branch protection gate does NOT
 # credit "skipped" as passing (verified live — a PR whose required contexts
-# were all "skipped" stayed BLOCKED). So those jobs always RUN and open with an
-# inline Gate step that passes when their concern is absent; the job's
-# check-run conclusion is therefore always "success" (concern off / no-op) or
-# "failure" (a real check failed) — never "skipped". A real failure still
-# blocks merge, and a required job whose upstream required job failed is
-# job-level-skipped by its circuit-breaker `if` (harmless: that failed
-# required predecessor already blocks the merge).
+# were all "skipped" stayed BLOCKED). So those jobs always RUN and open with
+# an inline Gate step that (a) fails when the `changes` job failed or any
+# classifier output is malformed, (b) emits `enabled=true/false` for the
+# job's concern, and (c) is required by every expensive setup/check step. A
+# failed classifier therefore fails every required job (a red check-run
+# blocks the merge) instead of silently passing them. With the concern
+# absent, the Gate passes with `enabled=false` and the steps no-op, so the
+# job's check-run conclusion is always "success" (concern off / no-op) or
+# "failure" (a real check or the gate itself failed) — never "skipped". A
+# required job downstream of a failed required job is skipped by its step
+# conditions — harmless: that failed predecessor already blocks the merge.
 #
 # Non-required jobs (workflow-lint, docker-build) may still be
 # job-level-skipped freely — their contexts are not required on main.
@@ -57,6 +61,13 @@ jobs:
       - name: Classify changed paths
         id: classify
         if: always()
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -uo pipefail
 
@@ -74,29 +85,33 @@ jobs:
             DOCKER=true
           }
 
-          EVENT="${{ github.event_name }}"
-          case "$EVENT" in
+          case "$EVENT_NAME" in
             pull_request)
-              BASE="${{ github.event.pull_request.base.sha }}"
-              HEAD="${{ github.event.pull_request.head.sha }}"
+              # PRs diff against the merge base, not the base-head SHA: the
+              # base branch may have advanced since the PR was created. Both
+              # SHAs exist (fetch-depth: 0); an unresolvable merge-base falls
+              # back to the full run via the git-diff failure path below.
+              BASE="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA" 2>/dev/null)" || BASE="$PR_BASE_SHA"
+              HEAD="$PR_HEAD_SHA"
               ;;
             push)
-              case "${{ github.ref }}" in
+              case "$EVENT_REF" in
                 refs/tags/*)
                   # Tag pushes have no diff base — full run.
                   BASE=""
                   ;;
                 *)
-                  BASE="${{ github.event.before }}"
-                  # First push of a new branch: github.event.before is
-                  # unresolvable — no diff base, classify conservatively.
+                  # Pushes diff before..sha; github.event.before is unresolvable
+                  # for the first push of a new branch — no diff base, classify
+                  # conservatively.
+                  BASE="$EVENT_BEFORE"
                   if [ -n "$BASE" ] && ! git rev-parse --verify -q "${BASE}^{commit}" >/dev/null; then
                     echo "Unresolvable base ${BASE} — classifying all concerns as changed"
                     BASE=""
                   fi
                   ;;
               esac
-              HEAD="${{ github.sha }}"
+              HEAD="$HEAD_SHA"
               ;;
             *)
               # workflow_dispatch: no diff, full run.
@@ -112,7 +127,7 @@ jobs:
             else
               while IFS= read -r -d '' path; do
                 case "$path" in
-                  .github/workflows/*.yml|.github/workflows/*.yaml) WORKFLOW=true ;;
+                  .github/workflows/*.yml|.github/workflows/*.yaml|.ci-verify/*) WORKFLOW=true ;;
                   web/embed.go|web/embed_stub.go) LINT=true; BUILD=true; TEST=true; DOCKER=true ;;
                   *_test.go) LINT=true; TEST=true ;;
                   web/src/*|web/package.json|web/bun.lock|web/vite.config.ts|web/svelte.config.js|web/tsconfig.json) BUILD=true; DOCKER=true ;;
@@ -173,103 +188,185 @@ jobs:
           go-version: stable
 
       - name: Lint workflows with actionlint
-        # -ignore: SC2046 (ci.yml mod-tidy line) and SC2209 (release.yml LATEST_TAG
-        # assignment) are pre-existing shellcheck findings in legacy steps this PR
-        # must not rewrite; new workflow files are linted at default severity.
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -ignore 'shellcheck.*SC2046' -ignore 'shellcheck.*SC2209'
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: CI Verify harness
+        # Focused harness for the classifier script and the gate expressions
+        # (Python preinstalled on ubuntu-latest; PyYAML only).
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 .ci-verify/classify_test.py
+          python3 .ci-verify/gate_test.py
 
   lint-format:
     name: Lint & Format
     needs: [changes]
+    if: ${{ !cancelled() }}
     # Required context: never job-level-skipped. Runs always; the Gate step
-    # no-ops (conclusion success) when the lint concern is absent.
+    # fails when classification failed, emits `enabled`, and no-ops the
+    # expensive steps (conclusion success) when the lint concern is absent.
     runs-on: ubuntu-latest
     steps:
       - name: Gate
-        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'false' }}
-        run: echo "Skipped - no lint-relevant changes"
+        if: ${{ !cancelled() }}
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ needs['changes'].result }}" != "success" ]; then
+            echo "::error::Changes job finished with '${{ needs['changes'].result }}'; failing gate"
+            exit 1
+          fi
+          for v in '${{ needs['changes'].outputs.workflow }}' '${{ needs['changes'].outputs.lint }}' '${{ needs['changes'].outputs.build }}' '${{ needs['changes'].outputs.test }}' '${{ needs['changes'].outputs.docker }}'; do
+            if [ "$v" != "true" ] && [ "$v" != "false" ]; then
+              echo "::error::Malformed classifier output: '$v' (expected true/false); failing gate"
+              exit 1
+            fi
+          done
+          if [ "${{ needs['changes'].outputs.lint }}" = "false" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Skipped - no lint-relevant changes"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Checkout repository
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Check formatting
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' }}
         run: test -z "$(gofmt -l .)"
 
       - name: Vet
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' }}
         run: go vet ./...
 
       - name: Mod tidy
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
-        run: go mod tidy && git diff --exit-code go.mod $(test -f go.sum && echo go.sum)
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' }}
+        run: |
+          set -euo pipefail
+          go mod tidy
+          if [ -f go.sum ]; then
+            git diff --exit-code go.mod go.sum
+          else
+            git diff --exit-code go.mod
+          fi
 
   build:
     name: Build
     needs: [changes, workflow-lint, lint-format]
-    # Circuit breaker only: skip this required context when an upstream
-    # required job FAILED (its red run already blocks the merge, so this
-    # "skipped" context is inert). An absent build concern is handled by the
-    # inline Gate below so the context stays "success", never "skipped".
-    if: ${{ !cancelled() && needs['lint-format'].result != 'failure' && needs['workflow-lint'].result != 'failure' }}
+    if: ${{ !cancelled() }}
+    # Required context: never job-level-skipped. The inline Gate circuit-
+    # breaks on a failed upstream required job and on a failed/malformed
+    # classification, emits `enabled`, and no-ops the expensive steps (job
+    # conclusion success) when the build concern is absent.
     runs-on: ubuntu-latest
     steps:
       - name: Gate
-        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.build == 'false' }}
-        run: echo "Skipped - no build-relevant changes"
+        if: ${{ !cancelled() }}
+        id: gate
+        run: |
+          set -euo pipefail
+          for r in "${{ needs['changes'].result }}" "${{ needs['lint-format'].result }}" "${{ needs['workflow-lint'].result }}"; do
+            if [ "$r" = "failure" ]; then
+              echo "::error::Upstream job failed; failing gate"
+              exit 1
+            fi
+          done
+          if [ "${{ needs['changes'].result }}" != "success" ]; then
+            echo "::error::Changes job finished with '${{ needs['changes'].result }}'; failing gate"
+            exit 1
+          fi
+          for v in '${{ needs['changes'].outputs.workflow }}' '${{ needs['changes'].outputs.lint }}' '${{ needs['changes'].outputs.build }}' '${{ needs['changes'].outputs.test }}' '${{ needs['changes'].outputs.docker }}'; do
+            if [ "$v" != "true" ] && [ "$v" != "false" ]; then
+              echo "::error::Malformed classifier output: '$v' (expected true/false); failing gate"
+              exit 1
+            fi
+          done
+          if [ "${{ needs['changes'].outputs.build }}" = "false" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Skipped - no build-relevant changes"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Checkout repository
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' && needs['lint-format'].result == 'success' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' && needs['lint-format'].result == 'success' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Build
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.build == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' && needs['lint-format'].result == 'success' }}
         run: go build ./...
 
   test:
     name: Test
     needs: [changes, workflow-lint, lint-format, build]
-    # Circuit breaker only: skip when an upstream required job FAILED (that red
-    # run already blocks the merge). An absent test concern is handled by the
-    # inline Gate so the context stays "success", never "skipped".
-    if: ${{ !cancelled() && needs['lint-format'].result != 'failure' && needs['workflow-lint'].result != 'failure' && needs['build'].result != 'failure' }}
+    if: ${{ !cancelled() }}
+    # Required context: never job-level-skipped. The inline Gate circuit-
+    # breaks on a failed upstream required job and on a failed/malformed
+    # classification, emits `enabled`, and no-ops the expensive steps (job
+    # conclusion success) when the test concern is absent.
     runs-on: ubuntu-latest
     steps:
       - name: Gate
-        if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.test == 'false' }}
-        run: echo "Skipped - no test-relevant changes"
+        if: ${{ !cancelled() }}
+        id: gate
+        run: |
+          set -euo pipefail
+          for r in "${{ needs['changes'].result }}" "${{ needs['lint-format'].result }}" "${{ needs['workflow-lint'].result }}" "${{ needs['build'].result }}"; do
+            if [ "$r" = "failure" ]; then
+              echo "::error::Upstream job failed; failing gate"
+              exit 1
+            fi
+          done
+          if [ "${{ needs['changes'].result }}" != "success" ]; then
+            echo "::error::Changes job finished with '${{ needs['changes'].result }}'; failing gate"
+            exit 1
+          fi
+          for v in '${{ needs['changes'].outputs.workflow }}' '${{ needs['changes'].outputs.lint }}' '${{ needs['changes'].outputs.build }}' '${{ needs['changes'].outputs.test }}' '${{ needs['changes'].outputs.docker }}'; do
+            if [ "$v" != "true" ] && [ "$v" != "false" ]; then
+              echo "::error::Malformed classifier output: '$v' (expected true/false); failing gate"
+              exit 1
+            fi
+          done
+          if [ "${{ needs['changes'].outputs.test }}" = "false" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Skipped - no test-relevant changes"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Checkout repository
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' && needs['lint-format'].result == 'success' && needs['build'].result == 'success' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' && needs['lint-format'].result == 'success' && needs['build'].result == 'success' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Run tests
-        if: ${{ needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.enabled == 'true' && needs['lint-format'].result == 'success' && needs['build'].result == 'success' }}
         run: go test ./...
 
   docker-build:
@@ -278,8 +375,8 @@ jobs:
     # workflow-lint is non-required and job-level-skipped when no workflow file
     # changed, so accept success|skipped for it. The three required jobs always
     # RUN (concern-off = no-op success), so a required job being "skipped" here
-    # means its circuit-breaker tripped on an upstream failure -> docker must
-    # stay skipped; require plain success for those.
+    # means its gate tripped on a failed upstream -> docker must stay skipped;
+    # require plain success for those.
     if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.docker == 'true' && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped') && needs['lint-format'].result == 'success' && needs['build'].result == 'success' && needs['test'].result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
@@ -297,7 +394,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request' || env.PR_IS_SAME_REPO == 'true'
+        if: ${{ github.event_name != 'pull_request' || env.PR_IS_SAME_REPO == 'true' }}
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -330,7 +427,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Find existing PR comment
-        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true'
+        if: ${{ github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true' }}
         uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
         id: find-comment
         with:
@@ -339,7 +436,7 @@ jobs:
           body-includes: 'Docker Image Ready'
 
       - name: Comment PR with image tags
-        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true'
+        if: ${{ github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true' }}
         uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
         with:
           comment-id: ${{ steps.find-comment.outputs.comment-id }}
@@ -360,5 +457,5 @@ jobs:
             docker pull ghcr.io/djdembeck/llm-router-go:pr-${{ github.event.pull_request.number }}
             ```
 
-            Images will be automatically deleted when this PR is merged or closed.
+            Images will be automatically deleted when the PR is merged or closed.
           edit-mode: replace
