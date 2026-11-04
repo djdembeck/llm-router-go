@@ -1,0 +1,339 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-21T18:28:39Z",
+  "title": "Design System: llm-router-go \u2014 Capacity Survey",
+  "extensions": {
+    "colorMeta": {
+      "ink-ground": {
+        "role": "neutral",
+        "displayName": "Ink Ground",
+        "canonical": "#10130e"
+      },
+      "survey-panel": {
+        "role": "neutral",
+        "displayName": "Survey Panel",
+        "canonical": "#151a13"
+      },
+      "survey-panel-raised": {
+        "role": "neutral",
+        "displayName": "Raised Panel",
+        "canonical": "#1a2018"
+      },
+      "survey-panel-active": {
+        "role": "neutral",
+        "displayName": "Active Panel",
+        "canonical": "#20261d"
+      },
+      "chalk": {
+        "role": "neutral",
+        "displayName": "Chalk",
+        "canonical": "#e9e5d8"
+      },
+      "chalk-secondary": {
+        "role": "neutral",
+        "displayName": "Chalk Secondary",
+        "canonical": "#b9b5a7"
+      },
+      "chalk-muted": {
+        "role": "neutral",
+        "displayName": "Chalk Muted",
+        "canonical": "#8f8c80"
+      },
+      "survey-line": {
+        "role": "primary",
+        "displayName": "Survey Line \u2014 Sand",
+        "canonical": "#b9a684"
+      },
+      "survey-line-lit": {
+        "role": "primary",
+        "displayName": "Survey Line \u2014 Lit",
+        "canonical": "#d3c2a2"
+      },
+      "water": {
+        "role": "secondary",
+        "displayName": "Water \u2014 KV / Engine",
+        "canonical": "#7fa3c4"
+      },
+      "moss": {
+        "role": "secondary",
+        "displayName": "Moss \u2014 Live / Router",
+        "canonical": "#8fae74"
+      },
+      "amber": {
+        "role": "tertiary",
+        "displayName": "Amber \u2014 Attention / Estimate",
+        "canonical": "#d6a445"
+      },
+      "vermilion": {
+        "role": "tertiary",
+        "displayName": "Vermilion \u2014 Failure",
+        "canonical": "#e07a66"
+      },
+      "day-ground": {
+        "role": "neutral",
+        "displayName": "Day Ground",
+        "canonical": "#eceadf"
+      },
+      "day-panel": {
+        "role": "neutral",
+        "displayName": "Day Panel",
+        "canonical": "#f4f2e9"
+      },
+      "day-ink": {
+        "role": "neutral",
+        "displayName": "Day Ink",
+        "canonical": "#171a13"
+      },
+      "day-survey-line": {
+        "role": "primary",
+        "displayName": "Day Survey Line",
+        "canonical": "#7d5f42"
+      },
+      "day-water": {
+        "role": "secondary",
+        "displayName": "Day Water",
+        "canonical": "#37627f"
+      },
+      "day-moss": {
+        "role": "secondary",
+        "displayName": "Day Moss",
+        "canonical": "#476438"
+      },
+      "day-amber": {
+        "role": "tertiary",
+        "displayName": "Day Amber",
+        "canonical": "#8a5a12"
+      },
+      "day-vermilion": {
+        "role": "tertiary",
+        "displayName": "Day Vermilion",
+        "canonical": "#a33a28"
+      },
+      "brand-symbol-day": {
+        "role": "primary",
+        "displayName": "B3 Flow Symbol — Day",
+        "canonical": "#0F766E"
+      },
+      "brand-wordmark-day": {
+        "role": "neutral",
+        "displayName": "B3 Flow Wordmark — Day",
+        "canonical": "#18343A"
+      },
+      "brand-symbol-night": {
+        "role": "primary",
+        "displayName": "B3 Flow Symbol — Night",
+        "canonical": "#5EEAD4"
+      },
+      "brand-wordmark-night": {
+        "role": "neutral",
+        "displayName": "B3 Flow Wordmark — Night",
+        "canonical": "#E5F3F1"
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Reserved Display",
+        "purpose": "Reserved Overpass display role; no dashboard element currently uses it. The logo is custom SVG artwork, not runtime type."
+      },
+      "data-value": {
+        "displayName": "Data Value",
+        "purpose": "Readings strip values and the largest panel number."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Section heads, column heads, data-class tags, controls."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Reading sublines and explanatory copy."
+      },
+      "detail": {
+        "displayName": "Detail",
+        "purpose": "Source notes, feed metadata, table footers."
+      },
+      "data-detail": {
+        "displayName": "Data Detail",
+        "purpose": "Axis labels, token figures, secondary measurements."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "state-change",
+        "value": "160ms cubic-bezier(0.16,1,0.3,1)",
+        "purpose": "Routine control and surface feedback."
+      },
+      {
+        "name": "metric-window",
+        "value": "15s rolling mean, refreshed 5s",
+        "purpose": "TTFT and engine throughput; printed on the cell."
+      },
+      {
+        "name": "metric-hold",
+        "value": "5000ms",
+        "purpose": "KV and gauge values hold before display; counts stay live."
+      },
+      {
+        "name": "value-tween",
+        "value": "1600ms cubic-bezier(0.65,0,0.35,1) for TTFT/prefill/decode/KV; 480ms for counts",
+        "purpose": "Measured values ease in-out without chasing each scrape; no overshoot; exact value stays in the SR text."
+      },
+      {
+        "name": "live-edge",
+        "value": "1000ms linear, ~30fps canvas paint",
+        "purpose": "The profile's live edge glides continuously between 1s data ticks; stops offscreen and under reduced motion."
+      },
+      {
+        "name": "row-flip",
+        "value": "220ms cubic-bezier(0.16,1,0.3,1)",
+        "purpose": "Live session rows preserve identity when the stack reflows; no entrance or exit animation."
+      },
+      {
+        "name": "request-table",
+        "value": "none",
+        "purpose": "The request table updates instantly; bursts must not flash or shift."
+      },
+      {
+        "name": "theme",
+        "value": "240ms cubic-bezier(0.4,0,0.2,1)",
+        "purpose": "Night/day surface cross-fade."
+      },
+      {
+        "name": "prefill-track",
+        "value": "1000ms linear",
+        "purpose": "Prefill progress advances with the request's age."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "mobile",
+        "value": "640px"
+      },
+      {
+        "name": "tablet",
+        "value": "960px"
+      },
+      {
+        "name": "live-band",
+        "value": "1200px"
+      },
+      {
+        "name": "wide-lower",
+        "value": "1600px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Reading Cell",
+      "kind": "custom",
+      "refersTo": "reading-cell",
+      "description": "One measured fleet reading; a button when it selects a profile layer.",
+      "html": "<button class=\"reading\"><span class=\"label\">TTFT <i class=\"tag router\">router</i></span><span class=\"value\">241ms</span><span class=\"sub\">p50 198ms \u00b7 p95 812ms \u00b7 n 614</span></button>",
+      "css": ".reading{display:flex;flex-direction:column;gap:2px;padding:8px 12px 9px;background:#151a13;border:0;border-right:1px solid rgba(233,229,216,.10);color:#e9e5d8;text-align:left;border-radius:0}.reading[aria-pressed=\"true\"]{background:#1a2018;box-shadow:inset 0 -2px 0 #b9a684}.reading .value{font:500 24px/28px 'Overpass Mono',monospace;font-variant-numeric:tabular-nums}.reading .label{font:600 10px/12px Overpass,sans-serif;letter-spacing:.12em;text-transform:uppercase;color:#8f8c80}"
+    },
+    {
+      "name": "Data-Class Tag",
+      "kind": "chip",
+      "refersTo": "button",
+      "description": "The honesty boundary: router/engine/device/est, with a 4px square.",
+      "html": "<span class=\"tag engine\">engine</span>",
+      "css": ".tag{display:inline-flex;align-items:center;gap:4px;font:600 10px/12px Overpass,sans-serif;letter-spacing:.1em;text-transform:uppercase;color:#8f8c80}.tag:before{content:\"\";width:4px;height:4px;background:currentColor}.tag.router{color:#8fae74}.tag.engine{color:#7fa3c4}.tag.device{color:#b9a684}.tag.est{color:#d6a445}"
+    },
+    {
+      "name": "Fleet Profile",
+      "kind": "custom",
+      "refersTo": "profile-panel",
+      "description": "The signature elevation sheet: per-backend KV ridges, request bars, live edge, survey cursor.",
+      "html": "<section class=\"profile\"><header><span class=\"label\">FLEET PROFILE</span><span class=\"readout\">live \u00b7 11:42:03 / KV 78%</span></header><canvas aria-hidden=\"true\"></canvas><footer>last 78% / avg 61% / min 12% / max 94%</footer></section>",
+      "css": ".profile{background:#151a13;border:1px solid rgba(233,229,216,.10);display:flex;flex-direction:column}.profile canvas{height:320px;width:100%;display:block;cursor:crosshair}.profile header,.profile footer{display:flex;justify-content:space-between;padding:6px 12px;border-bottom:1px solid rgba(233,229,216,.10)}.profile footer{border-bottom:0;border-top:1px solid rgba(233,229,216,.10)}"
+    },
+    {
+      "name": "Live Session Row",
+      "kind": "custom",
+      "refersTo": "live-session-row",
+      "description": "One in-flight request: age, phase, backend, token estimates, prefill track, first byte.",
+      "html": "<div class=\"sess\"><div><b>0:12</b> <span class=\"chip info\">ADMITTED</span> <span>vllm-king</span></div><div>/v1/chat/completions</div><div>ctx 1.5k <i class=\"tag est\">est</i> \u00b7 new 902 <i class=\"tag est\">est</i></div><div class=\"track\"><i style=\"width:62%\"></i></div></div>",
+      "css": ".sess{display:flex;flex-direction:column;gap:5px;padding:8px 12px;border-bottom:1px solid rgba(233,229,216,.10);background:#151a13}.sess .track{height:3px;background:#20261d;border:1px solid rgba(233,229,216,.10)}.sess .track i{display:block;height:100%;background:#d6a445}"
+    },
+    {
+      "name": "Data Table",
+      "kind": "custom",
+      "refersTo": "data-table-row",
+      "description": "Ruled numeric sheet; sticky first column, right-aligned numbers, source dots in heads.",
+      "html": "<table class=\"data-table\"><thead><tr><th>BACKEND</th><th class=\"num\">KV</th></tr></thead><tbody><tr><td>vllm-king</td><td class=\"num\">78%</td></tr></tbody></table>",
+      "css": ".data-table{width:100%;border-collapse:collapse;font:400 12px/16px 'Overpass Mono',monospace;font-variant-numeric:tabular-nums}.data-table th{border-bottom:1px solid rgba(233,229,216,.18);padding:6px 8px;text-align:left;font:600 10px/12px Overpass,sans-serif;letter-spacing:.1em;text-transform:uppercase;color:#8f8c80;background:#151a13}.data-table td{border-bottom:1px solid rgba(233,229,216,.10);padding:6px 8px;color:#b9b5a7}.data-table td.num{text-align:right}"
+    },
+    {
+      "name": "Stale Banner",
+      "kind": "custom",
+      "refersTo": "topbar",
+      "description": "The feed-loss state: frozen truth, explicit age, re-arming endpoint.",
+      "html": "<div class=\"stale\"><i></i><span><b>STALE</b> \u2014 last data 11:42:03 \u00b7 14s ago</span><span class=\"right\">re-arming /metrics/stream</span></div>",
+      "css": ".stale{display:flex;align-items:center;gap:12px;padding:6px 20px;background:#151a13;border-bottom:1px solid #e07a66;color:#e07a66;font:400 12px/16px Overpass,sans-serif}.stale i{width:8px;height:8px;background:#e07a66}.stale b{letter-spacing:.1em}.stale .right{margin-left:auto;color:#8f8c80}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Capacity Survey",
+    "overview": "The fleet is terrain. A dark survey sheet applies level lines, spot heights, grid references, and a marginal scale to live GPU/KV/session telemetry, with a cream day sheet that inverts the same roles. The standard ops shell keeps controls familiar; the world enters through type, palette, density, and the Fleet Profile. The header uses the approved B3 Flow custom outlined SVG symbol and custom-path wordmark, selected for the active theme and displayed at 30px high. Its four brand colors identify the product only and never encode survey or telemetry status. Every figure carries its source: router, engine, device, or est. Stale data freezes and says so; missing engine data is hatched, never guessed.",
+    "keyCharacteristics": [
+      "Dark olive-ink survey sheet + paired cream day sheet",
+      "Sand level lines, water KV, moss live, amber estimate, vermilion failure",
+      "Overpass + Overpass Mono; integer 2px type steps; tabular figures",
+      "B3 Flow custom SVG logo; theme-selected asset, 30px high, brand colors identifier-only",
+      "Zero radius, 1px rules, no ambient shadow or glow",
+      "Fleet Profile is the only history chart; live sessions sit beside it",
+      "Frozen truth on feed loss, explicitly labelled stale"
+    ],
+    "rules": [
+      {
+        "name": "The Source Rule",
+        "body": "Every figure carries router, engine, device, or est. A number without a source is a lie about the data.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Failure Rule",
+        "body": "Vermilion is failure only. A 429 stays water; a stale feed and a saturated pool are the only other failures.",
+        "section": "colors"
+      },
+      {
+        "name": "The Integer-Step Rule",
+        "body": "Type sizes use only 10/12/14/16/24/28; line heights 12/16/20/28/32. No fractional sizes.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Rule",
+        "body": "Every measured figure is mono and tabular; a ticking value never shifts its neighbours.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-Sheet Rule",
+        "body": "No ambient shadow, glow, glass, or gradient. Depth is the 1px rule, the water fill, and the panel gaps.",
+        "section": "elevation"
+      },
+      {
+        "name": "The No-Data Rule",
+        "body": "Nulls break the line and hatch the lane. Never interpolate between backends or forward-fill a gap.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "Put live sessions beside the profile in the first viewport.",
+      "Label every figure router, engine, device, or est.",
+      "Keep the Fleet Profile as the only history chart.",
+      "Hatch missing data and break lines at nulls.",
+      "Freeze the last truth on feed loss and label it stale.",
+      "Use tabular mono and integer 2px type steps.",
+      "Keep 429 water and vermilion for 5xx/saturation."
+    ],
+    "donts": [
+      "Don't use sand as decoration; it is the survey level line.",
+      "Don't add shadows, glows, gradients, glass, or rounded corners.",
+      "Don't use serif or italic type.",
+      "Don't reintroduce KPI cards, sparkline tiles, or a second chart style.",
+      "Don't present the router GPU budget as device utilization.",
+      "Don't show a stale engine's retained gauges as current.",
+      "Don't forward-fill history or claim uncovered percentiles."
+    ]
+  }
+}

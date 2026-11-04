@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" role="img" aria-labelledby="title">
+  <title id="title">LLM Router symbol</title>
+  <g id="symbol" fill="#5EEAD4">
+    <path d="M2 0H14A2 2 0 0 1 16 2V4H10L7 6.5H0V2A2 2 0 0 1 2 0Z"/>
+    <path d="M10 5.5H12.5L15.5 8L12.5 10.5H10Z"/>
+    <path d="M0 9.5H7L10 12H16V14A2 2 0 0 1 14 16H2A2 2 0 0 1 0 14Z"/>
+  </g>
+</svg>

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en" data-theme="night">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <link id="sheet-icon" rel="icon" type="image/svg+xml" href="/logo-symbol-small.svg" />
+    <meta id="sheet-color" name="theme-color" content="#eceadf" />
+    <title>llm-router-go — fleet survey</title>
+    <!-- Overpass + Overpass Mono are vendored at /fonts.css (web/static);
+         no CDN on load — the embedded SPA must work air-gapped. -->
+    <link rel="stylesheet" href="/fonts.css" />
+    <script>
+      (function () {
+        // The sheet the operator picked owns the tab icon and browser chrome:
+        // both are part of this surface, not of the host OS. The favicon is the
+        // 16px optical drawing; the full symbol turns to mush in a tab.
+        function paint(theme) {
+          var night = theme === "night";
+          var icon = document.getElementById("sheet-icon");
+          var meta = document.getElementById("sheet-color");
+          if (icon) icon.setAttribute("href", night ? "/logo-symbol-small-dark.svg" : "/logo-symbol-small.svg");
+          if (meta) meta.setAttribute("content", night ? "#10130e" : "#eceadf");
+        }
+        window.__lrgSheet = function (theme) {
+          var next = theme === "day" ? "day" : "night";
+          document.documentElement.dataset.theme = next;
+          paint(next);
+        };
+        try {
+          var stored = localStorage.getItem("lrg-theme");
+          var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+          window.__lrgSheet(stored || (dark ? "night" : "day"));
+        } catch (_) {
+          window.__lrgSheet("night");
+        }
+      })();
+    </script>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>
