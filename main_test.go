@@ -4718,6 +4718,372 @@ func TestLoadMetricsAllowedHosts_NormalizesEntries(t *testing.T) {
 // /metrics/sessions is 200 session-feed JSON, / (SPA) answers without a
 // guard error (200 with the webui tag, 404 on the plain stub — both
 // prove the guard delegated past it).
+
+func TestPressureStreamingGateExitBeforeCompletion(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("first"))
+		w.(http.Flusher).Flush()
+		close(entered)
+		<-release
+		w.Write([]byte("last"))
+	}))
+	defer upstream.Close()
+	defer free()
+	withRouterEnv(t, []Backend{{Name: "smoke", URL: upstream.URL}}, map[string]int{"smoke": 1}, nil)
+	saIsolate(t)
+	proxies["smoke"] = newTestProxy(upstream.URL)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleProxy(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"smoke","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	}()
+	<-entered
+	metrics.computeRates(time.Now())
+	snap := metrics.snapshot("smoke")
+	if snap.QueueWait == nil || snap.QueueWait.Execution.Samples != 1 {
+		free()
+		<-done
+		t.Fatal("gate exit not visible during stream")
+	}
+	if len(metrics.burst(10)) != 0 {
+		free()
+		<-done
+		t.Fatal("unfinished stream recorded as complete")
+	}
+	free()
+	<-done
+	metrics.computeRates(time.Now())
+	snap = metrics.snapshot("smoke")
+	samples := metrics.burst(10)
+	if snap.QueueWait.Execution.Samples != 1 || len(samples) != 1 || samples[0].QueueWait.Present != (1<<queueStageExecution) || samples[0].TTFTMs < 0 {
+		t.Fatalf("completion duplicated/lost observation: %+v %+v", snap, samples)
+	}
+}
+
+func TestPressureAdmissionReasonHandlers(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		t.Run(fmt.Sprint(timeout), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+			defer upstream.Close()
+			withRouterEnv(t, []Backend{{Name: "smoke", URL: upstream.URL}}, map[string]int{"smoke": 2}, nil)
+			saIsolate(t)
+			c := newSAManualClock()
+			waiting := 0
+			if timeout {
+				waiting = 1
+			}
+			withAdmissionEnv(t, time.Minute, c, 1, waiting)
+			mgr := sessionAdmissions["smoke"]
+			ticket, err := mgr.acquire(context.Background(), "holder", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ticket.release()
+			saved := queueTimeout
+			queueTimeout = 15 * time.Millisecond
+			defer func() { queueTimeout = saved }()
+			rec := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				handleProxy(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(saChatBody("smoke", "new", "hello"))))
+			}()
+			if timeout {
+				saPollAdmissionWaiting(t, "smoke", 1)
+				c.Advance(time.Second)
+			}
+			<-done
+			reason := "session-admission-queue-full"
+			if timeout {
+				reason = "session-admission-timeout"
+			}
+			s := metrics.burst(1)[0]
+			if rec.Code != 429 || rec.Header().Get("X-Router-Reason") != reason || s.RejectReason != reason || s.QueueWait.Present != 1 {
+				t.Fatalf("admission rejection %+v", s)
+			}
+			metrics.computeRates(time.Now())
+			if metrics.snapshot("smoke").Router429.Total != 1 {
+				t.Fatal("admission rejection not counted")
+			}
+		})
+	}
+}
+
+func TestPressureRatesPoolingAndCutoff(t *testing.T) {
+	m := newMetricsRegistry()
+	m.ringCap = 1
+	for _, d := range []time.Duration{100 * time.Millisecond, 300 * time.Millisecond} {
+		m.recordGateWait("a", queueStageExecution, d)
+	}
+	m.recordGateWait("b", queueStageExecution, 900*time.Millisecond)
+	m.recordAccept("a", 10, 2)
+	for _, reason := range router429Reasons {
+		m.recordRequest("a", requestSample{Status: 429, RejectReason: reason})
+	}
+	for _, s := range []requestSample{{Status: 429, accepted: true}, {Status: 413, RejectReason: "body-too-large"}, {Status: 499}, {Status: 502}} {
+		m.recordRequest("a", s)
+	}
+	m.computeRates(time.Now())
+	a, b := m.snapshot("a"), m.snapshot("b")
+	if a.Router429.Total != 8 || a.ReqRate != 1.0/30 || a.QueueWait.Execution.Samples != 2 {
+		t.Fatalf("lost same-bucket observations: %+v", a)
+	}
+	for i, r := range a.Router429.ByReason {
+		if r.Reason != router429Reasons[i] || r.Total != 1 || r.Rate != 1.0/30 {
+			t.Fatalf("reason %+v", r)
+		}
+	}
+	f := metricsFrame{Backends: []backendFrame{{QueueWait: a.QueueWait, Router429: a.Router429}, {QueueWait: b.QueueWait}}}
+	applyFleetAggregates(&f)
+	if got := f.Totals.QueueWait.Execution; got.SumMs != 1300 || got.Samples != 3 {
+		t.Fatalf("not pooled: %+v", got)
+	}
+	if a.QueueWait.Execution.SumMs/float64(a.QueueWait.Execution.Samples) != 200 {
+		t.Fatal("backend mean")
+	}
+	if m.snapshot("unused").QueueWait != nil || m.snapshot("unused").Router429 != nil {
+		t.Fatal("unused summaries must be null")
+	}
+	m.computeRates(time.Now().Add(31 * time.Second))
+	a = m.snapshot("a")
+	if a.QueueWait != nil || a.Router429.Total != 8 || a.Router429.Rate != 0 {
+		t.Fatalf("cutoff lost totals or kept window: %+v", a)
+	}
+	if len(m.burst(100)) != 1 {
+		t.Fatal("ring fixture did not evict")
+	}
+}
+
+func TestPressureHistoryReasonRates(t *testing.T) {
+	m := newMetricsRegistry()
+	for _, reason := range router429Reasons {
+		m.recordRequest("b", requestSample{Status: 429, RejectReason: reason})
+	}
+	m.computeRates(time.Now())
+	reasons := m.snapshot("b").Router429
+	enabled := pointFromBackend(backendFrame{Admission: &admissionFrame{}, Router429: reasons})
+	disabled := pointFromBackend(backendFrame{Router429: reasons})
+	unknown := pointFromBackend(backendFrame{Admission: &admissionFrame{}})
+	names := [...]string{"router429BlockedByTier0Rate", "router429SessionQueueFullRate", "router429SessionTimeoutRate", "router429GpuBudgetFullRate", "router429BackendFullRate", "router429BackendQueueFullRate", "router429PrefillFullRate", "router429PrefillQueueFullRate"}
+	for i, name := range names {
+		field := hiRouter429BlockedByTier0Rate + i
+		if histFieldNames[field] != name || !hpHas(enabled, field) || math.Abs(float64(enabled.V[field])-1.0/30) > 1e-8 {
+			t.Fatalf("reason field %s missing or wrong", name)
+		}
+		if hpHas(disabled, field) || hpHas(unknown, field) {
+			t.Fatalf("unavailable reason field %s populated", name)
+		}
+	}
+	var acc histAccum
+	acc.add(enabled)
+	zero := pointFromBackend(backendFrame{Admission: &admissionFrame{}, Router429: newRouter429Frame()})
+	acc.add(zero)
+	rolled := acc.flush(0)
+	for i := range names {
+		field := hiRouter429BlockedByTier0Rate + i
+		if math.Abs(float64(rolled.V[field])-1.0/60) > 1e-8 {
+			t.Fatalf("reason field %d did not average", field)
+		}
+	}
+}
+
+func TestPressureHistoryExpandedAndLegacy(t *testing.T) {
+	if histFieldN != 61 {
+		t.Fatalf("histFieldN=%d", histFieldN)
+	}
+	q := &queueWaitFrame{Execution: waitSummary{SumMs: 400, Samples: 2}}
+	p := pointFromBackend(backendFrame{QueueWait: q, Router429: &router429Frame{Rate: 1.0 / 30}})
+	p.T = time.Now().UnixMilli() - 2000
+	if !hpHas(p, hiPrefillWaitSamplesRate) || !hpHas(p, hiRouter429Rate) || math.Abs(float64(p.V[hiExecutionWaitMsRate])-400.0/30) > 0.001 {
+		t.Fatal("expanded presence/rates")
+	}
+	path := t.TempDir() + "/pressure.gob"
+	h := newHistoryStore()
+	h.configure(path)
+	sh := newSeriesHistory()
+	sh.add(p, p.T)
+	h.backends["b"] = sh
+	h.save()
+	restored := newHistoryStore()
+	restored.configure(path)
+	restored.loadSnapshot(path)
+	got := restored.backends["b"].raw.ordered()[0]
+	if got != p {
+		t.Fatalf("round trip: %+v != %+v", got, p)
+	}
+	var old historyPointV3Legacy
+	old.T = p.T
+	old.V[43] = 7
+	old.Flags = uint64(1) << 43
+	legacy := historySnapshotV3Legacy{Version: 3, Backends: map[string]histSeriesSnapV3Legacy{"b": {Raw: []historyPointV3Legacy{old}}}}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = gob.NewEncoder(file).Encode(legacy); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	restored = newHistoryStore()
+	restored.loadSnapshot(path)
+	got = restored.backends["b"].raw.ordered()[0]
+	if !hpHas(got, 43) || got.V[43] != 7 {
+		t.Fatal("old V3 values lost")
+	}
+	for i := 44; i < histFieldN; i++ {
+		if hpHas(got, i) {
+			t.Fatalf("fabricated field %d", i)
+		}
+	}
+	if err := os.WriteFile(path, []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	restored = newHistoryStore()
+	restored.loadSnapshot(path)
+	if len(restored.backends) != 0 {
+		t.Fatal("partial corrupt restore")
+	}
+}
+
+func TestPressureBurstPresenceAndReason(t *testing.T) {
+	for _, tc := range []struct {
+		s      requestSample
+		reason string
+	}{
+		{requestSample{Status: 200}, `"rejectReason":""`},
+		{requestSample{Status: 499}, `"rejectReason":""`},
+		{requestSample{Status: 429, accepted: true}, `"rejectReason":null`},
+		{requestSample{Status: 502}, `"rejectReason":null`},
+		{requestSample{Status: 429, RejectReason: "backend-full"}, `"rejectReason":"backend-full"`},
+	} {
+		tc.s.QueueWait.set(queueStageExecution, 100*time.Millisecond)
+		b, err := json.Marshal(burstRequestFrame{RejectReason: burstRejectReason(tc.s), QueueWait: tc.s.QueueWait})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), tc.reason) || !strings.Contains(string(b), `"queueWaitMs":{"admission":null,"gpu":null,"execution":100,"prefill":null}`) {
+			t.Fatalf("wire: %s", b)
+		}
+	}
+	b, _ := json.Marshal(queueWaitTimes{})
+	if string(b) != "null" {
+		t.Fatalf("unreached=%s", b)
+	}
+}
+
+func TestPressureGateHandlerOutcomes(t *testing.T) {
+	for _, stage := range []queueStage{queueStageExecution, queueStagePrefill, queueStageGPU} {
+		for _, outcome := range []string{"handoff", "timeout", "cancel"} {
+			if stage == queueStageGPU && outcome == "timeout" {
+				continue
+			} // GPU's fixed five-second wait is covered by its semaphore tests.
+			t.Run(fmt.Sprintf("%d/%s", stage, outcome), func(t *testing.T) {
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) }))
+				defer upstream.Close()
+				list := []Backend{{Name: "smoke", URL: upstream.URL, Tier: 1, GpuWeight: 1, LargePrefillThresholdTokens: 1}}
+				if stage == queueStageGPU {
+					list = append(list, Backend{Name: "king", Tier: 0})
+				}
+				withRouterEnv(t, list, map[string]int{"smoke": 2, "king": 1}, map[string]int{"smoke": 1})
+				saIsolate(t)
+				proxies["smoke"] = newTestProxy(upstream.URL)
+				savedTimeout := queueTimeout
+				queueTimeout = 30 * time.Millisecond
+				defer func() { queueTimeout = savedTimeout }()
+				var release func()
+				switch stage {
+				case queueStageExecution:
+					slots["smoke"] = newSlot(1, 1)
+					slots["smoke"].acquire(time.Second, nil)
+					release = slots["smoke"].release
+				case queueStagePrefill:
+					prefillSlots["smoke"] = newSlot(1, 1)
+					prefillSlots["smoke"].acquire(time.Second, nil)
+					release = prefillSlots["smoke"].release
+				case queueStageGPU:
+					slots["king"].acquire(time.Second, nil)
+					defer slots["king"].release()
+					gpu = &gpuBudget{max: 1}
+					gpu.cond = sync.NewCond(&gpu.mu)
+					gpu.tryAcquire(1, 4, time.Second, nil)
+					release = func() { gpu.release(1) }
+				}
+				var once sync.Once
+				free := func() { once.Do(release) }
+				defer free()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(saChatBody("smoke", "", "large prompt"))).WithContext(ctx)
+				rec := httptest.NewRecorder()
+				done := make(chan struct{})
+				go func() { defer close(done); handleProxy(rec, req) }()
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					waiting := 0
+					switch stage {
+					case queueStageExecution:
+						_, _, w, _ := slots["smoke"].snapshot()
+						waiting = int(w)
+					case queueStagePrefill:
+						_, _, w, _ := prefillSlots["smoke"].snapshot()
+						waiting = int(w)
+					case queueStageGPU:
+						_, _, waiting = gpu.snapshot()
+					}
+					if waiting == 1 {
+						break
+					}
+					if time.Now().After(deadline) {
+						cancel()
+						<-done
+						t.Fatal("gate not reached")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				if outcome == "cancel" {
+					cancel()
+				} else if outcome == "handoff" {
+					free()
+				}
+				<-done
+				samples := metrics.burst(10)
+				if len(samples) != 1 {
+					t.Fatalf("samples=%v", samples)
+				}
+				s := samples[0]
+				if s.QueueWait.Present&(1<<stage) == 0 || s.QueueWait.Ms[stage] <= 0 {
+					t.Fatalf("missing gate duration: %+v", s)
+				}
+				if outcome == "cancel" {
+					if s.Status != 499 || s.RejectReason != "" || rec.Body.Len() != 0 || rec.Flushed {
+						t.Fatalf("cancellation wrote response: %+v %s", s, rec.Body.String())
+					}
+				} else if outcome == "timeout" {
+					if s.Status != 429 || s.RejectReason != rec.Header().Get("X-Router-Reason") {
+						t.Fatalf("reason mismatch: %+v", s)
+					}
+				} else if s.Status != 200 || !s.accepted {
+					t.Fatalf("handoff: %+v", s)
+				}
+				metrics.computeRates(time.Now())
+				snap := metrics.snapshot("smoke")
+				if snap.QueueWait.stage(stage).Samples != 1 {
+					t.Fatalf("gate double counted: %+v", snap.QueueWait)
+				}
+				if outcome != "timeout" && snap.Router429 != nil {
+					t.Fatal("non rejection incremented router429")
+				}
+				if outcome != "handoff" && stage != queueStagePrefill && s.QueueWait.Present&(1<<queueStagePrefill) != 0 {
+					t.Fatal("later gate fabricated")
+				}
+			})
+		}
+	}
+}
+
 func TestManagementMux_Guard403Host(t *testing.T) {
 	// The guard's VIEW of the allowlist: seed one live session row so a
 	// hostile /metrics/sessions caller CAN observe a leak (sessions and

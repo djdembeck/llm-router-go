@@ -164,6 +164,20 @@ export interface AdmissionMetrics {
   rejClientCancel: number;
 }
 
+export const ROUTER_429_REASONS = [
+  "blocked-by-tier0", "session-admission-queue-full", "session-admission-timeout",
+  "gpu-budget-full", "backend-full", "backend-queue-full", "prefill-full", "prefill-queue-full",
+] as const;
+export type QueueStage = "admission" | "gpu" | "execution" | "prefill";
+export interface WaitSummary { sumMs: number; samples: number }
+export type QueueWait = Record<QueueStage, WaitSummary>;
+export interface Router429 {
+  total: number;
+  rate: number;
+  byReason: { reason: string; total: number; rate: number }[];
+}
+export type AdmissionTotals = Omit<AdmissionMetrics, "idleTTLms" | "gateWaitMs" | "gateWaitTotalMs" | "gateWaitCount" | "gateWaitTrailMs" | "gateWaitTrailCnt" | "rejQueueFull" | "rejQueueTimeout" | "rejClientCancel">;
+
 export interface BackendMetrics {
   name: string;
   url: string;
@@ -193,7 +207,10 @@ export interface BackendMetrics {
   tokEstTotal: number;
   engine: EngineMetrics;
   // null when session admission is disabled for this backend.
-  admission: AdmissionMetrics | null;
+  admission?: AdmissionMetrics | null;
+  queueWait?: QueueWait | null;
+  router429?: Router429 | null;
+  engineQueue?: WaitSummary | null;
 }
 
 export interface GpuMetrics {
@@ -248,6 +265,18 @@ export interface TotalsMetrics {
   hitRate: number;
   // Fleet rollup of active session-admission leases (0 when none enabled).
   admActive: number;
+  admission?: AdmissionTotals | null;
+  router429?: Router429 | null;
+  queueWait?: QueueWait | null;
+}
+
+export interface StatsBackend extends Pick<BackendMetrics, "name" | "url" | "tier" | "inFlight" | "maxConcurrent" | "waiting" | "maxQueueDepth" | "prefillInFlight" | "prefillWaiting" | "prefillMax" | "avgDurationS" | "admission" | "engineQueue"> {}
+export interface StatsResponse {
+  backends: StatsBackend[];
+  gpuUsed: number;
+  gpuBudget: number;
+  gpuWaiting: number;
+  tier0Inflight: number;
 }
 
 /** One SSE frame: a full live snapshot. */
@@ -274,7 +303,8 @@ export interface BurstRequest {
   bytesIn: number;
   bytesOut: number;
   // X-Router-Reason for a router-originated rejection; "" for accepted.
-  rejectReason: string;
+  rejectReason?: string | null;
+  queueWaitMs?: Record<QueueStage, number | null> | null;
   // Admission-gate wait in ms (keyed traffic only); 0 for unkeyed/disabled.
   gateWaitMs: number;
 }
@@ -392,7 +422,24 @@ export type HistoryField =
   | "admissionRejClientCancel"
   | "gpuUsed"
   | "gpuBudget"
-  | "gpuWaiting";
+  | "gpuWaiting"
+  | "router429Rate"
+  | "router429BlockedByTier0Rate"
+  | "router429SessionQueueFullRate"
+  | "router429SessionTimeoutRate"
+  | "router429GpuBudgetFullRate"
+  | "router429BackendFullRate"
+  | "router429BackendQueueFullRate"
+  | "router429PrefillFullRate"
+  | "router429PrefillQueueFullRate"
+  | "admissionWaitMsRate"
+  | "admissionWaitSamplesRate"
+  | "gpuWaitMsRate"
+  | "gpuWaitSamplesRate"
+  | "executionWaitMsRate"
+  | "executionWaitSamplesRate"
+  | "prefillWaitMsRate"
+  | "prefillWaitSamplesRate";
 
 export type Series = Partial<Record<HistoryField, (number | null)[]>>;
 

@@ -269,6 +269,92 @@ func (d *durationTracker) avgSeconds() float64 {
 // ring and folded into per-backend counters. accepted marks the demand side
 // that recordAccept registered at admission; only accepted samples are
 // retired from the pending window on completion.
+type queueStage uint8
+
+const (
+	queueStageAdmission queueStage = iota
+	queueStageGPU
+	queueStageExecution
+	queueStagePrefill
+	queueStageN
+)
+
+type queueWaitTimes struct {
+	Ms      [queueStageN]float64
+	Present uint8
+}
+
+func (q *queueWaitTimes) set(stage queueStage, elapsed time.Duration) {
+	q.Ms[stage] = elapsed.Seconds() * 1000
+	q.Present |= 1 << stage
+}
+
+func (q queueWaitTimes) MarshalJSON() ([]byte, error) {
+	if q.Present == 0 {
+		return []byte("null"), nil
+	}
+	var values [queueStageN]*float64
+	for i := range values {
+		if q.Present&(1<<i) != 0 {
+			values[i] = &q.Ms[i]
+		}
+	}
+	return json.Marshal(struct {
+		Admission *float64 `json:"admission"`
+		GPU       *float64 `json:"gpu"`
+		Execution *float64 `json:"execution"`
+		Prefill   *float64 `json:"prefill"`
+	}{values[0], values[1], values[2], values[3]})
+}
+
+type waitSummary struct {
+	SumMs   float64 `json:"sumMs"`
+	Samples int64   `json:"samples"`
+}
+
+type queueWaitFrame struct {
+	Admission waitSummary `json:"admission"`
+	GPU       waitSummary `json:"gpu"`
+	Execution waitSummary `json:"execution"`
+	Prefill   waitSummary `json:"prefill"`
+}
+
+func (q *queueWaitFrame) stage(s queueStage) *waitSummary {
+	switch s {
+	case queueStageAdmission:
+		return &q.Admission
+	case queueStageGPU:
+		return &q.GPU
+	case queueStageExecution:
+		return &q.Execution
+	default:
+		return &q.Prefill
+	}
+}
+
+var router429Reasons = [...]string{"blocked-by-tier0", "session-admission-queue-full", "session-admission-timeout", "gpu-budget-full", "backend-full", "backend-queue-full", "prefill-full", "prefill-queue-full"}
+
+const router429ReasonN = 8
+
+type router429ReasonFrame struct {
+	Reason string  `json:"reason"`
+	Total  int64   `json:"total"`
+	Rate   float64 `json:"rate"`
+}
+type router429Frame struct {
+	Total    int64                                  `json:"total"`
+	Rate     float64                                `json:"rate"`
+	ByReason [router429ReasonN]router429ReasonFrame `json:"byReason"`
+}
+
+func newRouter429Frame() *router429Frame {
+	f := &router429Frame{}
+	for i, reason := range router429Reasons {
+		f.ByReason[i].Reason = reason
+	}
+	return f
+}
+
 type requestSample struct {
 	T            time.Time // completion
 	Start        time.Time // admission - the profile draws the request interval
@@ -291,6 +377,7 @@ type requestSample struct {
 	// The RequestFeed's GATE WAIT column — the router's own queue pressure,
 	// not the downstream GPU/slot/prefill waits.
 	GateWaitMs float64
+	QueueWait  queueWaitTimes
 	accepted   bool
 }
 
@@ -322,7 +409,10 @@ type backendMetrics struct {
 	// the buckets inside the window and divides by the full window. There is
 	// no decay and completion never subtracts: the rate is a true trailing
 	// arrival average with a hard cutoff.
-	arrivals [rateBucketN]rateBucket
+	arrivals        [rateBucketN]rateBucket
+	router429Totals [router429ReasonN]int64
+	router429       *router429Frame
+	queueWait       *queueWaitFrame
 }
 
 // The live rate is the trailing 30 s arrival average, evaluated every 500 ms
@@ -335,10 +425,35 @@ const (
 )
 
 type rateBucket struct {
-	t   int64 // bucket start, unix millis
-	req float64
-	byt float64
-	tok float64
+	t       int64 // bucket start, unix millis
+	req     float64
+	byt     float64
+	tok     float64
+	reasons [router429ReasonN]int64
+	waits   [queueStageN]waitSummary
+}
+
+// rateBucketAt resets only when the ring slot belongs to another interval.
+func (bm *backendMetrics) rateBucketAt(now time.Time) *rateBucket {
+	start := now.UnixMilli() / rateBucketMs * rateBucketMs
+	b := &bm.arrivals[int(start/rateBucketMs)%rateBucketN]
+	if b.t != start {
+		*b = rateBucket{t: start}
+	}
+	return b
+}
+
+func (m *metricsRegistry) recordGateWait(backend string, stage queueStage, elapsed time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bm := m.backends[backend]
+	if bm == nil {
+		bm = &backendMetrics{}
+		m.backends[backend] = bm
+	}
+	w := &bm.rateBucketAt(time.Now()).waits[stage]
+	w.SumMs += elapsed.Seconds() * 1000
+	w.Samples++
 }
 
 // backendMetricSnapshot is the lock-free view of backendMetrics used by the
@@ -353,6 +468,8 @@ type backendMetricSnapshot struct {
 	ReqTotal        int64
 	RejectedTotal   int64
 	RejectReasons   map[string]int64
+	Router429       *router429Frame
+	QueueWait       *queueWaitFrame
 	BytesInTotal    int64
 	BytesOutTotal   int64
 	TokEstTotal     int64
@@ -392,9 +509,6 @@ var metrics = newMetricsRegistry()
 // rates. Rejections (429/413) are not "accepted" — they never enter a
 // backend — and are not recorded here.
 func (m *metricsRegistry) recordAccept(backend string, bytesIn int64, tokEst int) {
-	nowMs := time.Now().UnixMilli()
-	start := nowMs / rateBucketMs * rateBucketMs
-	idx := int(start/rateBucketMs) % rateBucketN
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	bm, ok := m.backends[backend]
@@ -402,10 +516,7 @@ func (m *metricsRegistry) recordAccept(backend string, bytesIn int64, tokEst int
 		bm = &backendMetrics{}
 		m.backends[backend] = bm
 	}
-	b := &bm.arrivals[idx]
-	if b.t != start {
-		*b = rateBucket{t: start}
-	}
+	b := bm.rateBucketAt(time.Now())
 	b.req++
 	b.byt += float64(bytesIn)
 	b.tok += float64(tokEst)
@@ -499,7 +610,16 @@ func (m *metricsRegistry) recordRequest(backend string, s requestSample) {
 	}
 	if !s.accepted {
 		bm.rejectedTotal++
-		if s.RejectReason != "" {
+		if s.Status == http.StatusTooManyRequests {
+			for i, reason := range router429Reasons {
+				if s.RejectReason == reason {
+					bm.router429Totals[i]++
+					bm.rateBucketAt(time.Now()).reasons[i]++
+					break
+				}
+			}
+		}
+		if s.RejectReason != "" && (s.Status == 429 || s.Status == 413) {
 			if bm.rejectReasons == nil {
 				bm.rejectReasons = map[string]int64{}
 			}
@@ -552,13 +672,43 @@ func (m *metricsRegistry) computeRates(now time.Time) {
 	defer m.mu.Unlock()
 	for _, bm := range m.backends {
 		var req, byt, tok float64
+		var reasons [router429ReasonN]int64
+		var waits [queueStageN]waitSummary
 		for i := range bm.arrivals {
 			b := &bm.arrivals[i]
 			if b.t > cutoff && b.t <= nowMs {
 				req += b.req
 				byt += b.byt
 				tok += b.tok
+				for j := range reasons {
+					reasons[j] += b.reasons[j]
+				}
+				for j := range waits {
+					waits[j].SumMs += b.waits[j].SumMs
+					waits[j].Samples += b.waits[j].Samples
+				}
 			}
+		}
+		rf := newRouter429Frame()
+		for i := range reasons {
+			rf.ByReason[i].Total = bm.router429Totals[i]
+			rf.ByReason[i].Rate = float64(reasons[i]) / rateWindowS
+			rf.Total += bm.router429Totals[i]
+			rf.Rate += rf.ByReason[i].Rate
+		}
+		bm.router429 = nil
+		if rf.Total > 0 {
+			bm.router429 = rf
+		}
+		qf := &queueWaitFrame{}
+		var count int64
+		for i := range waits {
+			*qf.stage(queueStage(i)) = waits[i]
+			count += waits[i].Samples
+		}
+		bm.queueWait = nil
+		if count > 0 {
+			bm.queueWait = qf
 		}
 		bm.reqRate = req / rateWindowS
 		bm.bytesRate = byt / rateWindowS
@@ -597,6 +747,8 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 		ReqTotal:        bm.reqTotal,
 		RejectedTotal:   bm.rejectedTotal,
 		RejectReasons:   copyReasons(bm.rejectReasons),
+		Router429:       bm.router429,
+		QueueWait:       bm.queueWait,
 		BytesInTotal:    bm.bytesInTotal,
 		BytesOutTotal:   bm.bytesOutTotal,
 		TokEstTotal:     bm.tokEstTotal,
@@ -3163,6 +3315,7 @@ func (a *sessionAdmission) pruneIdleLocked() {
 // identity remains eligible behind it. Modifying the list while ranging
 // over Start requires re-resolving Front after each removal.
 func (a *sessionAdmission) drainLocked() {
+	a.pruneIdleLocked()
 	for front := a.queue.Front(); front != nil; {
 		w := front.Value.(*sessionAdmissionWaiter)
 		if !w.pending {
@@ -3351,7 +3504,7 @@ func (a *sessionAdmission) aggregateSnapshot() admissionFrame {
 			continue
 		}
 		f.Waiting++
-		if w.enqueuedAt.Before(oldest) {
+		if oldest.IsZero() || w.enqueuedAt.Before(oldest) {
 			oldest = w.enqueuedAt
 		}
 	}
@@ -4101,10 +4254,9 @@ func estimateRetryAfter(name string) int {
 // The field set is the superset of the live frame's capacity figures: the
 // original 25 router/engine series plus the admission-gate gauges (the
 // frozen admissionFrame) and the fleet GPU-budget figures, so the live edge
-// and stored history cannot diverge. Counting the new series: 2 router
-// queue caps + 14 admission + 3 GPU budget = 19, for 44 total. (The plan's
-// "25→50" tally is unrecoverable from the dropped history; 44 is the
-// faithful superset. uint64 flags because 44 > 32.)
+// and stored history cannot diverge. The original 44 indexes remain stable;
+// router rejection and gate-exit rates append seventeen fields. uint64 flags
+// preserve presence above index 31.
 const (
 	hiInFlight = iota
 	hiWaiting
@@ -4151,8 +4303,27 @@ const (
 	hiGpuUsed
 	hiGpuBudget
 	hiGpuWaiting
+	hiRouter429Rate
+	hiRouter429BlockedByTier0Rate
+	hiRouter429SessionQueueFullRate
+	hiRouter429SessionTimeoutRate
+	hiRouter429GpuBudgetFullRate
+	hiRouter429BackendFullRate
+	hiRouter429BackendQueueFullRate
+	hiRouter429PrefillFullRate
+	hiRouter429PrefillQueueFullRate
+	hiAdmissionWaitMsRate
+	hiAdmissionWaitSamplesRate
+	hiGPUWaitMsRate
+	hiGPUWaitSamplesRate
+	hiExecutionWaitMsRate
+	hiExecutionWaitSamplesRate
+	hiPrefillWaitMsRate
+	hiPrefillWaitSamplesRate
 	histFieldN
 )
+
+var _ [64 - histFieldN]struct{}
 
 var histFieldNames = [histFieldN]string{
 	"inFlight", "waiting", "maxConcurrent", "prefillInFlight", "prefillWaiting",
@@ -4168,6 +4339,9 @@ var histFieldNames = [histFieldN]string{
 	"admissionRejQueueFull", "admissionRejQueueTimeout",
 	"admissionRejClientCancel",
 	"gpuUsed", "gpuBudget", "gpuWaiting",
+	"router429Rate",
+	"router429BlockedByTier0Rate", "router429SessionQueueFullRate", "router429SessionTimeoutRate", "router429GpuBudgetFullRate", "router429BackendFullRate", "router429BackendQueueFullRate", "router429PrefillFullRate", "router429PrefillQueueFullRate",
+	"admissionWaitMsRate", "admissionWaitSamplesRate", "gpuWaitMsRate", "gpuWaitSamplesRate", "executionWaitMsRate", "executionWaitSamplesRate", "prefillWaitMsRate", "prefillWaitSamplesRate",
 }
 
 // Max-rollup series: kvMax and ttftMax (existing) plus the admission
@@ -4202,10 +4376,10 @@ func hpSet(p *historyPoint, i int, v float64) {
 		return
 	}
 	p.V[i] = fv
-	p.Flags |= 1 << uint(i)
+	p.Flags |= uint64(1) << uint(i)
 }
 
-func hpHas(p historyPoint, i int) bool { return p.Flags&(1<<uint(i)) != 0 }
+func hpHas(p historyPoint, i int) bool { return p.Flags&(uint64(1)<<uint(i)) != 0 }
 
 type histAccum struct {
 	t     int64
@@ -4226,7 +4400,7 @@ func (a *histAccum) add(p historyPoint) {
 			a.max[i] = v
 		}
 		a.n[i]++
-		a.flags |= 1 << uint(i)
+		a.flags |= uint64(1) << uint(i)
 	}
 }
 
@@ -4539,8 +4713,22 @@ func (h *historyStore) sample() {
 	}
 }
 
+func hpPressure(p *historyPoint, reasons *router429Frame, waits *queueWaitFrame) {
+	if reasons != nil {
+		hpSet(p, hiRouter429Rate, reasons.Rate)
+	}
+	if waits != nil {
+		for s := queueStage(0); s < queueStageN; s++ {
+			w := waits.stage(s)
+			hpSet(p, hiAdmissionWaitMsRate+int(s)*2, w.SumMs/rateWindowS)
+			hpSet(p, hiAdmissionWaitSamplesRate+int(s)*2, float64(w.Samples)/rateWindowS)
+		}
+	}
+}
+
 func pointFromBackend(b backendFrame) historyPoint {
 	var p historyPoint
+	hpPressure(&p, b.Router429, b.QueueWait)
 	hpSet(&p, hiInFlight, float64(b.InFlight))
 	hpSet(&p, hiWaiting, float64(b.Waiting))
 	hpSet(&p, hiMaxConc, float64(b.MaxConcurrent))
@@ -4591,6 +4779,11 @@ func pointFromBackend(b backendFrame) historyPoint {
 	// this backend (Admission != nil), so a disabled backend's series stay
 	// null (never 0) — matching the live frame's null-when-disabled contract.
 	if adm := b.Admission; adm != nil {
+		if b.Router429 != nil {
+			for i, reason := range b.Router429.ByReason {
+				hpSet(&p, hiRouter429BlockedByTier0Rate+i, reason.Rate)
+			}
+		}
 		hpSet(&p, hiAdmMaxAdmitted, float64(adm.MaxAdmitted))
 		hpSet(&p, hiAdmMaxWaiting, float64(adm.MaxWaiting))
 		hpSet(&p, hiAdmActive, float64(adm.Active))
@@ -4611,6 +4804,7 @@ func pointFromBackend(b backendFrame) historyPoint {
 
 func pointFromTotals(t totalsFrame, g gpuFrame) historyPoint {
 	var p historyPoint
+	hpPressure(&p, t.Router429, t.QueueWait)
 	hpSet(&p, hiInFlight, float64(t.InFlight))
 	hpSet(&p, hiWaiting, float64(t.Waiting))
 	// Fleet rollup of active admissions (0 when no backend enables admission;
@@ -4955,6 +5149,46 @@ func histPointsV2toV3(in []histPointV2) []historyPoint {
 	return out
 }
 
+// The first V3 writer stored 44 fields. Keep its disk layout read-only;
+// runtime and new snapshots use the expanded field set.
+type historyPointV3Legacy struct {
+	T     int64
+	V     [44]float32
+	Flags uint64
+}
+type histSeriesSnapV3Legacy struct{ Raw, Minute, Hour []historyPointV3Legacy }
+type historySnapshotV3Legacy struct {
+	Version  int
+	SavedAt  int64
+	Backends map[string]histSeriesSnapV3Legacy
+	Fleet    histSeriesSnapV3Legacy
+	GPUs     map[string]histGPUSnap
+}
+
+func decodeHistoryV3Legacy(data []byte) (historySnapshot, bool) {
+	var old historySnapshotV3Legacy
+	if gob.NewDecoder(bytes.NewReader(data)).Decode(&old) != nil || old.Version != 3 {
+		return historySnapshot{}, false
+	}
+	convert := func(s histSeriesSnapV3Legacy) histSeriesSnap {
+		points := func(in []historyPointV3Legacy) []historyPoint {
+			out := make([]historyPoint, len(in))
+			for i, p := range in {
+				out[i].T = p.T
+				out[i].Flags = p.Flags & ((uint64(1) << 44) - 1)
+				copy(out[i].V[:44], p.V[:])
+			}
+			return out
+		}
+		return histSeriesSnap{Raw: points(s.Raw), Minute: points(s.Minute), Hour: points(s.Hour)}
+	}
+	snap := historySnapshot{Version: 3, SavedAt: old.SavedAt, Fleet: convert(old.Fleet), Backends: make(map[string]histSeriesSnap, len(old.Backends)), GPUs: old.GPUs}
+	for name, s := range old.Backends {
+		snap.Backends[name] = convert(s)
+	}
+	return snap, true
+}
+
 func (h *historyStore) snapshotLocked() historySnapshot {
 	snap := historySnapshot{
 		Version:  historySnapshotVersion,
@@ -5039,7 +5273,9 @@ func (h *historyStore) loadSnapshot(path string) {
 		// Not the current layout: a V2 snapshot (25 fields, uint32 flags)
 		// migrates to V3 preserving the shared 25 series; anything else is
 		// dropped.
-		if migrated, ok := decodeHistoryV2(bytes.NewReader(data)); ok {
+		if migrated, ok := decodeHistoryV3Legacy(data); ok {
+			snap = migrated
+		} else if migrated, ok := decodeHistoryV2(bytes.NewReader(data)); ok {
 			snap = migrated
 			log.Printf("history: migrated V2 snapshot from %s", path)
 		} else {
@@ -5083,6 +5319,27 @@ func applyFleetAggregates(f *metricsFrame) {
 	// figure.
 	var hitH, hitQ, hitMean, hitDen float64
 	for _, b := range f.Backends {
+		if b.Router429 != nil {
+			if t.Router429 == nil {
+				t.Router429 = newRouter429Frame()
+			}
+			t.Router429.Total += b.Router429.Total
+			t.Router429.Rate += b.Router429.Rate
+			for i := range t.Router429.ByReason {
+				t.Router429.ByReason[i].Total += b.Router429.ByReason[i].Total
+				t.Router429.ByReason[i].Rate += b.Router429.ByReason[i].Rate
+			}
+		}
+		if b.QueueWait != nil {
+			if t.QueueWait == nil {
+				t.QueueWait = &queueWaitFrame{}
+			}
+			for stage := queueStage(0); stage < queueStageN; stage++ {
+				dst, src := t.QueueWait.stage(stage), b.QueueWait.stage(stage)
+				dst.SumMs += src.SumMs
+				dst.Samples += src.Samples
+			}
+		}
 		e := b.Engine
 		if e.Status == "ok" {
 			t.EngineOK++
@@ -5472,7 +5729,10 @@ type backendFrame struct {
 	// Admission is nil (JSON null) when session admission is disabled for
 	// this backend; an object (possibly all-zero) when enabled. Missing
 	// entirely only on servers that predate the field.
-	Admission *admissionFrame `json:"admission"`
+	Admission   *admissionFrame `json:"admission"`
+	QueueWait   *queueWaitFrame `json:"queueWait"`
+	Router429   *router429Frame `json:"router429"`
+	EngineQueue *waitSummary    `json:"engineQueue"`
 }
 
 type gpuFrame struct {
@@ -5524,7 +5784,9 @@ type totalsFrame struct {
 	// AdmActive: fleet rollup of active session-admission leases (sum over
 	// backends with admission enabled). Feeds the fleet lane of the
 	// admission history layer; 0 when no backend has admission enabled.
-	AdmActive int32 `json:"admActive"`
+	AdmActive int32           `json:"admActive"`
+	QueueWait *queueWaitFrame `json:"queueWait"`
+	Router429 *router429Frame `json:"router429"`
 }
 
 type metricsFrame struct {
@@ -5567,10 +5829,15 @@ func buildMetricsFrame() metricsFrame {
 		bf.ReqTotal = ms.ReqTotal
 		bf.RejectTotal = ms.RejectedTotal
 		bf.RejectReasons = ms.RejectReasons
+		bf.QueueWait = ms.QueueWait
+		bf.Router429 = ms.Router429
 		bf.BytesInTotal = ms.BytesInTotal
 		bf.BytesOutTotal = ms.BytesOutTotal
 		bf.TokEstTotal = ms.TokEstTotal
 		bf.Engine = engineMetrics.view(b.Name)
+		if bf.Engine.Status == "ok" && bf.Engine.QueueSamples > 0 {
+			bf.EngineQueue = &waitSummary{SumMs: bf.Engine.QueueMs * float64(bf.Engine.QueueSamples), Samples: int64(bf.Engine.QueueSamples)}
+		}
 		if mgr := sessionAdmissions[b.Name]; mgr != nil {
 			af := mgr.aggregateSnapshot()
 			bf.Admission = &af
@@ -5663,7 +5930,8 @@ type burstRequestFrame struct {
 	BytesOut     int64   `json:"bytesOut"`
 	// RejectReason: the X-Router-Reason for a rejected (429/499/413) request;
 	// "" for accepted ones. The RequestFeed REASON column.
-	RejectReason string `json:"rejectReason,omitempty"`
+	RejectReason *string        `json:"rejectReason"`
+	QueueWait    queueWaitTimes `json:"queueWaitMs"`
 	// GateWaitMs: admission-gate wait (keyed traffic only); 0 otherwise.
 	// The RequestFeed GATE WAIT column.
 	GateWaitMs float64 `json:"gateWaitMs"`
@@ -5672,6 +5940,13 @@ type burstRequestFrame struct {
 // burstLimitMax bounds the number of recent requests ?limit= may return,
 // well under the ring capacity (2000) so a single poll stays cheap.
 const burstLimitMax = 1000
+
+func burstRejectReason(s requestSample) *string {
+	if s.RejectReason != "" || (s.Status < 400 || s.Status == 499) {
+		return &s.RejectReason
+	}
+	return nil
+}
 
 // handleBurst serves the recent-request ring as {"requests":[...]} (newest
 // last), ?limit default 500, max 1000.
@@ -5704,7 +5979,8 @@ func handleBurst(w http.ResponseWriter, r *http.Request) {
 			NewTokensEst: s.NewTokensEst,
 			BytesIn:      s.BytesIn,
 			BytesOut:     s.BytesOut,
-			RejectReason: s.RejectReason,
+			RejectReason: burstRejectReason(s),
+			QueueWait:    s.QueueWait,
 			GateWaitMs:   s.GateWaitMs,
 		})
 	}
@@ -5833,13 +6109,14 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			// Model is unknown at this point; attribute to the default backend.
 			metrics.recordRequest(backends[0].Name, requestSample{
-				T:       time.Now(),
-				Start:   reqStart,
-				Backend: backends[0].Name,
-				Path:    r.URL.Path,
-				Status:  http.StatusRequestEntityTooLarge,
-				DurMs:   float64(time.Since(reqStart) / time.Millisecond),
-				BytesIn: int64(len(body)),
+				T:            time.Now(),
+				Start:        reqStart,
+				Backend:      backends[0].Name,
+				Path:         r.URL.Path,
+				Status:       http.StatusRequestEntityTooLarge,
+				RejectReason: "body-too-large",
+				DurMs:        float64(time.Since(reqStart) / time.Millisecond),
+				BytesIn:      int64(len(body)),
 			})
 			return
 		}
@@ -5923,6 +6200,14 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		metrics.recordRequest(reqContext.Backend, reqContext)
 	}
 
+	recordWait := func(stage queueStage, start time.Time) {
+		elapsed := time.Since(start)
+		reqContext.QueueWait.set(stage, elapsed)
+		metrics.recordGateWait(target.Name, stage, elapsed)
+		if stage == queueStageAdmission {
+			reqContext.GateWaitMs = elapsed.Seconds() * 1000
+		}
+	}
 	cancelCh := r.Context().Done()
 	t0Inflight := tier0Inflight()
 
@@ -5957,15 +6242,15 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		if mgr := sessionAdmissions[target.Name]; mgr != nil {
 			admitStart := time.Now()
 			ticket, aerr := mgr.acquire(r.Context(), admKey, queueTimeout)
+			recordWait(queueStageAdmission, admitStart)
+			mgr.recordGateWait(time.Since(admitStart))
 			if aerr != nil {
 				if r.Context().Err() != nil {
 					// Cancellation wins over any concurrent queue deadline:
 					// 499, recorded only — never write to a closed client
 					// and never enter downstream admission.
-					reqContext.GateWaitMs = float64(time.Since(admitStart) / time.Millisecond)
-					mgr.recordGateWait(time.Since(admitStart))
 					mgr.recordGateRejection("client-cancel")
-					recordRejection(499, "client-cancel")
+					recordRejection(499, "")
 					return
 				}
 				reason := "session-admission-queue-full"
@@ -5980,8 +6265,6 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				}
 				log.Printf("%s %s -> %s (model=%s) 429: %s (admission wait=%v)",
 					r.Method, r.URL.Path, target.Name, modelName, reason, time.Since(admitStart))
-				reqContext.GateWaitMs = float64(time.Since(admitStart) / time.Millisecond)
-				mgr.recordGateWait(time.Since(admitStart))
 				mgr.recordGateRejection(reason)
 				write429(w, reason, target.Name, estimateRetryAfter(target.Name))
 				recordRejection(http.StatusTooManyRequests, reason)
@@ -5994,8 +6277,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			// The gate-wait figure is the admission gate only; downstream
 			// GPU/slot/prefill queueing is NOT folded into it.
-			reqContext.GateWaitMs = waitMs
-			mgr.recordGateWait(time.Since(admitStart))
+			// Admission wait was recorded at gate exit.
 			defer ticket.release()
 			// The lease may have waited: re-snapshot tier-0 in-flight so
 			// the GPU-budget decision below does not use the arrival-time
@@ -6011,34 +6293,19 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if gpu != nil && target.Tier > 0 && target.GpuWeight > 0 && t0Inflight > 0 {
 		used, maxB, _ := gpu.snapshot()
 		if used+target.GpuWeight > maxB {
-			log.Printf("%s %s -> %s (model=%s) queued at GPU budget (gpu=%d+%d/%d, tier0=%d)",
-				r.Method, r.URL.Path, target.Name, modelName,
-				used, target.GpuWeight, maxB, t0Inflight)
-			if !gpu.tryAcquire(target.GpuWeight, 4, 5*time.Second, cancelCh) {
-				if r.Context().Err() != nil {
-					// Client gave up while waiting at the GPU gate: 499,
-					// recorded only — the client is already gone.
-					recordRejection(499, "client-cancel")
-					return
-				}
-				retry := estimateRetryAfter(target.Name)
-				log.Printf("%s %s -> %s (model=%s) 429: GPU budget full", r.Method, r.URL.Path, target.Name, modelName)
-				write429(w, "gpu-budget-full", target.Name, retry)
-				recordRejection(http.StatusTooManyRequests, "gpu-budget-full")
+			log.Printf("%s %s -> %s (model=%s) queued at GPU budget (gpu=%d+%d/%d, tier0=%d)", r.Method, r.URL.Path, target.Name, modelName, used, target.GpuWeight, maxB, t0Inflight)
+		}
+		gateStart := time.Now()
+		acquired := gpu.tryAcquire(target.GpuWeight, 4, 5*time.Second, cancelCh)
+		recordWait(queueStageGPU, gateStart)
+		if !acquired {
+			if r.Context().Err() != nil {
+				recordRejection(499, "")
 				return
 			}
-		} else {
-			if !gpu.tryAcquire(target.GpuWeight, 4, 5*time.Second, cancelCh) {
-				if r.Context().Err() != nil {
-					recordRejection(499, "client-cancel")
-					return
-				}
-				retry := estimateRetryAfter(target.Name)
-				log.Printf("%s %s -> %s (model=%s) 429: GPU budget full (race)", r.Method, r.URL.Path, target.Name, modelName)
-				write429(w, "gpu-budget-full", target.Name, retry)
-				recordRejection(http.StatusTooManyRequests, "gpu-budget-full")
-				return
-			}
+			write429(w, "gpu-budget-full", target.Name, estimateRetryAfter(target.Name))
+			recordRejection(http.StatusTooManyRequests, "gpu-budget-full")
+			return
 		}
 		defer gpu.release(target.GpuWeight)
 	}
@@ -6052,9 +6319,12 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				r.Method, r.URL.Path, target.Name, modelName,
 				in, maxC, waiting+1, t0Inflight)
 		}
-		if !sem.acquire(queueTimeout, cancelCh) {
+		gateStart := time.Now()
+		acquired := sem.acquire(queueTimeout, cancelCh)
+		recordWait(queueStageExecution, gateStart)
+		if !acquired {
 			if r.Context().Err() != nil {
-				recordRejection(499, "client-cancel")
+				recordRejection(499, "")
 				return
 			}
 			retry := estimateRetryAfter(target.Name)
@@ -6095,9 +6365,12 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 					r.Method, r.URL.Path, target.Name, modelName,
 					pin, pmaxC, pwaiting+1, prefillTokens)
 			}
-			if !prefillSem.acquire(queueTimeout, cancelCh) {
+			gateStart := time.Now()
+			acquired := prefillSem.acquire(queueTimeout, cancelCh)
+			recordWait(queueStagePrefill, gateStart)
+			if !acquired {
 				if r.Context().Err() != nil {
-					recordRejection(499, "client-cancel")
+					recordRejection(499, "")
 					return
 				}
 				retry := estimateRetryAfter(target.Name)
@@ -6175,6 +6448,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		reqID:          reqID,
 		sessKey:        sessKey,
 		ctxTok:         ctxTok,
+		queueWait:      reqContext.QueueWait,
+		gateWaitMs:     reqContext.GateWaitMs,
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
@@ -6233,6 +6508,8 @@ type respTracker struct {
 	ctxTok       int    // est context tokens
 	ttftSent     bool   // first-byte TTFT already recorded (once)
 	recorded     bool   // finish guard: exactly one sample per request
+	queueWait    queueWaitTimes
+	gateWaitMs   float64
 }
 
 func (t *respTracker) WriteHeader(code int) {
@@ -6308,6 +6585,8 @@ func (t *respTracker) finish(backend, path string, status int, ttftMs float64, b
 		CtxTok:       t.ctxTok,
 		BytesIn:      t.bytesIn,
 		BytesOut:     bytesOut,
+		QueueWait:    t.queueWait,
+		GateWaitMs:   t.gateWaitMs,
 	})
 }
 

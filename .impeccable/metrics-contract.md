@@ -73,6 +73,27 @@ Frame schema (all numbers are `int`/`float64` as Go serializes them):
         "rejQueueTimeout": 3,
         "rejClientCancel": 1
       },
+      "queueWait": {
+        "admission": {"sumMs": 144.0, "samples": 12},
+        "gpu": {"sumMs": 0, "samples": 0},
+        "execution": {"sumMs": 96.0, "samples": 8},
+        "prefill": {"sumMs": 0, "samples": 0}
+      },
+      "router429": {
+        "total": 12,
+        "rate": 0.4,
+        "byReason": [
+          {"reason": "blocked-by-tier0", "total": 0, "rate": 0},
+          {"reason": "session-admission-queue-full", "total": 3, "rate": 0.1},
+          {"reason": "session-admission-timeout", "total": 0, "rate": 0},
+          {"reason": "gpu-budget-full", "total": 8, "rate": 0.27},
+          {"reason": "backend-full", "total": 1, "rate": 0.03},
+          {"reason": "backend-queue-full", "total": 0, "rate": 0},
+          {"reason": "prefill-full", "total": 0, "rate": 0},
+          {"reason": "prefill-queue-full", "total": 0, "rate": 0}
+        ]
+      },
+      "engineQueue": {"sumMs": 1200.0, "samples": 60},
       "engine": {
         "status": "ok",
         "engine": "vllm",
@@ -146,7 +167,27 @@ Frame schema (all numbers are `int`/`float64` as Go serializes them):
     "bytesInTotal": 2100000,
     "bytesOutTotal": 158000000,
     "tokEstTotal": 8812345,
-    "admActive": 3
+    "admActive": 3,
+    "router429": {
+      "total": 12,
+      "rate": 0.4,
+      "byReason": [
+        {"reason": "blocked-by-tier0", "total": 0, "rate": 0},
+        {"reason": "session-admission-queue-full", "total": 3, "rate": 0.1},
+        {"reason": "session-admission-timeout", "total": 0, "rate": 0},
+        {"reason": "gpu-budget-full", "total": 8, "rate": 0.27},
+        {"reason": "backend-full", "total": 1, "rate": 0.03},
+        {"reason": "backend-queue-full", "total": 0, "rate": 0},
+        {"reason": "prefill-full", "total": 0, "rate": 0},
+        {"reason": "prefill-queue-full", "total": 0, "rate": 0}
+      ]
+    },
+    "queueWait": {
+      "admission": {"sumMs": 144.0, "samples": 12},
+      "gpu": {"sumMs": 0, "samples": 0},
+      "execution": {"sumMs": 96.0, "samples": 8},
+      "prefill": {"sumMs": 0, "samples": 0}
+    }
   }
 }
 ```
@@ -161,9 +202,12 @@ Field semantics (A implements, B displays):
 - `reqTotal` / `bytesInTotal` / `bytesOutTotal` / `tokEstTotal` — monotonically increasing counters since process start (bytesIn = request body bytes, bytesOut = response body bytes actually written, tokEst = sum of `estimateNewTokens` over accepted requests).
 - `rejectReasons` — per-backend **lifetime** router-originated rejection counts keyed by the `X-Router-Reason` string (e.g. `gpu-budget-full`, `session-admission-queue-full`). `null` (JSON) when the backend has never rejected. This is the downstream gate breakdown (GPU budget, slot, queue, prefill); the admission gate's OWN breakdown lives in `admission`.
 - `admission` — the authoritative per-backend session-admission (lease) snapshot, **nil (JSON `null`) when session admission is disabled for this backend**; an object (possibly all-zero) when enabled. Present on servers that support it; absent only on older servers. Fields: `maxAdmitted` (per-backend identity cap), `maxWaiting` (distinct-by-arrival queue bound; 0 rejects newcomers), `idleTTLms` (`SESSION_IDLE_TTL`), `active` (leases with an accepted in-flight request), `idle` (idle leases retaining their slot), `waiting` (live waiters — the same predicate the capacity checks use), `oldestWaitMs` (max age among live waiters, 0 when none), `reclaimedTotal` (pressure reclaims, process lifetime). Gate-wait telemetry is the admission gate ONLY (downstream GPU/slot/prefill queueing is NOT folded in): `gateWaitMs` = lifetime mean ms (`gateWaitTotalMs/gateWaitCount`), `gateWaitTotalMs`/`gateWaitCount` lifetime sum/count, `gateWaitTrailMs`/`gateWaitTrailCnt` the trailing-30s window (live mean = `gateWaitTrailMs/gateWaitTrailCnt`). Rejection breakdown: `rejQueueFull` / `rejQueueTimeout` / `rejClientCancel`. A snapshot read cannot mutate — it never prunes, drains, or grants.
+- `queueWait` — trailing-30s **gate-exit** telemetry, per backend: `sumMs` (ms) and `samples` (int) for each of the four router gates in pipeline order `admission`, `gpu`, `execution`, `prefill`. A gate is recorded once per ATTEMPTED acquire — on success, queue rejection, timeout, or cancellation — measured at the gate, not at response completion; `admission` is keyed traffic only (0 for unkeyed). The displayed mean is `sumMs/samples`; `samples: 0` means "no gate exits in the window" → render `—`, never a measured zero. The GPU figure is that backend's gate wait; the SHARED GPU-budget queue depth stays in `gpu.waiting` and is never attributed per backend. `null` (JSON) when no gate exit has ever been recorded.
+- `router429` — router-originated 429 saturation, per backend. `total` is process-lifetime; `rate` is trailing-30s req/s. `byReason` is the FIXED eight known router-429 reasons in stable order (`blocked-by-tier0`, `session-admission-queue-full`, `session-admission-timeout`, `gpu-budget-full`, `backend-full`, `backend-queue-full`, `prefill-full`, `prefill-queue-full`) with lifetime `total` and trailing-30s `rate` each; unused reasons are present zero rows. Only non-accepted samples with status 429 and one of these reasons count — upstream 429s, 413s, 502s, and 499s never do. `null` (JSON) when the backend has never emitted a router 429. This is separate from `rejectTotal` (the broader lifetime counter, unchanged) and from `rejectReasons` (the lifetime map).
+- `engineQueue` — engine-sourced queue wait: `sumMs`/`samples` accumulated over the engine's own 1s scrape cadence (vLLM `request_queue_time_seconds`, SGLang `queue_time_seconds`), NOT the router's 30s window. The displayed mean is the engine scrape-interval mean; `samples: 0` → `—`. `null` when no scrape has observed queue time.
 - `gpu.used` / `gpu.budget` / `gpu.waiting` — live GPU-budget weighted state. `gpu.active` is `true` when `tier0Inflight > 0`. When no GPU budget is configured, `gpu.budget` is `0` and `active` is `false`.
 - `tier0Inflight` — total in-flight across all tier-0 backends.
-- `totals.*` — sum across backends (inFlight, waiting) plus aggregate rates/counters. `totals.admActive` is the fleet rollup of active session-admission leases (sum over backends with admission enabled; 0 when none enable it) — the fleet value for the admission history layer and the ADMISSION readings cell.
+- `totals.*` — sum across backends (inFlight, waiting) plus aggregate rates/counters. `totals.admActive` is the fleet rollup of active session-admission leases (sum over backends with admission enabled; 0 when none enable it) — the fleet value for the admission history layer and the ADMISSION readings cell. `totals.router429` sums lifetime totals and 30s rates per reason (all backends); `totals.queueWait` pools per-stage sums and sample counts (sum the sums, sum the counts — never a mean of per-backend means). `null` when no backend reports the field.
 - `engine` (v2) — the backend's OWN execution truth, scraped from its Prometheus `/metrics` endpoint at 1s (vLLM: always on; SGLang: only when started with `--enable-metrics`). Full field table below.
 
 ### Engine v2 field table
@@ -238,7 +282,8 @@ tape.
       "bytesIn": 2048,
       "bytesOut": 158000,
       "rejectReason": "gpu-budget-full",
-      "gateWaitMs": 120.5
+      "gateWaitMs": 120.5,
+      "queueWaitMs": {"admission": 120.5, "gpu": null, "execution": 30.2, "prefill": null}
     }
   ]
 }
@@ -248,8 +293,9 @@ tape.
 - `t` is the completion time for every sample, including router-originated rejections: a 429 that waited in the queue is stamped at the moment it was rejected, not at arrival.
 - `ttftMs` is `0` for non-streaming and for router-originated rejections.
 - `durMs` for a router-originated 429 is the queue-wait time before rejection (arrival → rejection); `t` − `durMs` is the arrival instant.
-- `rejectReason` — the `X-Router-Reason` string for a router-originated rejection (429/413/499); omitted for accepted requests. The RequestFeed REASON column.
-- `gateWaitMs` — the admission-gate wait only, in ms (keyed, session-admission traffic); `0` for unkeyed/disabled traffic. This is the router's OWN queue pressure, NOT the downstream GPU/slot/prefill waits. The RequestFeed GATE WAIT column.
+- `rejectReason` — the `X-Router-Reason` string for a router-originated rejection; the fixed router-429 set is `blocked-by-tier0`, `session-admission-queue-full`, `session-admission-timeout`, `gpu-budget-full`, `backend-full`, `backend-queue-full`, `prefill-full`, `prefill-queue-full`, and 413 uses `body-too-large`. A client CANCELED at a failed gate records status 499 with an EMPTY reason (the cancellation is not a refusal). Omitted (null) for accepted requests and for forwarded upstream errors, including upstream 429s — those are not router saturation. The RequestFeed REASON column.
+- `gateWaitMs` — the ADMISSION-gate wait only, in ms (keyed, session-admission traffic); `0` for unkeyed/disabled traffic. Kept as a scalar for the RequestFeed GATE WAIT column. This is the router's OWN queue pressure, NOT the downstream GPU/slot/prefill waits.
+- `queueWaitMs` — per-stage gate waits in ms, `{"admission": n|null, "gpu": n|null, "execution": n|null, "prefill": n|null}`. A stage is `null` when the request never attempted that gate (skipped/bypassed/unreached); a number (possibly 0, a measured immediate acquisition) when it did. Measured at each gate exit exactly once per attempted acquire. The RequestFeed per-stage breakdown.
 
 ## 3. GET /metrics/sessions
 
@@ -574,9 +620,9 @@ gauges/rates and maxima for `kvMax`/`ttftMax`/`admissionOldestWaitMs`. The
 history sampler runs once per second independent of SSE clients and shares
 the fleet aggregation with the live frame.
 
-**Additive capacity series (25 → 44 fields).** Per backend, 19 new series
-mirror the live `admission`/router-slot/GPU-budget state: `maxQueueDepth`,
-`prefillMax` (router slot limits, 0 = unlimited/absent);
+**Additive capacity series (25 → 61 fields).** Per backend, the first 19
+new series mirror the live `admission`/router-slot/GPU-budget state:
+`maxQueueDepth`, `prefillMax` (router slot limits, 0 = unlimited/absent);
 `admissionMaxAdmitted`/`admissionMaxWaiting` (lease caps), `admissionActive`
 /`admissionIdle`/`admissionWaiting` (lease/waiter counts),
 `admissionOldestWaitMs` (max-rollup, a pressure peak), `admissionGateWaitMs`
@@ -585,15 +631,31 @@ mirror the live `admission`/router-slot/GPU-budget state: `maxQueueDepth`,
 (trailing-30s window), `admissionRejQueueFull`/`admissionRejQueueTimeout`/
 `admissionRejClientCancel` (gate rejection breakdown); and fleet
 `gpuUsed`/`gpuBudget`/`gpuWaiting` plus fleet `admissionActive` (the
-rollup of active leases, the same figure as `totals.admActive`). A backend
-with session admission
-disabled serializes all `admission*` series as `null` (the presence bit is
-never set) — the client renders `—`, not 0. The fleet carries the GPU-budget
-triplet. **Persistence is now version 3** (the point grew from 25 to 44
-fields and `Flags` widened `uint32` → `uint64`); a v2 snapshot is read by
-a dedicated v2 layout and the 25 shared field indices are copied verbatim
-into v3 (the new capacity fields stay null, never 0). The field set, names,
-and max-rollup membership are compile-checked (a `[histFieldN]` array).
+rollup of active leases, the same figure as `totals.admActive`). Then 17
+pressure-rate series, in append order: `router429Rate` (trailing-30s
+router-429 req/s), the eight per-reason rates
+`router429BlockedByTier0Rate`/`router429SessionQueueFullRate`/
+`router429SessionTimeoutRate`/`router429GpuBudgetFullRate`/
+`router429BackendFullRate`/`router429BackendQueueFullRate`/
+`router429PrefillFullRate`/`router429PrefillQueueFullRate` (trailing-30s
+per-reason req/s, same stable reason order as the live `router429.byReason`),
+and the four per-stage gate-wait pairs
+`admissionWaitMsRate`/`admissionWaitSamplesRate`,
+`gpuWaitMsRate`/`gpuWaitSamplesRate`, `executionWaitMsRate`/
+`executionWaitSamplesRate`, `prefillWaitMsRate`/`prefillWaitSamplesRate`
+(each the trailing-30s gate-exit sum and sample count ÷ 30 — the displayed
+mean at a point is the sum-rate ÷ sample-rate ratio; zero sample-rate →
+`—`).
+These are **smoothed trailing-window observations**, not exact counts for a
+selected bucket. A backend with session admission disabled serializes all
+`admission*` and `router429*` series as `null` (the presence bit is never
+set) — the client renders `—`, not 0. The fleet carries the GPU-budget
+triplet. **Persistence is now version 3** (the point grew from 25 to 61
+fields and `Flags` widened `uint32` → `uint64`; a compile-time bound keeps
+the field count ≤ 64); a v2 snapshot is read by a dedicated v2 layout and
+the shared field indices are copied verbatim into v3 (new fields stay null,
+never 0). The field set, names, and max-rollup membership are
+compile-checked (a `[histFieldN]` array).
 
 ### Dev mock
 

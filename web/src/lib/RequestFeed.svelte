@@ -51,6 +51,16 @@
     return "ok";
   }
 
+  function waitValue(v: number | null | undefined): string {
+    return v == null || !Number.isFinite(v) ? "—" : v === 0 ? "0" : fmtMs(v);
+  }
+  function csvNumber(v: number | null | undefined): string {
+    return v == null || !Number.isFinite(v) ? "" : v.toFixed(1);
+  }
+  function gateTitle(r: BurstRequest): string {
+    return "Admission gate visible; stage gate waits: " + (["admission", "gpu", "execution", "prefill"] as const)
+      .map((stage) => stage + ": " + waitValue(r.queueWaitMs?.[stage])).join("; ");
+  }
   function exportCsv(): void {
     const head = [
       "completed_ms",
@@ -66,6 +76,7 @@
       "bytes_in",
       "bytes_out",
       "new_tokens_est",
+      "reason", "admission_wait_ms", "gpu_wait_ms", "execution_wait_ms", "prefill_wait_ms",
     ];
     const lines = [head.join(",")];
     for (const r of requests) {
@@ -79,11 +90,16 @@
           r.stream,
           r.ttftMs.toFixed(1),
           r.durMs.toFixed(1),
-          r.gateWaitMs.toFixed(1),
-          csvEscape(r.rejectReason),
+          csvNumber(r.gateWaitMs),
+          csvEscape(r.rejectReason ?? ""),
           r.bytesIn,
           r.bytesOut,
           r.newTokensEst,
+          csvEscape(r.rejectReason ?? ""),
+          csvNumber(r.queueWaitMs?.admission),
+          csvNumber(r.queueWaitMs?.gpu),
+          csvNumber(r.queueWaitMs?.execution),
+          csvNumber(r.queueWaitMs?.prefill),
         ].join(","),
       );
     }
@@ -141,7 +157,7 @@
             <th class="col-status num">STATUS</th>
             <th class="col-ttft num">TTFT</th>
             <th class="col-dur num">DUR</th>
-            <th class="col-gate num" title="Time in the admission gate only (keyed traffic); not the downstream GPU/slot/prefill waits">GATE</th>
+            <th class="col-gate num" title="Time in the admission gate only (keyed traffic); not the downstream GPU/slot/prefill waits">GATE WAIT</th>
             <th class="col-reason">REASON</th>
             <th class="col-tok num">TOK <span class="tag est">est</span></th>
           </tr>
@@ -160,9 +176,9 @@
               <td class="col-status num {statusClass(r.status)}">{r.status}</td>
               <td class="col-ttft num">{r.ttftMs > 0 ? fmtMs(r.ttftMs) : "—"}</td>
               <td class="col-dur num">{fmtMs(r.durMs)}</td>
-              <td class="col-gate num">{r.gateWaitMs > 0 ? fmtMs(r.gateWaitMs) : "—"}</td>
-              <td class="col-reason mono {r.rejectReason ? 'warn' : ''}" title={r.rejectReason || undefined}>
-                {r.rejectReason || "—"}
+              <td class="col-gate num"><details><summary title={gateTitle(r)}>{waitValue(r.gateWaitMs)}</summary><span class="detail">{gateTitle(r)}</span></details></td>
+              <td class="col-reason mono {r.status === 429 ? 'water' : ''}" title={r.rejectReason || undefined}>
+                {r.rejectReason || (r.status === 429 ? "upstream / unknown" : "—")}
               </td>
               <td class="col-tok num">{fmtInt(r.newTokensEst)}</td>
             </tr>
@@ -202,6 +218,7 @@
   }
   .feed .data-table {
     table-layout: fixed;
+    min-width: 800px;
   }
   .feed .data-table .col-time { width: 10%; }
   .feed .data-table .col-backend { width: 12%; }

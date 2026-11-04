@@ -8,8 +8,11 @@
 import { browser } from "$app/env";
 import {
   emptyEngine,
+  ROUTER_429_REASONS,
+  type QueueWait,
   getJSON,
-  type AdmissionMetrics,
+  type StatsResponse,
+  type AdmissionTotals,
   type BurstRequest,
   type Frame,
   type SessionsFeed,
@@ -24,27 +27,6 @@ export interface FeedInfo {
   gone: boolean;
 }
 
-interface StatsBackend {
-  name: string;
-  url: string;
-  tier: number;
-  inFlight: number;
-  maxConcurrent: number;
-  waiting: number;
-  maxQueueDepth: number;
-  prefillInFlight: number;
-  prefillWaiting: number;
-  prefillMax: number;
-  avgDurationS: number;
-  admission: AdmissionMetrics | null;
-}
-interface StatsResponse {
-  backends: StatsBackend[];
-  gpuUsed: number;
-  gpuBudget: number;
-  gpuWaiting: number;
-  tier0Inflight: number;
-}
 
 const LIVE_FRAMES_CAP = 900;
 
@@ -157,6 +139,28 @@ export class LiveStore {
       return;
     }
     if (!j || !Array.isArray(j.backends) || typeof j.t !== "number") return;
+    // Pool measured numerators and sample counts, never backend means.
+    if (j.backends.length && j.backends.every((b) => b.queueWait != null)) {
+      const pooled = {} as QueueWait;
+      for (const stage of ["admission", "gpu", "execution", "prefill"] as const) {
+        pooled[stage] = j.backends.reduce((sum, b) => ({
+          sumMs: sum.sumMs + b.queueWait![stage].sumMs,
+          samples: sum.samples + b.queueWait![stage].samples,
+        }), { sumMs: 0, samples: 0 });
+      }
+      j.totals.queueWait = pooled;
+    }
+    if (j.backends.length && j.backends.every((b) => b.router429 != null)) {
+      j.totals.router429 = {
+        total: j.backends.reduce((n, b) => n + b.router429!.total, 0),
+        rate: j.backends.reduce((n, b) => n + b.router429!.rate, 0),
+        byReason: ROUTER_429_REASONS.map((reason) => ({
+          reason,
+          total: j.backends.reduce((n, b) => n + (b.router429!.byReason.find((r) => r.reason === reason)?.total ?? 0), 0),
+          rate: j.backends.reduce((n, b) => n + (b.router429!.byReason.find((r) => r.reason === reason)?.rate ?? 0), 0),
+        })),
+      };
+    }
     if (f.kind !== "stats") this.stopStats();
     const sig = j.backends.map((b) => b.name).sort().join("|");
     if (this.backendSig && sig !== this.backendSig) {
@@ -387,11 +391,24 @@ export class LiveStore {
       bytesOutTotal: 0,
       tokEstTotal: 0,
       engine: { ...emptyEngine },
-      admission: b.admission ?? null,
+      admission: b.admission,
+      router429: null,
+      queueWait: null,
+      engineQueue: b.engineQueue ?? null,
     }));
     const inFlight = backends.reduce((a, b) => a + b.inFlight, 0);
     const waiting = backends.reduce((a, b) => a + b.waiting, 0);
     const admActive = backends.reduce((a, b) => a + (b.admission?.active ?? 0), 0);
+    const enabled = backends.flatMap((b) => b.admission ? [b.admission] : []);
+    const admission: AdmissionTotals | null | undefined = enabled.length ? {
+      active: admActive,
+      idle: enabled.reduce((n, a) => n + a.idle, 0),
+      maxAdmitted: enabled.reduce((n, a) => n + a.maxAdmitted, 0),
+      waiting: enabled.reduce((n, a) => n + a.waiting, 0),
+      maxWaiting: enabled.reduce((n, a) => n + a.maxWaiting, 0),
+      oldestWaitMs: Math.max(...enabled.map((a) => a.oldestWaitMs)),
+      reclaimedTotal: enabled.reduce((n, a) => n + a.reclaimedTotal, 0),
+    } : backends.some((b) => b.admission === undefined) ? undefined : null;
     return {
       t,
       backends,
@@ -408,6 +425,9 @@ export class LiveStore {
         inFlight,
         waiting,
         admActive,
+        admission,
+        router429: null,
+        queueWait: null,
         reqRate: 0,
         bytesRate: 0,
         tokEstRate: 0,

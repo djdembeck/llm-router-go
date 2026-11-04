@@ -317,7 +317,7 @@
         onLayer={(id) => (layerId = id)}
       />
 
-      <CapacityPanel frame={live.frame} singleBackend={singleBackendName} />
+      <CapacityPanel frame={live.frame} singleBackend={singleBackendName} history={history.data} {cursor} {selected} onSelect={(name) => (selected = name)} paused={live.paused} stale={live.stale} feedKind={live.feed?.kind ?? "none"} />
 
       <div class="live-band" class:log-open={requestLogOpen} bind:this={bandEl}>
         <section class="profile-sheet sheet" aria-label={singleBackend ? "server profile" : "fleet profile"}>
@@ -326,7 +326,7 @@
             history={history.data}
             frames={live.liveFrames}
             framesVersion={live.framesVersion}
-            {layerId}
+            bind:layerId
             range={history.range}
             {selected}
             bind:cursor

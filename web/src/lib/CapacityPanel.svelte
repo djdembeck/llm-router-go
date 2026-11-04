@@ -1,291 +1,133 @@
 <script lang="ts">
-  import type { AdmissionMetrics, BackendMetrics, Frame, GpuMetrics } from "./api";
-  import { fmtInt, fmtMs, fmtPct } from "./format";
+  import { ROUTER_429_REASONS, type BackendMetrics, type Frame, type HistoryField, type HistoryResponse, type QueueStage } from "./api";
+  import { fmtClock, fmtMs, fmtPct, nearestIndex } from "./format";
+  import { fmtPressureValue } from "./profile";
+  import type { FeedKind } from "./live.svelte";
 
-  let { frame, singleBackend }: { frame: Frame | null; singleBackend: string | null } =
-    $props();
+  let { frame, singleBackend, history, cursor, selected, onSelect, paused, stale, feedKind }: {
+    frame: Frame | null;
+    singleBackend: string | null;
+    history: HistoryResponse | null;
+    cursor: number | null;
+    selected: string | null;
+    onSelect: (name: string | null) => void;
+    paused: boolean;
+    stale: boolean;
+    feedKind: FeedKind;
+  } = $props();
 
-  const f = $derived(frame);
-  const gpu = $derived(f?.gpu ?? null);
-  const backends = $derived(
-    singleBackend != null
-      ? (f?.backends.filter((b) => b.name === singleBackend) ?? [])
-      : (f?.backends ?? []),
-  );
-
-  // A backend that is session-admission-enabled. The panel is the
-  // authoritative "is it at capacity, and WHY" view; backends without
-  // admission are router-slot-bound, so they show their slot fill instead.
-  function admissionState(b: BackendMetrics): { adm: AdmissionMetrics | null; atCap: boolean } {
-    const adm = b.admission;
-    if (!adm) return { adm: null, atCap: false };
-    const leased = adm.active + adm.idle;
-    // The identity cap is the admission gate's ceiling: at cap with a live
-    // queue, a new identity is refused until a lease frees — the precise
-    // "at capacity" the operator is asking about.
-    const atCap = adm.maxAdmitted > 0 && leased >= adm.maxAdmitted;
-    return { adm, atCap };
+  const historical = $derived(cursor != null);
+  const backends = $derived((frame?.backends ?? []).filter((b) =>
+    singleBackend != null ? b.name === singleBackend : selected == null || b.name === selected));
+  const stages: QueueStage[] = ["admission", "gpu", "execution", "prefill"];
+  const reasonFields: HistoryField[] = [
+    "router429BlockedByTier0Rate", "router429SessionQueueFullRate", "router429SessionTimeoutRate",
+    "router429GpuBudgetFullRate", "router429BackendFullRate", "router429BackendQueueFullRate",
+    "router429PrefillFullRate", "router429PrefillQueueFullRate",
+  ];
+  const stageFields: Record<QueueStage, [HistoryField, HistoryField]> = {
+    admission: ["admissionWaitMsRate", "admissionWaitSamplesRate"],
+    gpu: ["gpuWaitMsRate", "gpuWaitSamplesRate"],
+    execution: ["executionWaitMsRate", "executionWaitSamplesRate"],
+    prefill: ["prefillWaitMsRate", "prefillWaitSamplesRate"],
+  };
+  function at(name: string | null, field: HistoryField): number | null {
+    const series = name == null ? history?.fleet : history?.backends.find((b) => b.name === name);
+    if (!series || cursor == null || !series.t.length) return null;
+    if (cursor < series.t[0] || cursor > series.t[series.t.length - 1] + (history?.stepMs ?? 0)) return null;
+    return series.series[field]?.[nearestIndex(series.t, cursor)] ?? null;
   }
-
-  // Fleet GPU-budget pressure (0–100). 0 budget = no GPU gate configured.
-  const gpuPct = $derived(gpu && gpu.budget > 0 ? (gpu.used / gpu.budget) * 100 : null);
-  const gpuAtCap = $derived(gpu != null && gpu.budget > 0 && gpu.used >= gpu.budget);
+  function value(b: BackendMetrics, field: HistoryField, live: number | null | undefined): number | null {
+    return historical ? at(b.name, field) : live ?? null;
+  }
+  function figure(v: number | null | undefined): string {
+    return v == null ? "—" : fmtPressureValue(v);
+  }
+  function duration(v: number | null | undefined): string {
+    return v == null ? "—" : v === 0 ? "0 ms" : fmtMs(v);
+  }
+  function depth(b: BackendMetrics, stage: QueueStage): string {
+    if (stage === "gpu") return "shared (above)";
+    if (stage === "admission") return figure(value(b, "admissionWaiting", b.admission?.waiting));
+    return stage === "execution" ? figure(value(b, "waiting", b.waiting)) : figure(value(b, "prefillWaiting", b.prefillWaiting));
+  }
+  function gate(b: BackendMetrics, stage: QueueStage): { mean: number | null; samples: number | null } {
+    if (historical) {
+      const [sumField, countField] = stageFields[stage];
+      const sum = at(b.name, sumField), count = at(b.name, countField);
+      return { mean: sum != null && count != null && count > 0 ? sum / count : null, samples: count };
+    }
+    const summary = b.queueWait?.[stage];
+    return { mean: summary && summary.samples > 0 ? summary.sumMs / summary.samples : null, samples: summary?.samples ?? null };
+  }
 </script>
 
-{#if f && backends.length}
-  <section class="cap sheet" aria-label="capacity">
+{#if frame && frame.backends.length}
+  <section class="cap sheet" aria-label="capacity diagnostics">
     <div class="sheet-head cap-head">
       <div class="row wrap">
-        <span class="label">CAPACITY</span>
-        <span class="tag router">router</span>
-        <span class="detail muted">admission leases · router slots · GPU budget</span>
+        <span class="label">CAPACITY</span><span class="tag router">router</span>
+        <span class="detail muted">{historical ? `at ${fmtClock(cursor!)} · bucket avg · oldest bucket max` : stale ? "stale · last sample" : paused ? "paused · last sample" : feedKind === "stats" ? "stats fallback" : "live"}</span>
       </div>
+      {#if singleBackend == null && selected != null}<button class="btn" onclick={() => onSelect(null)}>VIEW ALL BACKENDS</button>{/if}
+      <span class="detail mono">shared GPU-budget Q {historical ? figure(at(null, "gpuWaiting")) : frame.gpu.budget > 0 ? figure(frame.gpu.waiting) : "off"}</span>
     </div>
-
-    {#if gpu && gpu.budget > 0}
-      <div class="cap-gpu">
-        <div class="cap-gpu-row">
-          <span class="cap-gpu-label">GPU BUDGET</span>
-          <span class="cap-gpu-fig mono">
-            {fmtInt(gpu.used)}/{fmtInt(gpu.budget)}
-            {#if gpu.waiting > 0}
-              <span class="warn">· {gpu.waiting} waiting</span>
-            {/if}
-          </span>
-          <span class={gpuAtCap ? "chip err" : "chip muted"}>
-            {gpuAtCap ? "at cap" : "headroom"}
-          </span>
-        </div>
-        <div class="bar" role="img" aria-label="GPU budget {fmtInt(gpu.used)} of {fmtInt(gpu.budget)}">
-          <i
-            class="fill {gpuAtCap ? 'cap' : ''}"
-            style:width="{gpuPct != null ? Math.min(100, gpuPct) : 0}%"
-          ></i>
-        </div>
-      </div>
-    {/if}
-
     {#each backends as b (b.name)}
-      {@const { adm, atCap } = admissionState(b)}
-      <div class="cap-backend" class:cap={atCap}>
-        <div class="cap-bk-head">
-          <span class="cap-bk-name mono">{b.name}</span>
-          {#if adm}
-            <span class="chip {atCap ? 'err' : 'ok'}">{atCap ? "at cap" : "headroom"}</span>
-            <span class="cap-bk-fig mono">
-              <span class="sand">{fmtInt(adm.active)}</span> active
-              <span class="dim">·</span> <span class="dim">{fmtInt(adm.idle)}</span> idle
-              <span class="dim">/ {fmtInt(adm.maxAdmitted)} lease</span>
-            </span>
-          {:else}
-            <span class="chip muted">slots</span>
-            <span class="cap-bk-fig mono">
-              <span class={b.maxConcurrent > 0 && b.inFlight >= b.maxConcurrent ? "warn" : "sand"}>
-                {fmtInt(b.inFlight)}
-              </span>
-              <span class="dim">/ {b.maxConcurrent > 0 ? fmtInt(b.maxConcurrent) : "∞"} slot</span>
-              {#if b.waiting > 0}
-                <span class="warn">· {fmtInt(b.waiting)} queued</span>
-              {/if}
-            </span>
-          {/if}
+      <div class="cap-backend">
+        <div class="cap-row mono">
+          {#if singleBackend == null}<span class="backend-name">{b.name}</span>{/if}
+          <span><span class="label">LEASES</span> {#if historical}{figure(at(b.name, "admissionActive"))} active + {figure(at(b.name, "admissionIdle"))} idle / {figure(at(b.name, "admissionMaxAdmitted"))}{:else if b.admission}{figure(b.admission.active)} active + {figure(b.admission.idle)} idle / {figure(b.admission.maxAdmitted)}{:else}{b.admission === null ? "off" : "unavailable"}{/if}</span>
+          <span><span class="label">ADMISSION Q</span> {#if historical || b.admission}{depth(b, "admission")}/{figure(value(b, "admissionMaxWaiting", b.admission?.maxWaiting))} · oldest {duration(value(b, "admissionOldestWaitMs", b.admission?.oldestWaitMs))}{:else}{b.admission === null ? "off" : "unavailable"}{/if}</span>
+          <span><span class="label">EXEC Q</span> {depth(b, "execution")}/{figure(value(b, "maxQueueDepth", b.maxQueueDepth))}</span>
+          <span><span class="label">PREFILL Q</span> {depth(b, "prefill")}/{figure(value(b, "prefillMax", b.prefillMax))}</span>
+          <span><span class="label">ENGINE Q</span> <span class="tag engine">engine</span> {figure(value(b, "engineWaiting", b.engine.status === "ok" ? b.engine.waiting : null))} · KV {fmtPct(value(b, "kvPct", b.engine.status === "ok" ? b.engine.kvPct : null))}</span>
         </div>
-
-        {#if adm}
-          <div class="cap-bk-row">
-            <span class="cap-cell">
-              <span class="cap-k">queue</span>
-              <span class="cap-v mono">
-                {fmtInt(adm.waiting)}<span class="dim">/{adm.maxWaiting > 0 ? fmtInt(adm.maxWaiting) : "∞"}</span>
-              </span>
-              <span class="cap-sub mono muted">
-                oldest {adm.oldestWaitMs > 0 ? fmtMs(adm.oldestWaitMs) : "—"}
-              </span>
-            </span>
-            <span class="cap-cell">
-              <span class="cap-k">gate wait</span>
-              <span class="cap-v mono">
-                {adm.gateWaitCount > 0 ? fmtMs(adm.gateWaitMs) : "—"}
-                <span class="dim">avg</span>
-              </span>
-              <span class="cap-sub mono muted">
-                {adm.gateWaitTrailCnt > 0
-                  ? `${fmtMs(adm.gateWaitTrailMs / adm.gateWaitTrailCnt)} · 30s`
-                  : "no gate samples"}
-              </span>
-            </span>
-            <span class="cap-cell">
-              <span class="cap-k">gate rejects</span>
-              <span class="cap-v mono">
-                {fmtInt(adm.rejQueueFull + adm.rejQueueTimeout + adm.rejClientCancel)}
-              </span>
-              <span class="cap-sub mono muted">
-                full {fmtInt(adm.rejQueueFull)} · timeout {fmtInt(adm.rejQueueTimeout)} ·
-                cancel {fmtInt(adm.rejClientCancel)}
-              </span>
-            </span>
-            <span class="cap-cell">
-              <span class="cap-k">reclaimed</span>
-              <span class="cap-v mono">{fmtInt(adm.reclaimedTotal)}</span>
-              <span class="cap-sub mono muted">idle leases under pressure</span>
-            </span>
+        <details>
+          <summary class="detail">Gate waits &amp; router 429 reasons{singleBackend == null ? ` · ${b.name}` : ""}</summary>
+          <div class="table-scroll">
+            <table class="data-table">
+              <caption class="detail muted">Router gate exits · {historical ? "30s smoothed observations · sample-rate req/s" : "trailing 30s"}{!historical && !b.queueWait ? " · unavailable" : ""}</caption>
+              <thead><tr><th>STAGE</th><th>QUEUE {historical ? "· BUCKET AVG" : ""}</th><th class="num">MEAN GATE WAIT</th><th class="num">{historical ? "SAMPLE RATE" : "SAMPLES"}</th></tr></thead>
+              <tbody>
+                {#each stages as stage (stage)}
+                  {@const observation = gate(b, stage)}
+                  <tr><th scope="row">{stage} <span class="tag router">router</span></th><td class="mono">{depth(b, stage)}</td><td class="num">{duration(observation.mean)}</td><td class="num">{figure(observation.samples)}</td></tr>
+                {/each}
+                <tr><th scope="row">engine <span class="tag engine">engine</span></th><td class="mono">{figure(value(b, "engineWaiting", b.engine.status === "ok" ? b.engine.waiting : null))}</td><td class="num">{historical ? "live only / —" : duration(b.engineQueue && b.engineQueue.samples > 0 ? b.engineQueue.sumMs / b.engineQueue.samples : null)}</td><td class="mono">engine scrape interval{!historical && b.engineQueue ? ` · ${figure(b.engineQueue.samples)} samples` : ""}</td></tr>
+              </tbody>
+            </table>
           </div>
-        {/if}
-
-        {#if b.rejectReasons}
-          {@const reasons = Object.entries(b.rejectReasons).sort((x, y) => y[1] - x[1])}
-          {#if reasons.length}
-            <div class="cap-reasons mono">
-              <span class="cap-k">refusal reasons</span>
-              {#each reasons.slice(0, 4) as [reason, n] (reason)}
-                <span class="chip warn" title={reason}>{reason} {fmtInt(n)}</span>
-              {/each}
-            </div>
-          {/if}
-        {/if}
+          <p class="detail muted">Idle TTL <span class="mono">{duration(b.admission?.idleTTLms)}</span> · lifetime idle reclaims <span class="mono">{historical ? "live only / —" : figure(b.admission?.reclaimedTotal)}</span> · idle reservations yield to waiting work; they do not pin KV cache</p>
+          <div class="table-scroll">
+            <table class="data-table reasons">
+              <caption class="detail muted">Router 429 · {historical ? "30s avg · req/s · lifetime totals live only" : "lifetime totals · trailing-30s req/s"}{!historical && !b.router429 ? " · unavailable" : ""}</caption>
+              <thead><tr><th>REASON</th><th class="num">LIFETIME</th><th class="num">30s AVG · REQ/S</th></tr></thead>
+              <tbody>
+                {#each ROUTER_429_REASONS as reason, i (reason)}
+                  {@const row = b.router429?.byReason.find((r) => r.reason === reason)}
+                  <tr><th scope="row" class="mono">{reason}</th><td class="num">{historical ? "live only / —" : figure(row?.total)}</td><td class="num">{figure(historical ? at(b.name, reasonFields[i]) : row?.rate)}</td></tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </details>
       </div>
     {/each}
   </section>
 {/if}
 
 <style>
-  .cap {
-    border-top: 1px solid var(--rule);
-  }
-  .cap-head {
-    padding: 7px var(--s3);
-  }
-  .cap-gpu {
-    display: grid;
-    gap: 4px;
-    padding: 6px var(--s3);
-    border-top: 1px solid var(--rule);
-  }
-  .cap-gpu-row {
-    display: flex;
-    align-items: center;
-    gap: var(--s2);
-  }
-  .cap-gpu-label {
-    font-family: var(--font-mono);
-    font-size: var(--fs-label);
-    letter-spacing: 0.08em;
-    color: var(--ink-3);
-  }
-  .cap-gpu-fig {
-    font-size: var(--fs-detail);
-    color: var(--ink-2);
-  }
-  .cap-gpu-fig .warn {
-    color: var(--amber);
-  }
-  .cap-gpu .chip {
-    margin-left: auto;
-  }
-  .cap-backend {
-    padding: 6px var(--s3) 7px;
-    border-top: 1px solid var(--rule);
-  }
-  .cap-backend.cap {
-    box-shadow: inset 2px 0 0 var(--verm);
-  }
-  .cap-bk-head {
-    display: flex;
-    align-items: center;
-    gap: var(--s2);
-    flex-wrap: wrap;
-  }
-  .cap-bk-name {
-    font-size: var(--fs-detail);
-    font-weight: 500;
-    overflow-wrap: anywhere;
-  }
-  .cap-bk-head .chip {
-    margin-left: 0;
-  }
-  .cap-bk-fig {
-    margin-left: auto;
-    font-size: var(--fs-detail);
-    color: var(--ink-3);
-  }
-  .cap-bk-fig .sand {
-    color: var(--sand);
-  }
-  .cap-bk-fig .warn {
-    color: var(--amber);
-  }
-  .cap-bk-fig .dim {
-    color: var(--ink-3);
-  }
-  .cap-bk-row {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: var(--s2);
-    margin-top: 6px;
-  }
-  .cap-cell {
-    display: grid;
-    gap: 1px;
-    min-width: 0;
-  }
-  .cap-k {
-    font-size: var(--fs-label);
-    letter-spacing: 0.06em;
-    color: var(--ink-3);
-    text-transform: uppercase;
-  }
-  .cap-v {
-    font-size: var(--fs-body);
-    color: var(--ink);
-    white-space: nowrap;
-  }
-  .cap-v .dim {
-    color: var(--ink-3);
-  }
-  .cap-sub {
-    font-size: 9px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .cap-reasons {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-wrap: wrap;
-    margin-top: 6px;
-  }
-  .cap-reasons .cap-k {
-    margin-right: 2px;
-  }
-  .cap-reasons .chip {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 220px;
-  }
-  .bar {
-    position: relative;
-    height: 6px;
-    background: var(--panel-2);
-    border: 1px solid var(--rule);
-    overflow: hidden;
-  }
-  .bar .fill {
-    position: absolute;
-    inset: 0 auto 0 0;
-    background: var(--water);
-    transition: width var(--dur) var(--ease-out);
-  }
-  .bar .fill.cap {
-    background: var(--verm);
-  }
-  @media (max-width: 839px) {
-    .cap-bk-row {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-    .cap-bk-fig {
-      margin-left: 0;
-      width: 100%;
-    }
-  }
+  .cap { min-width: 0; }
+  .cap-head { flex-wrap: wrap; gap: var(--s2); padding: 7px var(--s3); }
+  .cap-backend { padding: 6px var(--s3); border-top: 1px solid var(--rule); min-width: 0; }
+  .cap-row { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--s4); row-gap: var(--s1); font-size: var(--fs-detail); }
+  .cap-row > span { overflow-wrap: anywhere; }
+  .backend-name { color: var(--sand); }
+  summary { cursor: pointer; padding: var(--s2) 0; color: var(--ink-2); }
+  .table-scroll { overflow: auto; max-height: 320px; }
+  .data-table { min-width: 540px; }
+  caption { text-align: left; padding: var(--s2) 0; }
+  p { margin: var(--s2) 0; }
+  .reasons { color: var(--water); }
+  @media (max-width: 639px) { summary { min-height: 44px; align-content: center; } }
 </style>
