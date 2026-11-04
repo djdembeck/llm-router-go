@@ -648,9 +648,12 @@ mean at a point is the sum-rate ÷ sample-rate ratio; zero sample-rate →
 `—`).
 These are **smoothed trailing-window observations**, not exact counts for a
 selected bucket. A backend with session admission disabled serializes all
-`admission*` and `router429*` series as `null` (the presence bit is never
-set) — the client renders `—`, not 0. The fleet carries the GPU-budget
-triplet. **Persistence is now version 3** (the point grew from 25 to 61
+`admission*` series as `null` (the presence bit is never set); the
+`router429*` series (total, per-reason, gate-wait rates) reflect the
+backend's actual rejections — a disabled backend that never rejected
+serializes them as `null` too, and one that did (e.g. `gpu-budget-full`)
+reports both the total and its reason breakdown. The client renders `—`,
+not 0. The fleet carries the GPU-budget triplet. **Persistence is now version 3** (the point grew from 25 to 61
 fields and `Flags` widened `uint32` → `uint64`; a compile-time bound keeps
 the field count ≤ 64); a v2 snapshot is read by a dedicated v2 layout and
 the shared field indices are copied verbatim into v3 (new fields stay null,

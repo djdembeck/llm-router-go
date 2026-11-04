@@ -195,7 +195,7 @@ function fleetValue(t: TotalsMetrics, layer: LayerDef, frame?: Frame): number | 
       return t.engineOk > 0 ? t.decodeTokS : null;
     case "admission":
       return t.admActive;
-    case "admissionQueue": return t.admission?.waiting ?? null;
+    case "admissionQueue": return frame && frame.backends.some(b => b.admission) ? frame.backends.reduce((n, b) => n + (b.admission?.waiting ?? 0), 0) : null;
     case "executionQueue": return t.waiting ?? null;
     case "prefillQueue": return frame && frame.backends.length ? frame.backends.reduce((n, b) => n + b.prefillWaiting, 0) : null;
     case "engineQueue": return t.engineOk > 0 ? t.engineWaiting : null;

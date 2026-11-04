@@ -4873,8 +4873,14 @@ func TestPressureHistoryReasonRates(t *testing.T) {
 		if histFieldNames[field] != name || !hpHas(enabled, field) || math.Abs(float64(enabled.V[field])-1.0/30) > 1e-8 {
 			t.Fatalf("reason field %s missing or wrong", name)
 		}
-		if hpHas(disabled, field) || hpHas(unknown, field) {
-			t.Fatalf("unavailable reason field %s populated", name)
+		// Per-reason rates mirror the total for ANY backend that reports
+		// router429 — admission state gates the admission* gauges only, so a
+		// disabled backend's 429 breakdown must be populated identically.
+		if !hpHas(disabled, field) || math.Abs(float64(disabled.V[field])-1.0/30) > 1e-8 {
+			t.Fatalf("disabled reason field %s missing or wrong", name)
+		}
+		if hpHas(unknown, field) {
+			t.Fatalf("reason field %s populated without router429", name)
 		}
 	}
 	var acc histAccum
@@ -4953,11 +4959,13 @@ func TestPressureBurstPresenceAndReason(t *testing.T) {
 		s      requestSample
 		reason string
 	}{
-		{requestSample{Status: 200}, `"rejectReason":""`},
+		{requestSample{Status: 200}, `"rejectReason":null`},
+		{requestSample{Status: 200, RejectReason: ""}, `"rejectReason":null`},
 		{requestSample{Status: 499}, `"rejectReason":""`},
 		{requestSample{Status: 429, accepted: true}, `"rejectReason":null`},
 		{requestSample{Status: 502}, `"rejectReason":null`},
 		{requestSample{Status: 429, RejectReason: "backend-full"}, `"rejectReason":"backend-full"`},
+		{requestSample{Status: 413, RejectReason: "body-too-large"}, `"rejectReason":"body-too-large"`},
 	} {
 		tc.s.QueueWait.set(queueStageExecution, 100*time.Millisecond)
 		b, err := json.Marshal(burstRequestFrame{RejectReason: burstRejectReason(tc.s), QueueWait: tc.s.QueueWait})

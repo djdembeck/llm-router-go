@@ -71,12 +71,14 @@
       "stream",
       "ttft_ms",
       "dur_ms",
-      "gate_wait_ms",
-      "reject_reason",
       "bytes_in",
       "bytes_out",
       "new_tokens_est",
-      "reason", "admission_wait_ms", "gpu_wait_ms", "execution_wait_ms", "prefill_wait_ms",
+      "reason",
+      "admission_wait_ms",
+      "gpu_wait_ms",
+      "execution_wait_ms",
+      "prefill_wait_ms",
     ];
     const lines = [head.join(",")];
     for (const r of requests) {
@@ -90,8 +92,6 @@
           r.stream,
           r.ttftMs.toFixed(1),
           r.durMs.toFixed(1),
-          csvNumber(r.gateWaitMs),
-          csvEscape(r.rejectReason ?? ""),
           r.bytesIn,
           r.bytesOut,
           r.newTokensEst,

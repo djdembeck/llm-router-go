@@ -4775,15 +4775,18 @@ func pointFromBackend(b backendFrame) historyPoint {
 			hpSet(&p, hiEngTTFT, e.TTFTms)
 		}
 	}
+	// Router-429 per-reason rates mirror the total set above whenever the
+	// backend reports router429 — independent of admission state, since a
+	// disabled backend still emits non-admission 429s (gpu-budget-full, ...).
+	if b.Router429 != nil {
+		for i, reason := range b.Router429.ByReason {
+			hpSet(&p, hiRouter429BlockedByTier0Rate+i, reason.Rate)
+		}
+	}
 	// Admission-gate gauges: set only when session admission is enabled for
 	// this backend (Admission != nil), so a disabled backend's series stay
 	// null (never 0) — matching the live frame's null-when-disabled contract.
 	if adm := b.Admission; adm != nil {
-		if b.Router429 != nil {
-			for i, reason := range b.Router429.ByReason {
-				hpSet(&p, hiRouter429BlockedByTier0Rate+i, reason.Rate)
-			}
-		}
 		hpSet(&p, hiAdmMaxAdmitted, float64(adm.MaxAdmitted))
 		hpSet(&p, hiAdmMaxWaiting, float64(adm.MaxWaiting))
 		hpSet(&p, hiAdmActive, float64(adm.Active))
@@ -5928,8 +5931,9 @@ type burstRequestFrame struct {
 	NewTokensEst int     `json:"newTokensEst"`
 	BytesIn      int64   `json:"bytesIn"`
 	BytesOut     int64   `json:"bytesOut"`
-	// RejectReason: the X-Router-Reason for a rejected (429/499/413) request;
-	// "" for accepted ones. The RequestFeed REASON column.
+	// RejectReason: the X-Router-Reason for a rejected (429/413) request,
+	// "" for a client-canceled (499) one, null for accepted requests.
+	// The RequestFeed REASON column.
 	RejectReason *string        `json:"rejectReason"`
 	QueueWait    queueWaitTimes `json:"queueWaitMs"`
 	// GateWaitMs: admission-gate wait (keyed traffic only); 0 otherwise.
@@ -5942,7 +5946,9 @@ type burstRequestFrame struct {
 const burstLimitMax = 1000
 
 func burstRejectReason(s requestSample) *string {
-	if s.RejectReason != "" || (s.Status < 400 || s.Status == 499) {
+	// 429/413 carry their X-Router-Reason; a 499 (client cancel at a failed
+	// gate) serializes the empty reason; accepted requests serialize null.
+	if s.RejectReason != "" || s.Status == 499 {
 		return &s.RejectReason
 	}
 	return nil
@@ -6254,12 +6260,14 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				reason := "session-admission-queue-full"
-				if errors.Is(aerr, errSessionAdmissionTimeout) {
+				switch {
+				case errors.Is(aerr, errSessionAdmissionTimeout):
 					reason = "session-admission-timeout"
-				} else {
-					// A non-admission error cannot happen here (the manager
-					// returns only the two sentinels or ctx.Err); treat it
-					// like queue-full.
+				case !errors.Is(aerr, errSessionAdmissionQueueFull):
+					// The manager returns only the two sentinels or
+					// ctx.Err; anything else is a router bug, not
+					// expected backpressure — log it once, serve as
+					// queue-full.
 					log.Printf("%s %s -> %s (model=%s) admission error: %v",
 						r.Method, r.URL.Path, target.Name, modelName, aerr)
 				}
