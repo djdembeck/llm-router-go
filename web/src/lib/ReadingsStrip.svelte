@@ -437,7 +437,9 @@
     .cell:nth-child(2n) {
       border-right: 0;
     }
-    .cell:nth-child(-n + 4) {
+    /* Two columns: rows 1-3 (cells 1-6) keep their divider; the last row
+       (the 7th cell) does not. */
+    .cell:nth-child(-n + 6) {
       border-bottom: 1px solid var(--rule);
     }
     .cell {

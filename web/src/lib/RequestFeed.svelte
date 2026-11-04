@@ -242,6 +242,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* The expanded GATE WAIT body is a ~110-char stage breakdown: let it wrap
+     inside the 7% column (nowrap stays on the short summary value, so the
+     collapsed view is unchanged). */
+  .col-gate {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
   .data-table td.ok {
     color: var(--moss);
   }

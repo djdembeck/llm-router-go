@@ -412,7 +412,10 @@ export function scaleFor(
   }
   const pressure = layer.unit === "requests" || layer.unit === "req/s";
   const max = niceMax(pressure ? (peak > 0 ? peak : 1) : Math.max(peak, 1));
-  const fmt = (v: number) => pressure ? fmtPressureValue(v) : (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : `${Math.round(v)}`);
+  // Sub-10 non-pressure values keep two decimals so the four tick labels
+  // stay distinct (a max of 1 must not collapse 0.5/1.0 to "1" and lose
+  // the top-of-scale label); the k-formatting above 1000 is unchanged.
+  const fmt = (v: number) => pressure ? fmtPressureValue(v) : (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v < 10 ? v.toFixed(2) : `${Math.round(v)}`);
   return {
     max,
     ticks: [0.25, 0.5, 0.75, 1].map((f) => ({ v: max * f, label: fmt(max * f) })).filter((t, i, all) => all.findIndex((x) => x.label === t.label) === i),

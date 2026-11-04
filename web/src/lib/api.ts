@@ -157,8 +157,6 @@ export interface AdmissionMetrics {
   gateWaitMs: number;
   gateWaitTotalMs: number;
   gateWaitCount: number;
-  gateWaitTrailMs: number;
-  gateWaitTrailCnt: number;
   rejQueueFull: number;
   rejQueueTimeout: number;
   rejClientCancel: number;
@@ -176,8 +174,6 @@ export interface Router429 {
   rate: number;
   byReason: { reason: string; total: number; rate: number }[];
 }
-export type AdmissionTotals = Omit<AdmissionMetrics, "idleTTLms" | "gateWaitMs" | "gateWaitTotalMs" | "gateWaitCount" | "gateWaitTrailMs" | "gateWaitTrailCnt" | "rejQueueFull" | "rejQueueTimeout" | "rejClientCancel">;
-
 export interface BackendMetrics {
   name: string;
   url: string;
@@ -265,7 +261,6 @@ export interface TotalsMetrics {
   hitRate: number;
   // Fleet rollup of active session-admission leases (0 when none enabled).
   admActive: number;
-  admission?: AdmissionTotals | null;
   router429?: Router429 | null;
   queueWait?: QueueWait | null;
 }
@@ -401,9 +396,19 @@ export type HistoryField =
   | "weightMemGB"
   | "hitRate"
   | "engineTTFTMs"
-  // Additive capacity series (25 → 44 fields): router slot limits, the
-  // admission lease/gate breakdown, and the fleet GPU-budget triplet.
-  // admission* are null for a backend without session admission enabled.
+  // Additive capacity series (25 → 59 fields): router slot
+  // limits, the admission lease/gate breakdown, the fleet GPU-budget
+  // triplet, the router-429 per-reason rates, and the per-stage gate-wait
+  // sum/sample rates. The admission LEASE gauges (maxAdmitted, maxWaiting,
+  // active, idle, waiting, oldestWaitMs) are null for a backend without
+  // session admission enabled — its gate-wait (admissionGateWaitMs,
+  // admissionGateWaitTotalMs, admissionGateWaitCount) and rejection
+  // (admissionRej*) series are too, since they live in the same frame.
+  // The router429* series (total and per-reason) are null for a backend
+  // that never emitted a router 429. The gate-wait rate pairs
+  // (*WaitMsRate/*WaitSamplesRate) are null until a gate exit is recorded
+  // in the trailing-30s window — for the admission stage, 0 samples for an
+  // unkeyed backend — which tracks queue-wait presence, not 429 history.
   | "maxQueueDepth"
   | "prefillMax"
   | "admissionMaxAdmitted"
@@ -415,8 +420,6 @@ export type HistoryField =
   | "admissionGateWaitMs"
   | "admissionGateWaitTotalMs"
   | "admissionGateWaitCount"
-  | "admissionGateWaitTrailMs"
-  | "admissionGateWaitTrailCnt"
   | "admissionRejQueueFull"
   | "admissionRejQueueTimeout"
   | "admissionRejClientCancel"

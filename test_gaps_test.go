@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -550,5 +551,184 @@ func TestProxy_Rejection_SessionWholeConversationEstimate_TeardownFailsFast(t *t
 	}
 	if strings.Contains(string(out), "test timed out") {
 		t.Fatalf("teardown wedged: child hung instead of failing fast.\n%s", out)
+	}
+}
+
+// TestHistory_FleetRollups pins the fleet-rollup path that only
+// historyStore.sample() reaches: applyFleetAggregates' admission sums (nil-
+// admission backends contribute 0) and pointFromTotals' presence contract
+// (admission-waiting is null when no backend enables admission, the prefill
+// lane is a plain level, and the GPU lanes gate on g.Active).
+func TestHistory_FleetRollups(t *testing.T) {
+	// (a) applyFleetAggregates: A and B enable admission; C does not.
+	// Nil-admission backends contribute 0 to the admission sums, but their
+	// PrefillWaiting still rolls up like a plain level.
+	f := metricsFrame{Backends: []backendFrame{
+		{Name: "A", PrefillWaiting: 5, Admission: &admissionFrame{Active: 3, Waiting: 2}},
+		{Name: "B", PrefillWaiting: 3, Admission: &admissionFrame{Active: 1, Waiting: 4}},
+		{Name: "C", PrefillWaiting: 7, Admission: nil},
+	}}
+	applyFleetAggregates(&f)
+	tf := f.Totals
+	if tf.AdmEnabled != 2 {
+		t.Fatalf("AdmEnabled = %d, want 2 (only A and B enable admission)", tf.AdmEnabled)
+	}
+	if tf.AdmActive != 4 {
+		t.Errorf("AdmActive = %d, want 4 (3+1)", tf.AdmActive)
+	}
+	if tf.AdmWaiting != 6 {
+		t.Errorf("AdmWaiting = %d, want 6 (2+4; C's nil contributes 0)", tf.AdmWaiting)
+	}
+	if tf.PrefillWaiting != 15 {
+		t.Errorf("PrefillWaiting = %d, want 15 (5+3+7)", tf.PrefillWaiting)
+	}
+
+	// (b) pointFromTotals, enabled fleet + ACTIVE gpu budget.
+	pOn := pointFromTotals(
+		totalsFrame{AdmEnabled: 2, AdmActive: 4, AdmWaiting: 6, PrefillWaiting: 15},
+		gpuFrame{Used: 2, Budget: 4, Waiting: 1, Active: true})
+	if !hpHas(pOn, hiAdmWaiting) || pOn.V[hiAdmWaiting] != 6 {
+		t.Errorf("enabled: hiAdmWaiting set=%v val=%v, want set/6", hpHas(pOn, hiAdmWaiting), pOn.V[hiAdmWaiting])
+	}
+	if !hpHas(pOn, hiAdmActive) || pOn.V[hiAdmActive] != 4 {
+		t.Errorf("hiAdmActive (unconditional) set=%v val=%v, want set/4", hpHas(pOn, hiAdmActive), pOn.V[hiAdmActive])
+	}
+	if !hpHas(pOn, hiPrefillWaiting) || pOn.V[hiPrefillWaiting] != 15 {
+		t.Errorf("hiPrefillWaiting (level) set=%v val=%v, want set/15", hpHas(pOn, hiPrefillWaiting), pOn.V[hiPrefillWaiting])
+	}
+	for idx, want := range map[int]float32{hiGpuUsed: 2, hiGpuBudget: 4, hiGpuWaiting: 1} {
+		if !hpHas(pOn, idx) || pOn.V[idx] != want {
+			t.Errorf("active-gpu %s set=%v val=%v, want set/%v", histFieldNames[idx], hpHas(pOn, idx), pOn.V[idx], want)
+		}
+	}
+
+	// (b) pointFromTotals, DISABLED fleet (AdmEnabled==0) + INACTIVE gpu.
+	// AdmActive/AdmWaiting are deliberately NON-ZERO: the waiting lane must
+	// stay null because NO backend enables admission — a gate that keyed on
+	// the rollup value instead of AdmEnabled would be caught here. The GPU
+	// lanes must stay null because g.Active is false.
+	pOff := pointFromTotals(
+		totalsFrame{AdmEnabled: 0, AdmActive: 2, AdmWaiting: 3, PrefillWaiting: 0},
+		gpuFrame{Used: 2, Budget: 4, Waiting: 1, Active: false})
+	if hpHas(pOff, hiAdmWaiting) {
+		t.Errorf("disabled: hiAdmWaiting set, want null (never 0) despite AdmWaiting=3")
+	}
+	// hiAdmActive is a level and stays set even when nothing is enabled.
+	if !hpHas(pOff, hiAdmActive) || pOff.V[hiAdmActive] != 2 {
+		t.Errorf("hiAdmActive (unconditional) set=%v val=%v, want set/2", hpHas(pOff, hiAdmActive), pOff.V[hiAdmActive])
+	}
+	if !hpHas(pOff, hiPrefillWaiting) {
+		t.Errorf("hiPrefillWaiting (level) not set, want set/0")
+	}
+	for idx := range map[int]bool{hiGpuUsed: true, hiGpuBudget: true, hiGpuWaiting: true} {
+		if hpHas(pOff, idx) {
+			t.Errorf("inactive-gpu %s set, want null", histFieldNames[idx])
+		}
+	}
+}
+
+// TestMetrics_BackendFrame_WireNullContract pins the wire contract for the
+// backend frame's optional maps: a nil RejectReasons / nil Admission must
+// serialize as PRESENT keys with a null value (not omitted), a populated
+// rejectReasons must marshal the map, and buildMetricsFrame must leave
+// Admission nil for a backend that does not enable session admission.
+func TestMetrics_BackendFrame_WireNullContract(t *testing.T) {
+	// (a) nil maps -> keys present with null.
+	raw, err := json.Marshal(backendFrame{Name: "b"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for key, want := range map[string]string{"rejectReasons": `null`, "admission": `null`} {
+		v, ok := m[key]
+		if !ok {
+			t.Errorf("%s key absent from wire (omitempty leaked): %s", key, raw)
+		} else if string(v) != want {
+			t.Errorf("%s = %s, want %s", key, v, want)
+		}
+	}
+
+	// (b) populated rejectReasons -> the map marshals.
+	bf := backendFrame{Name: "b", RejectReasons: map[string]int64{"gpu-budget-full": 2}}
+	raw2, _ := json.Marshal(bf)
+	var m2 map[string]json.RawMessage
+	if err := json.Unmarshal(raw2, &m2); err != nil {
+		t.Fatalf("unmarshal populated: %v", err)
+	}
+	var reasons map[string]int64
+	if err := json.Unmarshal(m2["rejectReasons"], &reasons); err != nil {
+		t.Fatalf("rejectReasons not a map: %v (%s)", err, m2["rejectReasons"])
+	}
+	if reasons["gpu-budget-full"] != 2 {
+		t.Errorf("rejectReasons = %v, want gpu-budget-full:2", reasons)
+	}
+
+	// (c) buildMetricsFrame for a backend without session admission keeps
+	// Admission nil (the live edge's null-when-disabled contract).
+	withRouterEnv(t, []Backend{{Name: "m1", URL: "http://127.0.0.1:1"}}, nil, nil)
+	f := buildMetricsFrame()
+	if len(f.Backends) != 1 {
+		t.Fatalf("backends = %d, want 1", len(f.Backends))
+	}
+	if f.Backends[0].Admission != nil {
+		t.Errorf("Admission = %+v, want nil (session admission disabled)", f.Backends[0].Admission)
+	}
+}
+
+// TestHistory_PointFromBackend_AdmGauges pins the admission-gauge presence
+// contract on the backend history lane: every hiAdm* field is set for a fully
+// populated admissionFrame, NONE are set when Admission is nil (null, never
+// 0), and the oldest-wait lane rolls up as a PEAK (max) in the query-path
+// accumulator while a neighbor level (active) averages.
+func TestHistory_PointFromBackend_AdmGauges(t *testing.T) {
+	// The 12 admission-gauge indices pointFromBackend populates.
+	admIdx := []int{
+		hiAdmMaxAdmitted, hiAdmMaxWaiting, hiAdmActive, hiAdmIdle,
+		hiAdmWaiting, hiAdmOldestWaitMs, hiAdmGateWaitMs,
+		hiAdmGateWaitTotalMs, hiAdmGateWaitCount, hiAdmRejQueueFull,
+		hiAdmRejQueueTimeout, hiAdmRejClientCancel,
+	}
+
+	// Positive arm: a fully-populated (every field non-zero) admission.
+	full := &admissionFrame{
+		MaxAdmitted: 10, MaxWaiting: 5, IdleTTLms: 1000,
+		Active: 3, Idle: 2, Waiting: 4, OldestWaitMs: 50,
+		ReclaimedTotal: 7,
+		GateWaitMs:     12, GateWaitTotalMs: 240, GateWaitCount: 20,
+		RejQueueFull: 1, RejQueueTimeout: 2, RejClientCancel: 3,
+	}
+	enabled := pointFromBackend(backendFrame{Admission: full})
+	for _, i := range admIdx {
+		if !hpHas(enabled, i) {
+			t.Errorf("enabled: %s not set, want set", histFieldNames[i])
+		}
+	}
+
+	// Negative arm: Admission nil -> no hiAdm* field is set (null, not 0).
+	disabled := pointFromBackend(backendFrame{Admission: nil})
+	for _, i := range admIdx {
+		if hpHas(disabled, i) {
+			t.Errorf("disabled: %s set, want null (never 0)", histFieldNames[i])
+		}
+	}
+
+	// Oldest-wait is a MAX rollup; active is a plain average.
+	var acc histAccum
+	var p1, p2 historyPoint
+	hpSet(&p1, hiAdmOldestWaitMs, 100)
+	hpSet(&p1, hiAdmActive, 10)
+	hpSet(&p2, hiAdmOldestWaitMs, 300)
+	hpSet(&p2, hiAdmActive, 30)
+	acc.add(p1)
+	acc.add(p2)
+	rolled := acc.flush(0)
+	if !hpHas(rolled, hiAdmOldestWaitMs) || rolled.V[hiAdmOldestWaitMs] != 300 {
+		t.Errorf("oldest-wait rollup = %v set=%v, want 300 (peak)", rolled.V[hiAdmOldestWaitMs], hpHas(rolled, hiAdmOldestWaitMs))
+	}
+	if !hpHas(rolled, hiAdmActive) || rolled.V[hiAdmActive] != 20 {
+		t.Errorf("active rollup = %v set=%v, want 20 (average)", rolled.V[hiAdmActive], hpHas(rolled, hiAdmActive))
 	}
 }

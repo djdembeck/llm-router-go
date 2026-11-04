@@ -43,6 +43,11 @@
   function figure(v: number | null | undefined): string {
     return v == null ? "—" : fmtPressureValue(v);
   }
+  // prefillMax of 0 means the large-prefill gate is disabled (the slot pool
+  // exists only for MaxConcurrentLargePrefill > 0), not zero concurrency.
+  function limitLabel(v: number | null | undefined): string {
+    return v == null ? "—" : v === 0 ? "no gate" : `${figure(v)} CONCURRENT`;
+  }
   function duration(v: number | null | undefined): string {
     return v == null ? "—" : v === 0 ? "0 ms" : fmtMs(v);
   }
@@ -79,14 +84,14 @@
           <span><span class="label">LEASES</span> {#if historical}{figure(at(b.name, "admissionActive"))} active + {figure(at(b.name, "admissionIdle"))} idle / {figure(at(b.name, "admissionMaxAdmitted"))}{:else if b.admission}{figure(b.admission.active)} active + {figure(b.admission.idle)} idle / {figure(b.admission.maxAdmitted)}{:else}{b.admission === null ? "off" : "unavailable"}{/if}</span>
           <span><span class="label">ADMISSION Q</span> {#if historical || b.admission}{depth(b, "admission")}/{figure(value(b, "admissionMaxWaiting", b.admission?.maxWaiting))} · oldest {duration(value(b, "admissionOldestWaitMs", b.admission?.oldestWaitMs))}{:else}{b.admission === null ? "off" : "unavailable"}{/if}</span>
           <span><span class="label">EXEC Q</span> {depth(b, "execution")}/{figure(value(b, "maxQueueDepth", b.maxQueueDepth))}</span>
-          <span><span class="label">PREFILL Q</span> {depth(b, "prefill")}/{figure(value(b, "prefillMax", b.prefillMax))}</span>
+          <span><span class="label">PREFILL Q</span> {depth(b, "prefill")} · {limitLabel(value(b, "prefillMax", b.prefillMax))}</span>
           <span><span class="label">ENGINE Q</span> <span class="tag engine">engine</span> {figure(value(b, "engineWaiting", b.engine.status === "ok" ? b.engine.waiting : null))} · KV {fmtPct(value(b, "kvPct", b.engine.status === "ok" ? b.engine.kvPct : null))}</span>
         </div>
         <details>
           <summary class="detail">Gate waits &amp; router 429 reasons{singleBackend == null ? ` · ${b.name}` : ""}</summary>
           <div class="table-scroll">
             <table class="data-table">
-              <caption class="detail muted">Router gate exits · {historical ? "30s smoothed observations · sample-rate req/s" : "trailing 30s"}{!historical && !b.queueWait ? " · unavailable" : ""}</caption>
+              <caption class="detail muted">Router gate exits · {historical ? "30s smoothed observations · sample-rate req/s" : "trailing 30s"}{!historical && !b.queueWait ? (feedKind === "stats" ? " · unavailable" : " · no gate exits") : ""}</caption>
               <thead><tr><th>STAGE</th><th>QUEUE {historical ? "· BUCKET AVG" : ""}</th><th class="num">MEAN GATE WAIT</th><th class="num">{historical ? "SAMPLE RATE" : "SAMPLES"}</th></tr></thead>
               <tbody>
                 {#each stages as stage (stage)}
@@ -100,7 +105,7 @@
           <p class="detail muted">Idle TTL <span class="mono">{duration(b.admission?.idleTTLms)}</span> · lifetime idle reclaims <span class="mono">{historical ? "live only / —" : figure(b.admission?.reclaimedTotal)}</span> · idle reservations yield to waiting work; they do not pin KV cache</p>
           <div class="table-scroll">
             <table class="data-table reasons">
-              <caption class="detail muted">Router 429 · {historical ? "30s avg · req/s · lifetime totals live only" : "lifetime totals · trailing-30s req/s"}{!historical && !b.router429 ? " · unavailable" : ""}</caption>
+              <caption class="detail muted">Router 429 · {historical ? "30s avg · req/s · lifetime totals live only" : "lifetime totals · trailing-30s req/s"}{!historical && !b.router429 ? (feedKind === "stats" ? " · unavailable" : " · no router 429s") : ""}</caption>
               <thead><tr><th>REASON</th><th class="num">LIFETIME</th><th class="num">30s AVG · REQ/S</th></tr></thead>
               <tbody>
                 {#each ROUTER_429_REASONS as reason, i (reason)}

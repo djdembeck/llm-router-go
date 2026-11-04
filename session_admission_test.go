@@ -2112,10 +2112,12 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	if code := <-done2; code != 200 {
 		t.Fatalf("A2 = %d", code)
 	}
-	// A2 is the only A request finishing now: C is ADMISSION-queued
-	// (cap 1, A lease held), so no forward of its can exist until the
-	// final release.
-	saPollEngineSeen(t, engine, "A", "A")
+	// A2 is the only A request finishing now. The final release drains the
+	// queue: it reclaims the idled lease (immediate, no clock advance) and
+	// grants C, whose forward lands right after A2's — seen reaches
+	// [A, A, C] in one step, so poll the full order, not the two-A prefix
+	// (an exact-length-2 poll would time out once C's forward is ahead).
+	saPollEngineSeen(t, engine, "A", "A", "C")
 	saPollAdmissionWaiting(t, "smoke", 0) // C granted by the final release
 	engine.releaseKey("C")
 	select {
@@ -2992,18 +2994,15 @@ func TestSessionAdmission_FeedEvictionKeepsLeaseAuthority(t *testing.T) {
 }
 
 // TestSessionAdmission_GateTelemetry pins the admission-gate telemetry
-// (lifetime gate-wait sum/count/mean + trailing-30s window, and the
-// rejection-reason breakdown) that the capacity panel reads. The trailing
-// window uses the wall clock (production rate-window convention), so every
-// sample recorded "now" falls inside the window — the trail sum must equal
-// the lifetime sum and the trail count must equal the lifetime count.
+// (exact lifetime gate-wait sum/count/mean, and the rejection-reason
+// breakdown) that the capacity panel reads. The trailing-30s window lives
+// in the metrics registry (queueWait.admission), not the manager.
 func TestSessionAdmission_GateTelemetry(t *testing.T) {
 	a := newSessionAdmission(2, 2, 10*time.Second, newSAManualClock())
 
 	// No traffic: all-zero frame, no phantom samples.
 	f := a.aggregateSnapshot()
 	if f.GateWaitTotalMs != 0 || f.GateWaitCount != 0 || f.GateWaitMs != 0 ||
-		f.GateWaitTrailMs != 0 || f.GateWaitTrailCnt != 0 ||
 		f.RejQueueFull != 0 || f.RejQueueTimeout != 0 || f.RejClientCancel != 0 {
 		t.Fatalf("empty telemetry = %+v, want all zero", f)
 	}
@@ -3016,10 +3015,6 @@ func TestSessionAdmission_GateTelemetry(t *testing.T) {
 	if f.GateWaitTotalMs != 350 || f.GateWaitCount != 2 || f.GateWaitMs != 175 {
 		t.Fatalf("gate wait = total %d, count %d, mean %d; want 350/2/175",
 			f.GateWaitTotalMs, f.GateWaitCount, f.GateWaitMs)
-	}
-	if f.GateWaitTrailMs != 350 || f.GateWaitTrailCnt != 2 {
-		t.Fatalf("trailing window = %d/%d, want 350/2 (both recorded now)",
-			f.GateWaitTrailMs, f.GateWaitTrailCnt)
 	}
 
 	// Reason breakdown: each recognized reason bumps its own counter; an
@@ -3035,4 +3030,175 @@ func TestSessionAdmission_GateTelemetry(t *testing.T) {
 		t.Fatalf("reasons = full %d, timeout %d, cancel %d; want 2/1/1",
 			f.RejQueueFull, f.RejQueueTimeout, f.RejClientCancel)
 	}
+}
+
+// saPollWaiting polls a standalone manager's live waiter count to a value.
+// (saPollAdmissionWaiting is keyed on the sessionAdmissions registry, which
+// these direct-manager tests do not populate.)
+func saPollWaiting(t *testing.T, a *sessionAdmission, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		a.mu.Lock()
+		got := a.waiting
+		a.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admission waiting = %d, want %d", got, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestSessionAdmission_StaleIdleExpiryAfterReclaim pins the identity/
+// generation guard in idleExpiry. reclaimOldestIdleLocked stops the victim's
+// timer, bumps its generation, and deletes the key — so a callback that lost
+// the Stop race must no-op when invoked with the stale (lease, gen) pair it
+// captured. The manual clock's Stop marks timers stopped and Advance skips
+// them, making the guard unreachable through the clock, so the callback is
+// invoked DIRECTLY with its captured closure args.
+//
+// The strongest arm: after the reclaim, a SUCCESSOR lease is granted under
+// the SAME key. idleExpiry's `cur != lease` branch (not the `!ok` branch) is
+// what must catch the stale pointer, because the key is now populated by a
+// different lease object. A guard that only checked key presence would
+// evict the successor here.
+func TestSessionAdmission_StaleIdleExpiryAfterReclaim(t *testing.T) {
+	const ttl = 30 * time.Second
+	ctx := context.Background()
+	c := newSAManualClock()
+	a := newSessionAdmission(1, 2, ttl, c)
+
+	// 1) kA is acquired (active) then released (idle, timer armed, gen=1).
+	tA, _ := a.acquire(ctx, "kA", time.Minute)
+	tA.release()
+	// Capture the victim lease pointer and the generation the armed timer
+	// closure captured at rearm (gen=1 after the release bump).
+	a.mu.Lock()
+	victim := a.leaseMap["kA"]
+	staleGen := victim.gen
+	a.mu.Unlock()
+	if victim == nil {
+		t.Fatal("kA lease missing after release")
+	}
+
+	// 2) A fresh immediate arrival reclaims the oldest idle (kA): its timer
+	// is stopped, generation bumped (gen 1 -> 2), and the key deleted.
+	tC, err := a.acquire(ctx, "kC", time.Minute)
+	if err != nil {
+		t.Fatalf("kC acquire: %v", err)
+	}
+	if held, _ := a.snapshot("kA"); held {
+		t.Fatal("kA survived the reclaim")
+	}
+
+	// 3) Release kC (now idle) and re-acquire kA: the SUCCESSOR lease is
+	// granted under the same key, reclaiming kC. leaseMap["kA"] now points
+	// at a NEW lease object distinct from the victim.
+	tC.release()
+	tA2, err := a.acquire(ctx, "kA", time.Minute)
+	if err != nil {
+		t.Fatalf("kA successor acquire: %v", err)
+	}
+	a.mu.Lock()
+	succ := a.leaseMap["kA"]
+	rec := a.reclaimedTotal
+	a.mu.Unlock()
+	if succ == victim {
+		t.Fatal("successor is the same object as the victim; test cannot prove the identity guard")
+	}
+	if rec != 2 {
+		t.Fatalf("reclaimedTotal = %d, want 2 (kA then kC)", rec)
+	}
+
+	// 4) Fire the stale callback with the captured (victim, staleGen) pair.
+	// The guard (cur != lease, and victim.gen != staleGen) must no-op.
+	a.idleExpiry(victim, staleGen)
+
+	// 5) The successor survives: present, intact, and its ticket is usable.
+	a.mu.Lock()
+	cur, ok := a.leaseMap["kA"]
+	count, idle := 0, false
+	if ok {
+		count, idle = cur.count, cur.idle
+	}
+	a.mu.Unlock()
+	if !ok || cur != succ {
+		t.Fatalf("successor evicted by stale expiry: present=%v same=%v", ok, cur == succ)
+	}
+	if count != 1 || idle {
+		t.Fatalf("successor state corrupted: count=%d idle=%v, want 1/false", count, idle)
+	}
+	if tA2.lease != succ {
+		t.Fatal("successor ticket does not point at the surviving lease")
+	}
+	// The ticket is still usable: a clean release transitions the successor
+	// to idle (a no-op eviction would have already destroyed it).
+	tA2.release()
+	f := a.aggregateSnapshot()
+	if f.Active != 0 || f.Idle != 1 {
+		t.Fatalf("post-release fleet = active %d idle %d, want 0/1", f.Active, f.Idle)
+	}
+}
+
+// TestSessionAdmission_AggregateWaitingOldest pins the non-zero arms of the
+// admission snapshot's queue pressure: Waiting counts live waiters and
+// OldestWaitMs is their maximum age (measured on the manager clock). Existing
+// telemetry tests only ever assert Waiting==0; this drives two waiters 5 ms
+// apart on a full-cap manager, then cancels the older one and confirms the
+// figure follows the younger waiter's age.
+func TestSessionAdmission_AggregateWaitingOldest(t *testing.T) {
+	const ttl = 10 * time.Second
+	ctx := context.Background()
+	c := newSAManualClock()
+	// Cap 1, up to 2 queued: kA occupies the only slot; two fresh identities
+	// block behind an active lease (nothing reclaimable).
+	a := newSessionAdmission(1, 2, ttl, c)
+	tA, _ := a.acquire(ctx, "kA", time.Minute)
+	defer tA.release()
+
+	// Older waiter enqueued at the current clock instant (T0).
+	w1ctx, cancelW1 := context.WithCancel(ctx)
+	defer cancelW1()
+	w1 := make(chan error, 1)
+	go func() { _, err := a.acquire(w1ctx, "kW1", time.Minute); w1 <- err }()
+	saPollWaiting(t, a, 1)
+
+	// Advance the manager clock 5 ms, then enqueue the younger waiter at
+	// T0+5ms: its age is 5 ms behind the older waiter's.
+	c.Advance(5 * time.Millisecond)
+	w2ctx, cancelW2 := context.WithCancel(ctx)
+	defer cancelW2()
+	w2 := make(chan error, 1)
+	go func() { _, err := a.acquire(w2ctx, "kW2", time.Minute); w2 <- err }()
+	saPollWaiting(t, a, 2)
+
+	// Both live: Waiting=2, Oldest=5ms (T0+5 - T0).
+	f := a.aggregateSnapshot()
+	if f.Waiting != 2 {
+		t.Fatalf("waiting = %d, want 2 (two live waiters)", f.Waiting)
+	}
+	if f.OldestWaitMs != 5 {
+		t.Fatalf("oldestWaitMs = %d, want 5 (older waiter's age)", f.OldestWaitMs)
+	}
+
+	// Cancel the OLDER waiter: it leaves the count and the oldest figure
+	// together (dead waiters count nowhere). Advance 3 ms so the younger
+	// waiter's age is a distinct, non-zero figure.
+	cancelW1()
+	saPollWaiting(t, a, 1)
+	c.Advance(3 * time.Millisecond)
+	f = a.aggregateSnapshot()
+	if f.Waiting != 1 {
+		t.Fatalf("waiting after cancel = %d, want 1 (older waiter gone)", f.Waiting)
+	}
+	if f.OldestWaitMs != 3 {
+		t.Fatalf("oldestWaitMs after cancel = %d, want 3 (younger waiter's age)", f.OldestWaitMs)
+	}
+
+	// Drain: cancel the younger waiter and confirm the queue empties.
+	cancelW2()
+	saPollWaiting(t, a, 0)
 }

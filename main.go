@@ -443,6 +443,12 @@ func (bm *backendMetrics) rateBucketAt(now time.Time) *rateBucket {
 	return b
 }
 
+// recordGateWait records one gate exit in the exact trailing-30s
+// registry buckets (waits[stage], a 100 ms ring over the 30 s window).
+// This sink owns the TRAILING window for all four stages; the admission
+// manager separately keeps the exact LIFETIME mean
+// (admission.gateWaitMs/gateWaitCount). Both are fed from the same single
+// measurement at each gate — no bounded sampling anywhere.
 func (m *metricsRegistry) recordGateWait(backend string, stage queueStage, elapsed time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2971,28 +2977,17 @@ type sessionAdmission struct {
 	// Gate-wait is the time a keyed request spent in the admission gate
 	// (admitStart → terminal), for granted AND rejected requests: the
 	// router's own admission-queue pressure, distinct from the
-	// downstream GPU/slot/prefill gates. Lifetime sum + count plus a
-	// trailing-30s window (the live summary, the ring below); rejections
+	// downstream GPU/slot/prefill gates. Exact lifetime sum + count —
+	// the trailing-30s window lives in the metrics registry
+	// (queueWait.admission), so no bounded sampling anywhere; rejections
 	// are counted by reason so a full queue (queueFull) is distinguishable
 	// from a deadline (queueTimeout) and a client hang-up (clientCancel).
 	gateWaitMs      int64
 	gateWaitCount   int64
-	gateWaitSamples [gateTrailN]gateTrailSample
-	gateWaitHead    int
 	rejQueueFull    int64
 	rejQueueTimeout int64
 	rejClientCancel int64
 }
-
-// gateTrailSample is one admission-gate wait, kept for the trailing-30s
-// live summary. The ring is fixed-capacity (no per-sample allocation):
-// a burst over the capacity drops the oldest samples, never grows.
-type gateTrailSample struct {
-	at  int64 // wall-clock UnixMilli of the terminal
-	dur int64 // ms
-}
-
-const gateTrailN = 4096
 
 func newSessionAdmission(maxAdmitted, maxWaiting int, ttl time.Duration, clock admissionClock) *sessionAdmission {
 	if clock == nil {
@@ -3200,16 +3195,15 @@ func (a *sessionAdmission) reclaimOldestIdleLocked() bool {
 // own admission-queue pressure — distinct from the downstream
 // GPU/slot/prefill gates — and is counted for granted AND rejected
 // requests, so a full queue shows as long waits, not just 429s. The
-// trailing-30s window (the live summary) uses the wall clock, matching the
-// rate-window convention; the manual test clock drives lease/TTL/deadline
-// logic only.
+// manager keeps the exact LIFETIME mean (gateWaitMs/gateWaitCount, no
+// bounded sampling); the trailing-30s window lives in the metrics registry
+// (queueWait.admission), fed from the same single measurement — the two
+// sinks cannot diverge.
 func (a *sessionAdmission) recordGateWait(d time.Duration) {
 	ms := int64(d / time.Millisecond)
 	a.mu.Lock()
 	a.gateWaitMs += ms
 	a.gateWaitCount++
-	a.gateWaitSamples[a.gateWaitHead] = gateTrailSample{at: time.Now().UnixMilli(), dur: ms}
-	a.gateWaitHead = (a.gateWaitHead + 1) % gateTrailN
 	a.mu.Unlock()
 }
 
@@ -3461,17 +3455,15 @@ type admissionFrame struct {
 	OldestWaitMs   int64 `json:"oldestWaitMs"`
 	ReclaimedTotal int64 `json:"reclaimedTotal"`
 	// Gate-wait telemetry (the admission gate only, not downstream gates):
-	// lifetime mean (GateWaitMs = total/count), trailing-30s window
-	// (GateWaitTrailMs / GateWaitTrailCount → live mean), and the
+	// exact LIFETIME mean (GateWaitMs = total/count; the trailing-30s
+	// window lives in the metrics registry, queueWait.admission), and the
 	// rejection breakdown — queue-full vs queue-timeout vs client-cancel.
-	GateWaitMs       int64 `json:"gateWaitMs"`
-	GateWaitTotalMs  int64 `json:"gateWaitTotalMs"`
-	GateWaitCount    int64 `json:"gateWaitCount"`
-	GateWaitTrailMs  int64 `json:"gateWaitTrailMs"`
-	GateWaitTrailCnt int64 `json:"gateWaitTrailCnt"`
-	RejQueueFull     int64 `json:"rejQueueFull"`
-	RejQueueTimeout  int64 `json:"rejQueueTimeout"`
-	RejClientCancel  int64 `json:"rejClientCancel"`
+	GateWaitMs      int64 `json:"gateWaitMs"`
+	GateWaitTotalMs int64 `json:"gateWaitTotalMs"`
+	GateWaitCount   int64 `json:"gateWaitCount"`
+	RejQueueFull    int64 `json:"rejQueueFull"`
+	RejQueueTimeout int64 `json:"rejQueueTimeout"`
+	RejClientCancel int64 `json:"rejClientCancel"`
 }
 
 // aggregateSnapshot copies the admission state for the live frame and /stats
@@ -3519,20 +3511,6 @@ func (a *sessionAdmission) aggregateSnapshot() admissionFrame {
 	if a.gateWaitCount > 0 {
 		f.GateWaitMs = a.gateWaitMs / a.gateWaitCount
 	}
-	// Trailing-30s live window: the fixed-capacity ring drops the oldest
-	// samples on a burst, never grows. Wall clock (see recordGateWait).
-	nowMs := time.Now().UnixMilli()
-	cutoff := nowMs - 30_000
-	var trailMs, trailCnt int64
-	for i := range a.gateWaitSamples {
-		s := &a.gateWaitSamples[i]
-		if s.at > cutoff && s.at <= nowMs {
-			trailMs += s.dur
-			trailCnt++
-		}
-	}
-	f.GateWaitTrailMs = trailMs
-	f.GateWaitTrailCnt = trailCnt
 	f.RejQueueFull = a.rejQueueFull
 	f.RejQueueTimeout = a.rejQueueTimeout
 	f.RejClientCancel = a.rejClientCancel
@@ -4253,10 +4231,10 @@ func estimateRetryAfter(name string) int {
 
 // The field set is the superset of the live frame's capacity figures: the
 // original 25 router/engine series plus the admission-gate gauges (the
-// frozen admissionFrame) and the fleet GPU-budget figures, so the live edge
-// and stored history cannot diverge. The original 44 indexes remain stable;
-// router rejection and gate-exit rates append seventeen fields. uint64 flags
-// preserve presence above index 31.
+// frozen admissionFrame), the fleet GPU-budget figures, and the router
+// rejection / gate-exit rate series, so the live edge and stored history
+// cannot diverge. The 25 V2 indexes remain stable; uint64 flags preserve
+// presence above index 31.
 const (
 	hiInFlight = iota
 	hiWaiting
@@ -4283,7 +4261,7 @@ const (
 	hiWeightMemGB
 	hiHitRate
 	hiEngTTFT
-	// New capacity series (25 → 44).
+	// New capacity series (25 → 59).
 	hiMaxQueueDepth
 	hiPrefillMax
 	hiAdmMaxAdmitted
@@ -4295,8 +4273,6 @@ const (
 	hiAdmGateWaitMs
 	hiAdmGateWaitTotalMs
 	hiAdmGateWaitCount
-	hiAdmGateWaitTrailMs
-	hiAdmGateWaitTrailCnt
 	hiAdmRejQueueFull
 	hiAdmRejQueueTimeout
 	hiAdmRejClientCancel
@@ -4335,7 +4311,6 @@ var histFieldNames = [histFieldN]string{
 	"admissionMaxAdmitted", "admissionMaxWaiting", "admissionActive",
 	"admissionIdle", "admissionWaiting", "admissionOldestWaitMs",
 	"admissionGateWaitMs", "admissionGateWaitTotalMs", "admissionGateWaitCount",
-	"admissionGateWaitTrailMs", "admissionGateWaitTrailCnt",
 	"admissionRejQueueFull", "admissionRejQueueTimeout",
 	"admissionRejClientCancel",
 	"gpuUsed", "gpuBudget", "gpuWaiting",
@@ -4353,8 +4328,8 @@ var histMaxFields = [histFieldN]bool{
 
 // historyPoint is compact and fixed-layout (~200 B with the capacity
 // superset). Flags records which fields were observed; an absent bit
-// serializes as null, never 0. uint64 because the field count (44) exceeds
-// the 32 bits of the old layout — the capacity series would not fit.
+// serializes as null, never 0. uint64 because the field count (59) exceeds
+// the 32 bits of the V2 layout — the capacity series would not fit.
 type historyPoint struct {
 	T     int64
 	V     [histFieldN]float32
@@ -4796,8 +4771,6 @@ func pointFromBackend(b backendFrame) historyPoint {
 		hpSet(&p, hiAdmGateWaitMs, float64(adm.GateWaitMs))
 		hpSet(&p, hiAdmGateWaitTotalMs, float64(adm.GateWaitTotalMs))
 		hpSet(&p, hiAdmGateWaitCount, float64(adm.GateWaitCount))
-		hpSet(&p, hiAdmGateWaitTrailMs, float64(adm.GateWaitTrailMs))
-		hpSet(&p, hiAdmGateWaitTrailCnt, float64(adm.GateWaitTrailCnt))
 		hpSet(&p, hiAdmRejQueueFull, float64(adm.RejQueueFull))
 		hpSet(&p, hiAdmRejQueueTimeout, float64(adm.RejQueueTimeout))
 		hpSet(&p, hiAdmRejClientCancel, float64(adm.RejClientCancel))
@@ -4813,6 +4786,15 @@ func pointFromTotals(t totalsFrame, g gpuFrame) historyPoint {
 	// Fleet rollup of active admissions (0 when no backend enables admission;
 	// a level, so it is never a "hole").
 	hpSet(&p, hiAdmActive, float64(t.AdmActive))
+	// Fleet rollup of admission-queue waiters: meaningful only when at least
+	// one backend enables admission — a fleet without it keeps the lane
+	// null (never 0), matching the live edge's per-backend contract.
+	if t.AdmEnabled > 0 {
+		hpSet(&p, hiAdmWaiting, float64(t.AdmWaiting))
+	}
+	// Fleet rollup of the large-prefill slot queue depth (a level; 0 when no
+	// backend has a prefill limit), like the live edge's sum.
+	hpSet(&p, hiPrefillWaiting, float64(t.PrefillWaiting))
 	hpSet(&p, hiReqRate, t.ReqRate)
 	hpSet(&p, hiTokEstRate, t.TokEstRate)
 	// Fleet GPU-budget (the router's own admission view): set only when the
@@ -5116,8 +5098,8 @@ func histPointV2toV3(p histPointV2) historyPoint {
 
 // decodeHistoryV2 reads a V2 snapshot (the uint32/25-field layout) and
 // converts it to the V3 layout. The GPU point layout never changed, so it is
-// reused as-is. Any decode error means "not a V2 snapshot" — the caller
-// falls back to the V3 reader.
+// reused as-is. Any decode error or a non-V2 version means "not a V2
+// snapshot" — the caller drops it.
 func decodeHistoryV2(r io.Reader) (historySnapshot, bool) {
 	var v2 historySnapshotV2
 	if err := gob.NewDecoder(r).Decode(&v2); err != nil || v2.Version != 2 {
@@ -5150,46 +5132,6 @@ func histPointsV2toV3(in []histPointV2) []historyPoint {
 		out[i] = histPointV2toV3(p)
 	}
 	return out
-}
-
-// The first V3 writer stored 44 fields. Keep its disk layout read-only;
-// runtime and new snapshots use the expanded field set.
-type historyPointV3Legacy struct {
-	T     int64
-	V     [44]float32
-	Flags uint64
-}
-type histSeriesSnapV3Legacy struct{ Raw, Minute, Hour []historyPointV3Legacy }
-type historySnapshotV3Legacy struct {
-	Version  int
-	SavedAt  int64
-	Backends map[string]histSeriesSnapV3Legacy
-	Fleet    histSeriesSnapV3Legacy
-	GPUs     map[string]histGPUSnap
-}
-
-func decodeHistoryV3Legacy(data []byte) (historySnapshot, bool) {
-	var old historySnapshotV3Legacy
-	if gob.NewDecoder(bytes.NewReader(data)).Decode(&old) != nil || old.Version != 3 {
-		return historySnapshot{}, false
-	}
-	convert := func(s histSeriesSnapV3Legacy) histSeriesSnap {
-		points := func(in []historyPointV3Legacy) []historyPoint {
-			out := make([]historyPoint, len(in))
-			for i, p := range in {
-				out[i].T = p.T
-				out[i].Flags = p.Flags & ((uint64(1) << 44) - 1)
-				copy(out[i].V[:44], p.V[:])
-			}
-			return out
-		}
-		return histSeriesSnap{Raw: points(s.Raw), Minute: points(s.Minute), Hour: points(s.Hour)}
-	}
-	snap := historySnapshot{Version: 3, SavedAt: old.SavedAt, Fleet: convert(old.Fleet), Backends: make(map[string]histSeriesSnap, len(old.Backends)), GPUs: old.GPUs}
-	for name, s := range old.Backends {
-		snap.Backends[name] = convert(s)
-	}
-	return snap, true
 }
 
 func (h *historyStore) snapshotLocked() historySnapshot {
@@ -5276,9 +5218,7 @@ func (h *historyStore) loadSnapshot(path string) {
 		// Not the current layout: a V2 snapshot (25 fields, uint32 flags)
 		// migrates to V3 preserving the shared 25 series; anything else is
 		// dropped.
-		if migrated, ok := decodeHistoryV3Legacy(data); ok {
-			snap = migrated
-		} else if migrated, ok := decodeHistoryV2(bytes.NewReader(data)); ok {
+		if migrated, ok := decodeHistoryV2(bytes.NewReader(data)); ok {
 			snap = migrated
 			log.Printf("history: migrated V2 snapshot from %s", path)
 		} else {
@@ -5393,7 +5333,10 @@ func applyFleetAggregates(f *metricsFrame) {
 		}
 		if b.Admission != nil {
 			t.AdmActive += int32(b.Admission.Active)
+			t.AdmWaiting += int32(b.Admission.Waiting)
+			t.AdmEnabled++
 		}
+		t.PrefillWaiting += b.PrefillWaiting
 	}
 	if ttftN > 0 {
 		t.TTFTMs = ttftW / ttftN
@@ -5724,7 +5667,7 @@ type backendFrame struct {
 	// null) when the backend has never rejected. The capacity panel shows
 	// WHY capacity was refused; the admission gate's own breakdown lives in
 	// the admission frame.
-	RejectReasons map[string]int64 `json:"rejectReasons,omitempty"`
+	RejectReasons map[string]int64 `json:"rejectReasons"`
 	BytesInTotal  int64            `json:"bytesInTotal"`
 	BytesOutTotal int64            `json:"bytesOutTotal"`
 	TokEstTotal   int64            `json:"tokEstTotal"`
@@ -5787,9 +5730,22 @@ type totalsFrame struct {
 	// AdmActive: fleet rollup of active session-admission leases (sum over
 	// backends with admission enabled). Feeds the fleet lane of the
 	// admission history layer; 0 when no backend has admission enabled.
-	AdmActive int32           `json:"admActive"`
-	QueueWait *queueWaitFrame `json:"queueWait"`
-	Router429 *router429Frame `json:"router429"`
+	AdmActive int32 `json:"admActive"`
+	// AdmEnabled: count of backends with session admission enabled. Not a
+	// wire field — it tells pointFromTotals when the admission-waiting
+	// rollup is meaningful (a fleet with no admission-enabled backend must
+	// keep that history lane null, never 0).
+	AdmEnabled int `json:"-"`
+	// AdmWaiting: fleet rollup of admission-queue waiters (sum over
+	// backends with admission enabled). History-only fleet lane; the live
+	// edge sums the same per-backend admission.waiting.
+	AdmWaiting int32 `json:"-"`
+	// PrefillWaiting: fleet rollup of the large-prefill slot queue depth
+	// (sum over backends). History-only fleet lane; 0 when no backend has a
+	// prefill limit, like the live edge.
+	PrefillWaiting int32           `json:"-"`
+	QueueWait      *queueWaitFrame `json:"queueWait"`
+	Router429      *router429Frame `json:"router429"`
 }
 
 type metricsFrame struct {
@@ -6311,6 +6267,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				recordRejection(499, "")
 				return
 			}
+			log.Printf("%s %s -> %s (model=%s) 429: GPU budget full", r.Method, r.URL.Path, target.Name, modelName)
 			write429(w, "gpu-budget-full", target.Name, estimateRetryAfter(target.Name))
 			recordRejection(http.StatusTooManyRequests, "gpu-budget-full")
 			return

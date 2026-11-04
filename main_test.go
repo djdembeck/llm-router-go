@@ -862,14 +862,22 @@ func TestMetrics_RecordRequest_RejectReasons(t *testing.T) {
 		T: now, Backend: "b", Status: 429,
 		RejectReason: "backend-queue-full",
 	})
+	// 413: counts in the per-backend reason map like a 429, but is NEVER a
+	// router 429 (its reason is not in router429Reasons, and the 429 counter
+	// is gated on status==429).
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 413,
+		RejectReason: "body-too-large",
+	})
 	// Accepted: no reason (""), must not pollute the map.
 	m.recordRequest("b", requestSample{
 		T: now, Backend: "b", Status: 200, accepted: true,
 	})
 
+	m.computeRates(time.Now())
 	s := m.snapshot("b")
-	if s.RejectedTotal != 3 {
-		t.Fatalf("rejectedTotal = %d, want 3", s.RejectedTotal)
+	if s.RejectedTotal != 4 {
+		t.Fatalf("rejectedTotal = %d, want 4", s.RejectedTotal)
 	}
 	if s.RejectReasons["gpu-budget-full"] != 2 {
 		t.Errorf("gpu-budget-full = %d, want 2", s.RejectReasons["gpu-budget-full"])
@@ -877,8 +885,16 @@ func TestMetrics_RecordRequest_RejectReasons(t *testing.T) {
 	if s.RejectReasons["backend-queue-full"] != 1 {
 		t.Errorf("backend-queue-full = %d, want 1", s.RejectReasons["backend-queue-full"])
 	}
-	if len(s.RejectReasons) != 2 {
-		t.Errorf("len(rejectReasons) = %d, want 2 (accepted must not count)", len(s.RejectReasons))
+	if s.RejectReasons["body-too-large"] != 1 {
+		t.Errorf("body-too-large = %d, want 1 (413 counts in the reason map)", s.RejectReasons["body-too-large"])
+	}
+	if len(s.RejectReasons) != 3 {
+		t.Errorf("len(rejectReasons) = %d, want 3 (accepted must not count)", len(s.RejectReasons))
+	}
+	// 413 must never increment a router-429 counter: the 429 breakdown is
+	// 3 (the two 429s above) with the 413 absent from it.
+	if s.Router429 == nil || s.Router429.Total != 3 {
+		t.Errorf("router429 total = %+v, want 3 (413 is not a router 429)", s.Router429)
 	}
 	// The snapshot carries a copy: mutating it must not corrupt the registry.
 	s.RejectReasons["gpu-budget-full"] = 999
@@ -3221,6 +3237,29 @@ func TestHistory_V2Migration(t *testing.T) {
 	if hpHas(p, hiAdmActive) || hpHas(p, hiGpuWaiting) || hpHas(p, hiAdmGateWaitMs) {
 		t.Errorf("new capacity field set on a migrated V2 point: flags=%b", p.Flags)
 	}
+	// The FLEET series migrates too: the seeded V2 point carries over with
+	// its V2 values (inFlight=7, kvPct=42) and null new capacity fields.
+	// (The raw ring may hold a zero-point tail, so locate the point by its
+	// carried value, mirroring the backend series above.)
+	var fpFound bool
+	for _, fp := range h.fleet.raw.ordered() {
+		if !hpHas(fp, hiInFlight) {
+			continue
+		}
+		fpFound = true
+		if fp.V[hiInFlight] != 7 {
+			t.Errorf("fleet inFlight = %v, want 7", fp.V[hiInFlight])
+		}
+		if !hpHas(fp, hiKVPct) || fp.V[hiKVPct] != 42 {
+			t.Errorf("fleet kvPct = %v set=%v, want 42/set", fp.V[hiKVPct], hpHas(fp, hiKVPct))
+		}
+		if hpHas(fp, hiAdmActive) || hpHas(fp, hiGpuWaiting) {
+			t.Errorf("fleet new capacity field set on a migrated V2 point: flags=%b", fp.Flags)
+		}
+	}
+	if !fpFound {
+		t.Errorf("fleet V2 point with inFlight not found (V2 fleet not migrated)")
+	}
 	// GPU point survives (its layout never changed).
 	if g := h.gpus["GPU-1"].raw.ordered(); len(g) != 1 || g[0].V[guUtil] != 88 {
 		t.Errorf("gpu raw = %+v, want 1 point util=88", g)
@@ -4439,6 +4478,9 @@ func TestProxy_OversizedBodyRejected(t *testing.T) {
 	if s.BytesIn != 1024 {
 		t.Errorf("bytesIn = %d, want 1024 (capped at maxBodyBytes)", s.BytesIn)
 	}
+	if s.RejectReason != "body-too-large" {
+		t.Errorf("sample rejectReason = %q, want body-too-large", s.RejectReason)
+	}
 }
 
 // TestGPURegistry_ScrapeTransitions covers the registry's status machine:
@@ -4808,7 +4850,77 @@ func TestPressureAdmissionReasonHandlers(t *testing.T) {
 			if metrics.snapshot("smoke").Router429.Total != 1 {
 				t.Fatal("admission rejection not counted")
 			}
+			// The MANAGER's own breakdown must reflect the rejection reason
+			// through the handler path (not just the direct
+			// recordGateRejection unit test).
+			f := mgr.aggregateSnapshot()
+			if timeout {
+				if f.RejQueueTimeout != 1 || f.RejQueueFull != 0 || f.RejClientCancel != 0 {
+					t.Fatalf("manager counters = %+v, want timeout=1 only", f)
+				}
+			} else if f.RejQueueFull != 1 || f.RejQueueTimeout != 0 || f.RejClientCancel != 0 {
+				t.Fatalf("manager counters = %+v, want full=1 only", f)
+			}
 		})
+	}
+}
+
+// TestPressureAdmissionClientCancel pins the manager-side rejection counter
+// for the handler's 499 arm: a keyed request queued at a full cap whose
+// client cancels before the queue deadline is recorded by the MANAGER as a
+// client-cancel (RejClientCancel) — the existing reason-handler test only
+// asserts the queue-full and queue-timeout arms through handleProxy. The
+// 499 sample keeps an EMPTY reason (recordRejection(499, "")); the
+// manager's breakdown is the only place the cancel is counted.
+func TestPressureAdmissionClientCancel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer upstream.Close()
+	withRouterEnv(t, []Backend{{Name: "smoke", URL: upstream.URL}}, map[string]int{"smoke": 2}, nil)
+	saIsolate(t)
+	c := newSAManualClock()
+	// maxWaiting=1 so the queued request can be cancelled, not hard-rejected
+	// by a full queue.
+	withAdmissionEnv(t, time.Minute, c, 1, 1)
+	mgr := sessionAdmissions["smoke"]
+	ticket, err := mgr.acquire(context.Background(), "holder", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ticket.release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(saChatBody("smoke", "new", "hello"))).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleProxy(rec, req)
+	}()
+	// The request is queued behind the active "holder" lease; cancel the
+	// client well before the 30s queue deadline.
+	saPollAdmissionWaiting(t, "smoke", 1)
+	cancel()
+	<-done
+
+	// The 499 arm is record-only (it never writes to the closed client), so
+	// the response writer stays untouched — the 499 and its empty reason
+	// live in the burst ring, and the manager's rejection counter is the only
+	// place the cancel identity is counted.
+	s := metrics.burst(1)[0]
+	if s.Status != 499 || s.RejectReason != "" {
+		t.Fatalf("sample = status %d reason %q, want 499/empty", s.Status, s.RejectReason)
+	}
+	f := mgr.aggregateSnapshot()
+	if f.RejClientCancel != 1 {
+		t.Fatalf("RejClientCancel = %d, want 1", f.RejClientCancel)
+	}
+	if f.RejQueueFull != 0 || f.RejQueueTimeout != 0 {
+		t.Fatalf("unrelated counters bumped: full=%d timeout=%d", f.RejQueueFull, f.RejQueueTimeout)
+	}
+	// A client cancel is a 499, never a router 429: the backend's 429
+	// counter must stay zero.
+	if got := metrics.snapshot("smoke").Router429; got != nil && got.Total != 0 {
+		t.Fatalf("429 total = %d, want 0 (cancel is not a router 429)", got.Total)
 	}
 }
 
@@ -4897,7 +5009,7 @@ func TestPressureHistoryReasonRates(t *testing.T) {
 }
 
 func TestPressureHistoryExpandedAndLegacy(t *testing.T) {
-	if histFieldN != 61 {
+	if histFieldN != 59 {
 		t.Fatalf("histFieldN=%d", histFieldN)
 	}
 	q := &queueWaitFrame{Execution: waitSummary{SumMs: 400, Samples: 2}}
@@ -4919,30 +5031,6 @@ func TestPressureHistoryExpandedAndLegacy(t *testing.T) {
 	got := restored.backends["b"].raw.ordered()[0]
 	if got != p {
 		t.Fatalf("round trip: %+v != %+v", got, p)
-	}
-	var old historyPointV3Legacy
-	old.T = p.T
-	old.V[43] = 7
-	old.Flags = uint64(1) << 43
-	legacy := historySnapshotV3Legacy{Version: 3, Backends: map[string]histSeriesSnapV3Legacy{"b": {Raw: []historyPointV3Legacy{old}}}}
-	file, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = gob.NewEncoder(file).Encode(legacy); err != nil {
-		t.Fatal(err)
-	}
-	file.Close()
-	restored = newHistoryStore()
-	restored.loadSnapshot(path)
-	got = restored.backends["b"].raw.ordered()[0]
-	if !hpHas(got, 43) || got.V[43] != 7 {
-		t.Fatal("old V3 values lost")
-	}
-	for i := 44; i < histFieldN; i++ {
-		if hpHas(got, i) {
-			t.Fatalf("fabricated field %d", i)
-		}
 	}
 	if err := os.WriteFile(path, []byte("corrupt"), 0600); err != nil {
 		t.Fatal(err)
