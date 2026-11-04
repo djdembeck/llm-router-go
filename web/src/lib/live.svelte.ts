@@ -9,6 +9,7 @@ import { browser } from "$app/env";
 import {
   emptyEngine,
   getJSON,
+  type AdmissionMetrics,
   type BurstRequest,
   type Frame,
   type SessionsFeed,
@@ -35,6 +36,7 @@ interface StatsBackend {
   prefillWaiting: number;
   prefillMax: number;
   avgDurationS: number;
+  admission: AdmissionMetrics | null;
 }
 interface StatsResponse {
   backends: StatsBackend[];
@@ -377,13 +379,19 @@ export class LiveStore {
       tokEstRate: 0,
       reqTotal: 0,
       rejectTotal: 0,
+      // The /stats fallback carries the admission lease snapshot (authoritative)
+      // but not the per-backend lifetime refusal breakdown — null there, not a
+      // fake zero, so the panel's refusal-reasons row stays empty.
+      rejectReasons: null,
       bytesInTotal: 0,
       bytesOutTotal: 0,
       tokEstTotal: 0,
       engine: { ...emptyEngine },
+      admission: b.admission ?? null,
     }));
     const inFlight = backends.reduce((a, b) => a + b.inFlight, 0);
     const waiting = backends.reduce((a, b) => a + b.waiting, 0);
+    const admActive = backends.reduce((a, b) => a + (b.admission?.active ?? 0), 0);
     return {
       t,
       backends,
@@ -399,6 +407,7 @@ export class LiveStore {
       totals: {
         inFlight,
         waiting,
+        admActive,
         reqRate: 0,
         bytesRate: 0,
         tokEstRate: 0,

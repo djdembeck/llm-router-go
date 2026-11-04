@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -833,9 +834,57 @@ func TestMetrics_RecordRequest_CounterIncrements(t *testing.T) {
 	if s2.ReqTotal != 1 || s2.TokEstTotal != 10 {
 		t.Errorf("subject counters = %+v, want reqTotal=1 tokEst=10", s2)
 	}
-	// Unknown backend: zero snapshot, not a panic or stale value.
-	if zero := m.snapshot("ghost"); zero != (backendMetricSnapshot{}) {
+	// Unknown backend: zero snapshot, not a panic or stale value. (Cannot
+	// compare the whole struct: it now carries a reject-reason map.)
+	if zero := m.snapshot("ghost"); zero.TTFTMs != 0 || zero.ReqRate != 0 || zero.ReqTotal != 0 ||
+		zero.RejectedTotal != 0 || zero.RejectReasons != nil ||
+		zero.BytesInTotal != 0 || zero.BytesOutTotal != 0 || zero.TokEstTotal != 0 {
 		t.Errorf("unknown backend snapshot = %+v, want zero", zero)
+	}
+}
+
+// TestMetrics_RecordRequest_RejectReasons pins the per-backend rejection-reason
+// breakdown: rejected samples accumulate by X-Router-Reason string, accepted
+// samples never do, and the snapshot returns a copy (mutating it must not
+// corrupt the registry).
+func TestMetrics_RecordRequest_RejectReasons(t *testing.T) {
+	m := newTestMetrics()
+	now := time.Now()
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 429,
+		RejectReason: "gpu-budget-full",
+	})
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 429,
+		RejectReason: "gpu-budget-full",
+	})
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 429,
+		RejectReason: "backend-queue-full",
+	})
+	// Accepted: no reason (""), must not pollute the map.
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 200, accepted: true,
+	})
+
+	s := m.snapshot("b")
+	if s.RejectedTotal != 3 {
+		t.Fatalf("rejectedTotal = %d, want 3", s.RejectedTotal)
+	}
+	if s.RejectReasons["gpu-budget-full"] != 2 {
+		t.Errorf("gpu-budget-full = %d, want 2", s.RejectReasons["gpu-budget-full"])
+	}
+	if s.RejectReasons["backend-queue-full"] != 1 {
+		t.Errorf("backend-queue-full = %d, want 1", s.RejectReasons["backend-queue-full"])
+	}
+	if len(s.RejectReasons) != 2 {
+		t.Errorf("len(rejectReasons) = %d, want 2 (accepted must not count)", len(s.RejectReasons))
+	}
+	// The snapshot carries a copy: mutating it must not corrupt the registry.
+	s.RejectReasons["gpu-budget-full"] = 999
+	s2 := m.snapshot("b")
+	if s2.RejectReasons["gpu-budget-full"] != 2 {
+		t.Errorf("registry mutated by snapshot mutation: gpu-budget-full = %d, want 2", s2.RejectReasons["gpu-budget-full"])
 	}
 }
 
@@ -2497,6 +2546,69 @@ func TestHandleBurst_LimitClamp(t *testing.T) {
 	}
 }
 
+// TestHandleBurst_ReasonAndGateWait pins the additive burst fields: a
+// rejected request carries its X-Router-Reason, and a keyed request carries
+// its admission-gate wait. The frame is the client's RequestFeed contract.
+func TestHandleBurst_ReasonAndGateWait(t *testing.T) {
+	m := newTestMetrics()
+	now := time.Now()
+	// A rejected request (downstream gate) with a reason.
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 429,
+		RejectReason: "gpu-budget-full",
+	})
+	// An accepted keyed request with an admission-gate wait.
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 200, accepted: true, GateWaitMs: 120.5,
+	})
+
+	saveMetrics := metrics
+	metrics = m
+	t.Cleanup(func() { metrics = saveMetrics })
+	srv := httptest.NewServer(buildMetricsMux())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics/burst?limit=2")
+	if err != nil {
+		t.Fatalf("burst: %v", err)
+	}
+	var burst struct {
+		Requests []struct {
+			Status       int     `json:"status"`
+			RejectReason string  `json:"rejectReason"`
+			GateWaitMs   float64 `json:"gateWaitMs"`
+		} `json:"requests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&burst); err != nil {
+		t.Fatalf("burst decode: %v", err)
+	}
+	resp.Body.Close()
+	if len(burst.Requests) != 2 {
+		t.Fatalf("burst = %d entries, want 2", len(burst.Requests))
+	}
+	var rejected, accepted bool
+	for _, r := range burst.Requests {
+		switch {
+		case r.Status == 429:
+			rejected = true
+			if r.RejectReason != "gpu-budget-full" {
+				t.Errorf("rejected rejectReason = %q, want gpu-budget-full", r.RejectReason)
+			}
+		case r.Status == 200:
+			accepted = true
+			if r.GateWaitMs != 120.5 {
+				t.Errorf("accepted gateWaitMs = %v, want 120.5", r.GateWaitMs)
+			}
+			if r.RejectReason != "" {
+				t.Errorf("accepted rejectReason = %q, want empty", r.RejectReason)
+			}
+		}
+	}
+	if !rejected || !accepted {
+		t.Fatalf("burst missing expected status 429/200 entries")
+	}
+}
+
 func firstTokInt(b struct {
 	Requests []struct {
 		NewTokensEst int `json:"newTokensEst"`
@@ -3051,6 +3163,86 @@ func TestHistory_SnapshotRoundTrip(t *testing.T) {
 	}
 	if got := len(h2.gpus["GPU-1"].raw.ordered()); got != 1 {
 		t.Fatalf("loaded gpu raw points = %d, want 1", got)
+	}
+}
+
+// TestHistory_V2Migration loads a genuine V2 snapshot (25 fields, uint32
+// flags) and verifies the reader migrates it to V3: the shared 25 series
+// survive with their values, the GPU point survives, and the 19 new capacity
+// fields stay null (an old snapshot has no capacity data — they must not be
+// reported as 0). A version that is neither 2 nor 3 is dropped.
+func TestHistory_V2Migration(t *testing.T) {
+	path := t.TempDir() + "/history.gob"
+	now := time.Now().UnixMilli()
+
+	// Build a V2 wire point: inFlight=7, kvPct=42, ttftMax via max flag.
+	var p2 histPointV2
+	p2.T = now - 2000
+	p2.V[hiInFlight] = 7
+	p2.V[hiKVPct] = 42
+	p2.Flags = (1 << uint(hiInFlight)) | (1 << uint(hiKVPct))
+
+	v2 := historySnapshotV2{
+		Version: 2,
+		SavedAt: now,
+		Backends: map[string]histSeriesSnapV2{
+			"b": {Raw: []histPointV2{p2}},
+		},
+		Fleet: histSeriesSnapV2{Raw: []histPointV2{p2}},
+		GPUs: map[string]histGPUSnap{
+			"GPU-1": {Raw: []gpuPoint{{T: now - 2000, V: [guFieldN]float32{guUtil: 88}, Flags: 1 << guUtil}}},
+		},
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := gob.NewEncoder(f).Encode(v2); err != nil {
+		t.Fatalf("encode v2: %v", err)
+	}
+	f.Close()
+
+	h := newHistoryStore()
+	h.configure(path)
+	h.loadSnapshot(path)
+
+	pts := h.backends["b"].raw.ordered()
+	if len(pts) != 1 {
+		t.Fatalf("backend raw points = %d, want 1 (V2 not migrated)", len(pts))
+	}
+	p := pts[0]
+	if !hpHas(p, hiInFlight) || p.V[hiInFlight] != 7 {
+		t.Errorf("inFlight = %v set=%v, want 7/set", p.V[hiInFlight], hpHas(p, hiInFlight))
+	}
+	if !hpHas(p, hiKVPct) || p.V[hiKVPct] != 42 {
+		t.Errorf("kvPct = %v set=%v, want 42/set", p.V[hiKVPct], hpHas(p, hiKVPct))
+	}
+	// The new capacity fields must be null, not zero.
+	if hpHas(p, hiAdmActive) || hpHas(p, hiGpuWaiting) || hpHas(p, hiAdmGateWaitMs) {
+		t.Errorf("new capacity field set on a migrated V2 point: flags=%b", p.Flags)
+	}
+	// GPU point survives (its layout never changed).
+	if g := h.gpus["GPU-1"].raw.ordered(); len(g) != 1 || g[0].V[guUtil] != 88 {
+		t.Errorf("gpu raw = %+v, want 1 point util=88", g)
+	}
+}
+
+// TestHistory_BadVersionDropped confirms a snapshot with a version that is
+// neither 2 (migratable) nor 3 (current) is ignored, not partially loaded.
+func TestHistory_BadVersionDropped(t *testing.T) {
+	path := t.TempDir() + "/history.gob"
+	h := newHistoryStore()
+	h.configure(path)
+	// A V1-era file: version 1, no data. The V3 decode sees version 1 != 3;
+	// the V2 reader sees version 1 != 2. Both reject → nothing loaded.
+	var v historySnapshotV2
+	v.Version = 1
+	f, _ := os.Create(path)
+	gob.NewEncoder(f).Encode(v)
+	f.Close()
+	h.loadSnapshot(path)
+	if len(h.backends) != 0 || len(h.gpus) != 0 {
+		t.Fatalf("bad-version snapshot loaded data: backends=%d gpus=%d", len(h.backends), len(h.gpus))
 	}
 }
 

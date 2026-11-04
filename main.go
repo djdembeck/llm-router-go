@@ -271,7 +271,7 @@ func (d *durationTracker) avgSeconds() float64 {
 // retired from the pending window on completion.
 type requestSample struct {
 	T            time.Time // completion
-	Start        time.Time // admission — the profile draws the request interval
+	Start        time.Time // admission - the profile draws the request interval
 	Backend      string
 	Path         string
 	Status       int
@@ -282,7 +282,16 @@ type requestSample struct {
 	CtxTok       int // est context tokens (all messages/prompt, ~4 bytes/token)
 	BytesIn      int64
 	BytesOut     int64
-	accepted     bool
+	// RejectReason: the X-Router-Reason string for a rejected (429/413)
+	// request; "" for accepted requests. Feeds the per-backend reason
+	// breakdown so the dashboard can show WHY capacity was refused.
+	RejectReason string
+	// GateWaitMs: the time the request spent in the ADMISSION gate only
+	// (keyed, session-admission traffic); 0 for unkeyed/disabled traffic.
+	// The RequestFeed's GATE WAIT column — the router's own queue pressure,
+	// not the downstream GPU/slot/prefill waits.
+	GateWaitMs float64
+	accepted   bool
 }
 
 // backendMetrics holds per-backend lifetime counters (completed requests
@@ -293,6 +302,12 @@ type requestSample struct {
 type backendMetrics struct {
 	reqTotal      int64
 	rejectedTotal int64
+	// rejectReasons: per-backend lifetime router-originated 429/413 counts
+	// keyed by the X-Router-Reason string (e.g. "gpu-budget-full"). The
+	// dashboard's capacity panel shows WHY capacity was refused; the
+	// session-admission manager publishes its own admission-gate breakdown
+	// in the admission frame.
+	rejectReasons map[string]int64
 	bytesInTotal  int64
 	bytesOutTotal int64
 	tokEstTotal   int64
@@ -337,6 +352,7 @@ type backendMetricSnapshot struct {
 	TokEstRate      float64
 	ReqTotal        int64
 	RejectedTotal   int64
+	RejectReasons   map[string]int64
 	BytesInTotal    int64
 	BytesOutTotal   int64
 	TokEstTotal     int64
@@ -483,6 +499,12 @@ func (m *metricsRegistry) recordRequest(backend string, s requestSample) {
 	}
 	if !s.accepted {
 		bm.rejectedTotal++
+		if s.RejectReason != "" {
+			if bm.rejectReasons == nil {
+				bm.rejectReasons = map[string]int64{}
+			}
+			bm.rejectReasons[s.RejectReason]++
+		}
 	}
 	bm.reqTotal++
 	bm.bytesInTotal += s.BytesIn
@@ -544,6 +566,19 @@ func (m *metricsRegistry) computeRates(now time.Time) {
 	}
 }
 
+// copyReasons returns an independent copy of the rejection-reason map (nil
+// stays nil) so frame builders can't mutate registry state.
+func copyReasons(in map[string]int64) map[string]int64 {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]int64, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -561,6 +596,7 @@ func (m *metricsRegistry) snapshot(backend string) backendMetricSnapshot {
 		TokEstRate:      bm.tokEstRate,
 		ReqTotal:        bm.reqTotal,
 		RejectedTotal:   bm.rejectedTotal,
+		RejectReasons:   copyReasons(bm.rejectReasons),
 		BytesInTotal:    bm.bytesInTotal,
 		BytesOutTotal:   bm.bytesOutTotal,
 		TokEstTotal:     bm.tokEstTotal,
@@ -2753,14 +2789,15 @@ type sessionAdmissionLease struct {
 
 // sessionAdmissionWaiter is one queued admission request, FIFO-ordered.
 type sessionAdmissionWaiter struct {
-	key      string
-	ctx      context.Context
-	deadline time.Time  // absolute deadline (arrival + grace)
-	result   chan error // exactly one terminal result
-	el       *list.Element
-	pending  bool
-	timer    admissionTimer
-	ticket   *sessionAdmissionTicket // set under mu when a grant is published
+	key        string
+	ctx        context.Context
+	deadline   time.Time  // absolute deadline (arrival + grace)
+	enqueuedAt time.Time  // manager-clock instant of the queue push
+	result     chan error // exactly one terminal result
+	el         *list.Element
+	pending    bool
+	timer      admissionTimer
+	ticket     *sessionAdmissionTicket // set under mu when a grant is published
 }
 
 // sessionAdmission is the bounded per-backend lease gate: a lease map
@@ -2768,15 +2805,42 @@ type sessionAdmissionWaiter struct {
 // arrivals. All state moves under mu; timers carry the lease pointer and
 // generation so stale callbacks can no-op.
 type sessionAdmission struct {
-	mu          sync.Mutex
-	maxAdmitted int
-	maxWaiting  int
-	ttl         time.Duration
-	clock       admissionClock
-	leaseMap    map[string]*sessionAdmissionLease
-	queue       *list.List
-	waiting     int
+	mu             sync.Mutex
+	maxAdmitted    int
+	maxWaiting     int
+	ttl            time.Duration
+	clock          admissionClock
+	leaseMap       map[string]*sessionAdmissionLease
+	queue          *list.List
+	waiting        int
+	reclaimedTotal int64 // pressure reclaims, process lifetime
+
+	// Gate-wait and rejection telemetry, per manager (process lifetime).
+	// Gate-wait is the time a keyed request spent in the admission gate
+	// (admitStart → terminal), for granted AND rejected requests: the
+	// router's own admission-queue pressure, distinct from the
+	// downstream GPU/slot/prefill gates. Lifetime sum + count plus a
+	// trailing-30s window (the live summary, the ring below); rejections
+	// are counted by reason so a full queue (queueFull) is distinguishable
+	// from a deadline (queueTimeout) and a client hang-up (clientCancel).
+	gateWaitMs      int64
+	gateWaitCount   int64
+	gateWaitSamples [gateTrailN]gateTrailSample
+	gateWaitHead    int
+	rejQueueFull    int64
+	rejQueueTimeout int64
+	rejClientCancel int64
 }
+
+// gateTrailSample is one admission-gate wait, kept for the trailing-30s
+// live summary. The ring is fixed-capacity (no per-sample allocation):
+// a burst over the capacity drops the oldest samples, never grows.
+type gateTrailSample struct {
+	at  int64 // wall-clock UnixMilli of the terminal
+	dur int64 // ms
+}
+
+const gateTrailN = 4096
 
 func newSessionAdmission(maxAdmitted, maxWaiting int, ttl time.Duration, clock admissionClock) *sessionAdmission {
 	if clock == nil {
@@ -2833,15 +2897,28 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 		return t, nil
 	}
 
-	// Fresh identity: admit now only when capacity exists AND no earlier
-	// eligible newcomer (still queued, no lease of its own) is bypassed.
-	if len(a.leaseMap) < a.maxAdmitted && !a.blockedByQueueLocked() {
+	// Fresh identity: admit now when NO earlier live newcomer (still
+	// queued, no lease of its own) would be bypassed. Free capacity
+	// grants immediately; a full cap grants by reclaiming the oldest
+	// idle lease — an idle reservation yields to live demand, even with
+	// maxWaiting == 0 or grace <= 0 (those values forbid queueing, not
+	// service with reclaimable capacity).
+	if !a.blockedByQueueLocked() {
 		if ctx.Err() == nil {
-			l := &sessionAdmissionLease{key: key, count: 1}
-			a.leaseMap[key] = l
-			t := ticketFor(a, l)
-			a.mu.Unlock()
-			return t, nil
+			if len(a.leaseMap) < a.maxAdmitted {
+				l := &sessionAdmissionLease{key: key, count: 1}
+				a.leaseMap[key] = l
+				t := ticketFor(a, l)
+				a.mu.Unlock()
+				return t, nil
+			}
+			if a.reclaimOldestIdleLocked() {
+				l := &sessionAdmissionLease{key: key, count: 1}
+				a.leaseMap[key] = l
+				t := ticketFor(a, l)
+				a.mu.Unlock()
+				return t, nil
+			}
 		}
 	}
 
@@ -2856,12 +2933,14 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 		a.mu.Unlock()
 		return nil, ctxErr
 	}
+	now := a.clock.Now()
 	w := &sessionAdmissionWaiter{
-		key:      key,
-		ctx:      ctx,
-		deadline: a.clock.Now().Add(grace),
-		result:   make(chan error, 1),
-		pending:  true,
+		key:        key,
+		ctx:        ctx,
+		deadline:   now.Add(grace),
+		enqueuedAt: now,
+		result:     make(chan error, 1),
+		pending:    true,
 	}
 	w.el = a.queue.PushBack(w)
 	a.waiting++
@@ -2902,17 +2981,22 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 	}
 }
 
+// waiterLiveLocked reports a pending waiter whose context is live and whose
+// deadline has not passed. The SAME predicate serves the capacity checks
+// (a dead waiter must not produce a spurious queue-full), the settle/drain
+// removals, and the oldest-wait figure: dead waiters count nowhere.
+func (a *sessionAdmission) waiterLiveLocked(w *sessionAdmissionWaiter, now time.Time) bool {
+	return w.pending && w.ctx.Err() == nil && now.Before(w.deadline)
+}
+
 // blockedByQueueLocked reports whether a fresh arrival would bypass an
-// earlier queued newcomer: some pending, live, unexpired waiter that does
-// not already hold a lease (it blocks only while capacity is exhausted).
+// earlier queued newcomer: some live waiter that does not already hold a
+// lease (it blocks only while capacity is exhausted).
 func (a *sessionAdmission) blockedByQueueLocked() bool {
 	now := a.clock.Now()
 	for e := a.queue.Front(); e != nil; e = e.Next() {
 		w := e.Value.(*sessionAdmissionWaiter)
-		if !w.pending {
-			continue
-		}
-		if w.ctx.Err() != nil || !now.Before(w.deadline) {
+		if !a.waiterLiveLocked(w, now) {
 			continue // dead; purged on the settle pass
 		}
 		if _, held := a.leaseMap[w.key]; !held {
@@ -2920,6 +3004,78 @@ func (a *sessionAdmission) blockedByQueueLocked() bool {
 		}
 	}
 	return false
+}
+
+// reclaimOldestIdleLocked forfeits the oldest idle lease to satisfy live
+// demand, when every admission cap is held and the only thing standing
+// between the caller and a grant is that idle reservation. Caller holds mu;
+// it inspects leaseMap only (never the bounded session registry).
+//
+// Eligible = idle && count == 0: an active lease (count > 0, including
+// downstream GPU/slot/prefill waits, streaming, abort cleanup) is never
+// touched. Minimum idleSince wins; lexical key breaks clock ties so
+// equal-clock tests and production pick the same lease, in map order
+// without sorting or allocating. The selection's timer is stopped and its
+// generation incremented BEFORE the map delete, so the expiry callback can
+// no-op through the pointer/generation check. reclaimedTotal counts pressure
+// reclaims only — a due lease expiring on its own TTL is not one.
+func (a *sessionAdmission) reclaimOldestIdleLocked() bool {
+	var victim *sessionAdmissionLease
+	for _, l := range a.leaseMap {
+		if !l.idle || l.count > 0 {
+			continue
+		}
+		if victim == nil || l.idleSince.Before(victim.idleSince) ||
+			(l.idleSince.Equal(victim.idleSince) && l.key < victim.key) {
+			victim = l
+		}
+	}
+	if victim == nil {
+		return false
+	}
+	if victim.timer != nil {
+		victim.timer.Stop()
+		victim.timer = nil
+	}
+	victim.gen++
+	delete(a.leaseMap, victim.key)
+	a.reclaimedTotal++
+	return true
+}
+
+// recordGateWait records one admission-gate wait (the time a keyed request
+// spent in the admission gate, admitStart → terminal). It is the router's
+// own admission-queue pressure — distinct from the downstream
+// GPU/slot/prefill gates — and is counted for granted AND rejected
+// requests, so a full queue shows as long waits, not just 429s. The
+// trailing-30s window (the live summary) uses the wall clock, matching the
+// rate-window convention; the manual test clock drives lease/TTL/deadline
+// logic only.
+func (a *sessionAdmission) recordGateWait(d time.Duration) {
+	ms := int64(d / time.Millisecond)
+	a.mu.Lock()
+	a.gateWaitMs += ms
+	a.gateWaitCount++
+	a.gateWaitSamples[a.gateWaitHead] = gateTrailSample{at: time.Now().UnixMilli(), dur: ms}
+	a.gateWaitHead = (a.gateWaitHead + 1) % gateTrailN
+	a.mu.Unlock()
+}
+
+// recordGateRejection counts a rejected keyed request by reason so the live
+// summary can show WHY capacity was refused: a full queue (queueFull) is a
+// different operational signal from a deadline (queueTimeout) and a client
+// that gave up (clientCancel). Callers map their own sentinel/ctx error.
+func (a *sessionAdmission) recordGateRejection(reason string) {
+	a.mu.Lock()
+	switch reason {
+	case "session-admission-queue-full":
+		a.rejQueueFull++
+	case "session-admission-timeout":
+		a.rejQueueTimeout++
+	case "client-cancel":
+		a.rejClientCancel++
+	}
+	a.mu.Unlock()
 }
 
 func (a *sessionAdmission) waiterTimeout(w *sessionAdmissionWaiter) {
@@ -2959,8 +3115,10 @@ func (t *sessionAdmissionTicket) release() {
 	})
 }
 
-// releaseLocked decrements the accepted count; on the final release it arms
-// the idle expiry. Caller holds mu.
+// releaseLocked decrements the accepted count; on the final release the
+// lease goes idle and the queue drains IMMEDIATELY: a live queued newcomer
+// reclaims the freed (or oldest other idle) slot without waiting for an
+// arrival, a polling tick, or the TTL. Caller holds mu.
 func (a *sessionAdmission) releaseLocked(l *sessionAdmissionLease) {
 	if l.count > 0 {
 		l.count--
@@ -2971,10 +3129,14 @@ func (a *sessionAdmission) releaseLocked(l *sessionAdmissionLease) {
 	l.idle = true
 	l.idleSince = a.clock.Now()
 	l.gen++
-	a.rearmIdleLocked(l)
-	// A newly idle lease may unblock nothing directly (the queue drains on
-	// any terminal path). drainLocked is a no-op when nothing is eligible.
 	a.drainLocked()
+	// Arm the idle expiry only if this exact lease survived the drain:
+	// the drain may have reclaimed it (replaced, timer stopped,
+	// generation bumped), and a just-rearmed timer would be wasted
+	// churn in that case.
+	if cur, ok := a.leaseMap[l.key]; ok && cur == l && l.idle {
+		a.rearmIdleLocked(l)
+	}
 }
 
 // pruneIdleLocked removes every due idle lease (count 0, now >= idleSince+ttl)
@@ -3023,7 +3185,8 @@ func (a *sessionAdmission) drainLocked() {
 			continue
 		}
 		// Grant decision: an existing (unexpired) lease turns around
-		// immediately; a new identity needs a free identity slot.
+		// immediately; a new identity needs a free identity slot —
+		// reclaiming the oldest idle lease when the cap is full.
 		if l, ok := a.leaseMap[w.key]; ok {
 			if l.idle && !a.clock.Now().Before(l.idleSince.Add(a.ttl)) {
 				// Idle lease due: prune it in place; re-decide below as a
@@ -3039,7 +3202,11 @@ func (a *sessionAdmission) drainLocked() {
 				continue
 			}
 		}
-		if len(a.leaseMap) < a.maxAdmitted {
+		grant := len(a.leaseMap) < a.maxAdmitted
+		if !grant {
+			grant = a.reclaimOldestIdleLocked()
+		}
+		if grant {
 			a.queue.Remove(front)
 			// grantWaiterLocked bumps count to 1: start at 0 so the
 			// grant's single ticket balances.
@@ -3127,6 +3294,96 @@ func (a *sessionAdmission) idleExpiry(lease *sessionAdmissionLease, gen uint64) 
 	lease.timer = nil
 	a.drainLocked()
 	a.mu.Unlock()
+}
+
+// admissionFrame is the manager's authoritative aggregate state, copied
+// under mu. No lease keys or waiter identities leave the manager.
+type admissionFrame struct {
+	MaxAdmitted    int   `json:"maxAdmitted"`
+	MaxWaiting     int   `json:"maxWaiting"`
+	IdleTTLms      int64 `json:"idleTTLms"`
+	Active         int   `json:"active"`
+	Idle           int   `json:"idle"`
+	Waiting        int   `json:"waiting"`
+	OldestWaitMs   int64 `json:"oldestWaitMs"`
+	ReclaimedTotal int64 `json:"reclaimedTotal"`
+	// Gate-wait telemetry (the admission gate only, not downstream gates):
+	// lifetime mean (GateWaitMs = total/count), trailing-30s window
+	// (GateWaitTrailMs / GateWaitTrailCount → live mean), and the
+	// rejection breakdown — queue-full vs queue-timeout vs client-cancel.
+	GateWaitMs       int64 `json:"gateWaitMs"`
+	GateWaitTotalMs  int64 `json:"gateWaitTotalMs"`
+	GateWaitCount    int64 `json:"gateWaitCount"`
+	GateWaitTrailMs  int64 `json:"gateWaitTrailMs"`
+	GateWaitTrailCnt int64 `json:"gateWaitTrailCnt"`
+	RejQueueFull     int64 `json:"rejQueueFull"`
+	RejQueueTimeout  int64 `json:"rejQueueTimeout"`
+	RejClientCancel  int64 `json:"rejClientCancel"`
+}
+
+// aggregateSnapshot copies the admission state for the live frame and /stats
+// without pruning, draining, or granting — a snapshot read cannot mutate.
+// Active counts leases with accepted requests (count > 0), idle counts
+// idle && count == 0. Waiting counts live waiters (the same predicate the
+// capacity checks use); oldest is the maximum age among them, zero when
+// none.
+func (a *sessionAdmission) aggregateSnapshot() admissionFrame {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	f := admissionFrame{
+		MaxAdmitted:    a.maxAdmitted,
+		MaxWaiting:     a.maxWaiting,
+		IdleTTLms:      int64(a.ttl / time.Millisecond),
+		ReclaimedTotal: a.reclaimedTotal,
+	}
+	now := a.clock.Now()
+	for _, l := range a.leaseMap {
+		if l.count > 0 {
+			f.Active++
+		} else if l.idle {
+			f.Idle++
+		}
+	}
+	var oldest time.Time
+	for e := a.queue.Front(); e != nil; e = e.Next() {
+		w := e.Value.(*sessionAdmissionWaiter)
+		if !a.waiterLiveLocked(w, now) {
+			continue
+		}
+		f.Waiting++
+		if w.enqueuedAt.Before(oldest) {
+			oldest = w.enqueuedAt
+		}
+	}
+	if !oldest.IsZero() {
+		f.OldestWaitMs = int64(now.Sub(oldest) / time.Millisecond)
+		if f.OldestWaitMs < 0 {
+			f.OldestWaitMs = 0
+		}
+	}
+	f.GateWaitTotalMs = a.gateWaitMs
+	f.GateWaitCount = a.gateWaitCount
+	if a.gateWaitCount > 0 {
+		f.GateWaitMs = a.gateWaitMs / a.gateWaitCount
+	}
+	// Trailing-30s live window: the fixed-capacity ring drops the oldest
+	// samples on a burst, never grows. Wall clock (see recordGateWait).
+	nowMs := time.Now().UnixMilli()
+	cutoff := nowMs - 30_000
+	var trailMs, trailCnt int64
+	for i := range a.gateWaitSamples {
+		s := &a.gateWaitSamples[i]
+		if s.at > cutoff && s.at <= nowMs {
+			trailMs += s.dur
+			trailCnt++
+		}
+	}
+	f.GateWaitTrailMs = trailMs
+	f.GateWaitTrailCnt = trailCnt
+	f.RejQueueFull = a.rejQueueFull
+	f.RejQueueTimeout = a.rejQueueTimeout
+	f.RejClientCancel = a.rejClientCancel
+	return f
 }
 
 // snapshot is the registry-side read: does this key currently hold a
@@ -3620,17 +3877,18 @@ func main() {
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	type stat struct {
-		Name            string  `json:"name"`
-		URL             string  `json:"url"`
-		Tier            int     `json:"tier"`
-		INFlight        int32   `json:"inFlight"`
-		MaxConcurrent   int32   `json:"maxConcurrent"`
-		Waiting         int32   `json:"waiting"`
-		MaxQueueDepth   int32   `json:"maxQueueDepth"`
-		PrefillInFlight int32   `json:"prefillInFlight"`
-		PrefillWaiting  int32   `json:"prefillWaiting"`
-		PrefillMax      int32   `json:"prefillMax"`
-		AvgDurationS    float64 `json:"avgDurationS"`
+		Name            string          `json:"name"`
+		URL             string          `json:"url"`
+		Tier            int             `json:"tier"`
+		INFlight        int32           `json:"inFlight"`
+		MaxConcurrent   int32           `json:"maxConcurrent"`
+		Waiting         int32           `json:"waiting"`
+		MaxQueueDepth   int32           `json:"maxQueueDepth"`
+		PrefillInFlight int32           `json:"prefillInFlight"`
+		PrefillWaiting  int32           `json:"prefillWaiting"`
+		PrefillMax      int32           `json:"prefillMax"`
+		AvgDurationS    float64         `json:"avgDurationS"`
+		Admission       *admissionFrame `json:"admission"`
 	}
 	t0Inflight := tier0Inflight()
 
@@ -3657,6 +3915,10 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 			PrefillMax:      pMax,
 			AvgDurationS:    durations[b.Name].avgSeconds(),
 		})
+		if mgr := sessionAdmissions[b.Name]; mgr != nil {
+			af := mgr.aggregateSnapshot()
+			stats[len(stats)-1].Admission = &af
+		}
 	}
 
 	gUsed, gMax, gWaiting := 0, 0, 0
@@ -3836,6 +4098,13 @@ func estimateRetryAfter(name string) int {
 // across restarts (atomic snapshot, series only — lifetime counters stay
 // process-scoped per the contract).
 
+// The field set is the superset of the live frame's capacity figures: the
+// original 25 router/engine series plus the admission-gate gauges (the
+// frozen admissionFrame) and the fleet GPU-budget figures, so the live edge
+// and stored history cannot diverge. Counting the new series: 2 router
+// queue caps + 14 admission + 3 GPU budget = 19, for 44 total. (The plan's
+// "25→50" tally is unrecoverable from the dropped history; 44 is the
+// faithful superset. uint64 flags because 44 > 32.)
 const (
 	hiInFlight = iota
 	hiWaiting
@@ -3862,6 +4131,26 @@ const (
 	hiWeightMemGB
 	hiHitRate
 	hiEngTTFT
+	// New capacity series (25 → 44).
+	hiMaxQueueDepth
+	hiPrefillMax
+	hiAdmMaxAdmitted
+	hiAdmMaxWaiting
+	hiAdmActive
+	hiAdmIdle
+	hiAdmWaiting
+	hiAdmOldestWaitMs
+	hiAdmGateWaitMs
+	hiAdmGateWaitTotalMs
+	hiAdmGateWaitCount
+	hiAdmGateWaitTrailMs
+	hiAdmGateWaitTrailCnt
+	hiAdmRejQueueFull
+	hiAdmRejQueueTimeout
+	hiAdmRejClientCancel
+	hiGpuUsed
+	hiGpuBudget
+	hiGpuWaiting
 	histFieldN
 )
 
@@ -3871,17 +4160,37 @@ var histFieldNames = [histFieldN]string{
 	"engineRunning", "engineWaiting", "prefillTokS", "prefillCacheTokS",
 	"decodeTokS", "kvPct", "kvHeldPct", "kvMax", "kvUsedTok", "kvCapTok",
 	"kvMemGB", "weightMemGB", "hitRate", "engineTTFTMs",
+	"maxQueueDepth", "prefillMax",
+	"admissionMaxAdmitted", "admissionMaxWaiting", "admissionActive",
+	"admissionIdle", "admissionWaiting", "admissionOldestWaitMs",
+	"admissionGateWaitMs", "admissionGateWaitTotalMs", "admissionGateWaitCount",
+	"admissionGateWaitTrailMs", "admissionGateWaitTrailCnt",
+	"admissionRejQueueFull", "admissionRejQueueTimeout",
+	"admissionRejClientCancel",
+	"gpuUsed", "gpuBudget", "gpuWaiting",
 }
 
-var histMaxFields = [histFieldN]bool{hiTTFTMax: true, hiKVMax: true}
+// Max-rollup series: kvMax and ttftMax (existing) plus the admission
+// oldest-wait (a pressure peak, not a level) — the plan's "max-rollup
+// oldest". Everything else rolls up as an average.
+var histMaxFields = [histFieldN]bool{
+	hiTTFTMax: true, hiKVMax: true, hiAdmOldestWaitMs: true,
+}
 
-// historyPoint is compact and fixed-layout (~108 B). Flags records which
-// fields were observed; an absent bit serializes as null, never 0.
+// historyPoint is compact and fixed-layout (~200 B with the capacity
+// superset). Flags records which fields were observed; an absent bit
+// serializes as null, never 0. uint64 because the field count (44) exceeds
+// the 32 bits of the old layout — the capacity series would not fit.
 type historyPoint struct {
 	T     int64
 	V     [histFieldN]float32
-	Flags uint32
+	Flags uint64
 }
+
+// histFieldNames and histMaxFields are fixed-length [histFieldN] arrays: the
+// Go compiler rejects a name/max element-count mismatch at build time, so
+// extending the field set without updating both is a compile error, not a
+// silent misalignment of the series map.
 
 // hpSet stores v in field i, rejecting values that overflow float32:
 // a finite float64 past float32 max narrows to ±Inf and json.Marshal
@@ -3903,7 +4212,7 @@ type histAccum struct {
 	sum   [histFieldN]float64
 	max   [histFieldN]float32
 	n     [histFieldN]int32
-	flags uint32
+	flags uint64
 }
 
 func (a *histAccum) add(p historyPoint) {
@@ -4202,7 +4511,7 @@ func (h *historyStore) sample() {
 		p.T = now
 		s.add(p, now)
 	}
-	fp := pointFromTotals(f.Totals)
+	fp := pointFromTotals(f.Totals, f.GPU)
 	fp.T = now
 	h.fleet.add(fp, now)
 	for _, d := range f.GPUDevices {
@@ -4235,8 +4544,10 @@ func pointFromBackend(b backendFrame) historyPoint {
 	hpSet(&p, hiInFlight, float64(b.InFlight))
 	hpSet(&p, hiWaiting, float64(b.Waiting))
 	hpSet(&p, hiMaxConc, float64(b.MaxConcurrent))
+	hpSet(&p, hiMaxQueueDepth, float64(b.MaxQueueDepth))
 	hpSet(&p, hiPrefillInFlight, float64(b.PrefillInFlight))
 	hpSet(&p, hiPrefillWaiting, float64(b.PrefillWaiting))
+	hpSet(&p, hiPrefillMax, float64(b.PrefillMax))
 	hpSet(&p, hiReqRate, b.ReqRate)
 	hpSet(&p, hiTokEstRate, b.TokEstRate)
 	if b.EWMAms > 0 {
@@ -4276,15 +4587,44 @@ func pointFromBackend(b backendFrame) historyPoint {
 			hpSet(&p, hiEngTTFT, e.TTFTms)
 		}
 	}
+	// Admission-gate gauges: set only when session admission is enabled for
+	// this backend (Admission != nil), so a disabled backend's series stay
+	// null (never 0) — matching the live frame's null-when-disabled contract.
+	if adm := b.Admission; adm != nil {
+		hpSet(&p, hiAdmMaxAdmitted, float64(adm.MaxAdmitted))
+		hpSet(&p, hiAdmMaxWaiting, float64(adm.MaxWaiting))
+		hpSet(&p, hiAdmActive, float64(adm.Active))
+		hpSet(&p, hiAdmIdle, float64(adm.Idle))
+		hpSet(&p, hiAdmWaiting, float64(adm.Waiting))
+		hpSet(&p, hiAdmOldestWaitMs, float64(adm.OldestWaitMs))
+		hpSet(&p, hiAdmGateWaitMs, float64(adm.GateWaitMs))
+		hpSet(&p, hiAdmGateWaitTotalMs, float64(adm.GateWaitTotalMs))
+		hpSet(&p, hiAdmGateWaitCount, float64(adm.GateWaitCount))
+		hpSet(&p, hiAdmGateWaitTrailMs, float64(adm.GateWaitTrailMs))
+		hpSet(&p, hiAdmGateWaitTrailCnt, float64(adm.GateWaitTrailCnt))
+		hpSet(&p, hiAdmRejQueueFull, float64(adm.RejQueueFull))
+		hpSet(&p, hiAdmRejQueueTimeout, float64(adm.RejQueueTimeout))
+		hpSet(&p, hiAdmRejClientCancel, float64(adm.RejClientCancel))
+	}
 	return p
 }
 
-func pointFromTotals(t totalsFrame) historyPoint {
+func pointFromTotals(t totalsFrame, g gpuFrame) historyPoint {
 	var p historyPoint
 	hpSet(&p, hiInFlight, float64(t.InFlight))
 	hpSet(&p, hiWaiting, float64(t.Waiting))
+	// Fleet rollup of active admissions (0 when no backend enables admission;
+	// a level, so it is never a "hole").
+	hpSet(&p, hiAdmActive, float64(t.AdmActive))
 	hpSet(&p, hiReqRate, t.ReqRate)
 	hpSet(&p, hiTokEstRate, t.TokEstRate)
+	// Fleet GPU-budget (the router's own admission view): set only when the
+	// budget is active (tier-0 running), matching the live frame's GPU gate.
+	if g.Active {
+		hpSet(&p, hiGpuUsed, float64(g.Used))
+		hpSet(&p, hiGpuBudget, float64(g.Budget))
+		hpSet(&p, hiGpuWaiting, float64(g.Waiting))
+	}
 	if t.TTFTSampleCount > 0 {
 		hpSet(&p, hiTTFT, t.TTFTMs)
 		hpSet(&p, hiTTFTMax, t.TTFTMs)
@@ -4520,14 +4860,40 @@ func buildGPUSeries(key string, meta gpuDeviceFrame, pts []gpuPoint, from, stepM
 
 // ── Persistence (optional, atomic snapshot) ──────────────────────────────
 
-const historySnapshotVersion = 2
+const historySnapshotVersion = 3
 
-type histSeriesSnap struct {
-	Raw, Minute, Hour []historyPoint
+// V2 wire layout. historyPoint grew from 25 fields / uint32 flags (V2) to
+// 44 fields / uint64 flags (V3), so a V2 snapshot must not decode into the
+// current type. The original 25 field indices are UNCHANGED in V3, so the
+// migration copies each point's first 25 values and its uint32 flags
+// straight across; the 19 new capacity fields stay null (never 0) — an old
+// snapshot has no capacity data.
+const v2FieldN = 25
+
+type histPointV2 struct {
+	T     int64
+	V     [v2FieldN]float32
+	Flags uint32
+}
+
+type histSeriesSnapV2 struct {
+	Raw, Minute, Hour []histPointV2
 }
 
 type histGPUSnap struct {
 	Raw, Minute, Hour []gpuPoint
+}
+
+type historySnapshotV2 struct {
+	Version  int
+	SavedAt  int64
+	Backends map[string]histSeriesSnapV2
+	Fleet    histSeriesSnapV2
+	GPUs     map[string]histGPUSnap
+}
+
+type histSeriesSnap struct {
+	Raw, Minute, Hour []historyPoint
 }
 
 type historySnapshot struct {
@@ -4536,6 +4902,57 @@ type historySnapshot struct {
 	Backends map[string]histSeriesSnap
 	Fleet    histSeriesSnap
 	GPUs     map[string]histGPUSnap
+}
+
+// histPointV2toV3 maps a V2 point onto the V3 layout: the 25 shared indices
+// are copied verbatim (V2's uint32 flags are a subset of V3's uint64), and
+// the new capacity fields remain unset (null).
+func histPointV2toV3(p histPointV2) historyPoint {
+	var q historyPoint
+	q.T = p.T
+	q.Flags = uint64(p.Flags)
+	for i := 0; i < v2FieldN; i++ {
+		q.V[i] = p.V[i]
+	}
+	return q
+}
+
+// decodeHistoryV2 reads a V2 snapshot (the uint32/25-field layout) and
+// converts it to the V3 layout. The GPU point layout never changed, so it is
+// reused as-is. Any decode error means "not a V2 snapshot" — the caller
+// falls back to the V3 reader.
+func decodeHistoryV2(r io.Reader) (historySnapshot, bool) {
+	var v2 historySnapshotV2
+	if err := gob.NewDecoder(r).Decode(&v2); err != nil || v2.Version != 2 {
+		return historySnapshot{}, false
+	}
+	snap := historySnapshot{Version: historySnapshotVersion, SavedAt: v2.SavedAt}
+	snap.Fleet = histSeriesSnap{
+		Raw:    histPointsV2toV3(v2.Fleet.Raw),
+		Minute: histPointsV2toV3(v2.Fleet.Minute),
+		Hour:   histPointsV2toV3(v2.Fleet.Hour),
+	}
+	snap.Backends = make(map[string]histSeriesSnap, len(v2.Backends))
+	for name, s := range v2.Backends {
+		snap.Backends[name] = histSeriesSnap{
+			Raw:    histPointsV2toV3(s.Raw),
+			Minute: histPointsV2toV3(s.Minute),
+			Hour:   histPointsV2toV3(s.Hour),
+		}
+	}
+	snap.GPUs = make(map[string]histGPUSnap, len(v2.GPUs))
+	for key, s := range v2.GPUs {
+		snap.GPUs[key] = s
+	}
+	return snap, true
+}
+
+func histPointsV2toV3(in []histPointV2) []historyPoint {
+	out := make([]historyPoint, len(in))
+	for i, p := range in {
+		out[i] = histPointV2toV3(p)
+	}
+	return out
 }
 
 func (h *historyStore) snapshotLocked() historySnapshot {
@@ -4609,10 +5026,26 @@ func (h *historyStore) loadSnapshot(path string) {
 		return
 	}
 	defer f.Close()
-	var snap historySnapshot
-	if err := gob.NewDecoder(f).Decode(&snap); err != nil || snap.Version != historySnapshotVersion {
-		log.Printf("history: ignoring %s (bad snapshot or version)", path)
+	// Read the whole snapshot once so a V2 file can be tried after a failed
+	// V3 decode (the layouts differ, so one byte stream feeds both readers).
+	data, err := io.ReadAll(f)
+	if err != nil {
+		log.Printf("history: cannot read %s (continuing in memory): %v", path, err)
 		return
+	}
+	var snap historySnapshot
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&snap); err != nil ||
+		snap.Version != historySnapshotVersion {
+		// Not the current layout: a V2 snapshot (25 fields, uint32 flags)
+		// migrates to V3 preserving the shared 25 series; anything else is
+		// dropped.
+		if migrated, ok := decodeHistoryV2(bytes.NewReader(data)); ok {
+			snap = migrated
+			log.Printf("history: migrated V2 snapshot from %s", path)
+		} else {
+			log.Printf("history: ignoring %s (bad snapshot or version)", path)
+			return
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -4697,6 +5130,9 @@ func applyFleetAggregates(f *metricsFrame) {
 		if b.TTFTSampleCount > 0 {
 			ttftW += b.TTFTms * float64(b.TTFTSampleCount)
 			ttftN += float64(b.TTFTSampleCount)
+		}
+		if b.Admission != nil {
+			t.AdmActive += int32(b.Admission.Active)
 		}
 	}
 	if ttftN > 0 {
@@ -5003,30 +5439,40 @@ func parseGPUDevices(samples []promSample) []gpuDeviceFrame {
 // ─── /metrics/stream (SSE) + /metrics/burst ───────────────────────────────
 
 type backendFrame struct {
-	Name            string     `json:"name"`
-	URL             string     `json:"url"`
-	Tier            int        `json:"tier"`
-	InFlight        int32      `json:"inFlight"`
-	MaxConcurrent   int32      `json:"maxConcurrent"`
-	Waiting         int32      `json:"waiting"`
-	MaxQueueDepth   int32      `json:"maxQueueDepth"`
-	PrefillInFlight int32      `json:"prefillInFlight"`
-	PrefillWaiting  int32      `json:"prefillWaiting"`
-	PrefillMax      int32      `json:"prefillMax"`
-	AvgDurationS    float64    `json:"avgDurationS"`
-	EWMAms          float64    `json:"ewmaMs"`
-	TTFTms          float64    `json:"ttftMs"`
-	TTFTSampleCount int        `json:"ttftSampleCount"`
-	TTFTMsNow       float64    `json:"ttftMsNow"`
-	ReqRate         float64    `json:"reqRate"`
-	BytesRate       float64    `json:"bytesRate"`
-	TokEstRate      float64    `json:"tokEstRate"`
-	ReqTotal        int64      `json:"reqTotal"`
-	RejectTotal     int64      `json:"rejectTotal"`
-	BytesInTotal    int64      `json:"bytesInTotal"`
-	BytesOutTotal   int64      `json:"bytesOutTotal"`
-	TokEstTotal     int64      `json:"tokEstTotal"`
-	Engine          engineView `json:"engine"`
+	Name            string  `json:"name"`
+	URL             string  `json:"url"`
+	Tier            int     `json:"tier"`
+	InFlight        int32   `json:"inFlight"`
+	MaxConcurrent   int32   `json:"maxConcurrent"`
+	Waiting         int32   `json:"waiting"`
+	MaxQueueDepth   int32   `json:"maxQueueDepth"`
+	PrefillInFlight int32   `json:"prefillInFlight"`
+	PrefillWaiting  int32   `json:"prefillWaiting"`
+	PrefillMax      int32   `json:"prefillMax"`
+	AvgDurationS    float64 `json:"avgDurationS"`
+	EWMAms          float64 `json:"ewmaMs"`
+	TTFTms          float64 `json:"ttftMs"`
+	TTFTSampleCount int     `json:"ttftSampleCount"`
+	TTFTMsNow       float64 `json:"ttftMsNow"`
+	ReqRate         float64 `json:"reqRate"`
+	BytesRate       float64 `json:"bytesRate"`
+	TokEstRate      float64 `json:"tokEstRate"`
+	ReqTotal        int64   `json:"reqTotal"`
+	RejectTotal     int64   `json:"rejectTotal"`
+	// RejectReasons: per-backend lifetime router-originated rejection counts
+	// keyed by the X-Router-Reason string (e.g. "gpu-budget-full"). Nil (JSON
+	// null) when the backend has never rejected. The capacity panel shows
+	// WHY capacity was refused; the admission gate's own breakdown lives in
+	// the admission frame.
+	RejectReasons map[string]int64 `json:"rejectReasons,omitempty"`
+	BytesInTotal  int64            `json:"bytesInTotal"`
+	BytesOutTotal int64            `json:"bytesOutTotal"`
+	TokEstTotal   int64            `json:"tokEstTotal"`
+	Engine        engineView       `json:"engine"`
+	// Admission is nil (JSON null) when session admission is disabled for
+	// this backend; an object (possibly all-zero) when enabled. Missing
+	// entirely only on servers that predate the field.
+	Admission *admissionFrame `json:"admission"`
 }
 
 type gpuFrame struct {
@@ -5074,6 +5520,11 @@ type totalsFrame struct {
 	KVCapTokN    int `json:"-"`
 	KVMemGBN     int `json:"-"`
 	WeightMemGBN int `json:"-"`
+
+	// AdmActive: fleet rollup of active session-admission leases (sum over
+	// backends with admission enabled). Feeds the fleet lane of the
+	// admission history layer; 0 when no backend has admission enabled.
+	AdmActive int32 `json:"admActive"`
 }
 
 type metricsFrame struct {
@@ -5115,10 +5566,15 @@ func buildMetricsFrame() metricsFrame {
 		bf.TokEstRate = ms.TokEstRate
 		bf.ReqTotal = ms.ReqTotal
 		bf.RejectTotal = ms.RejectedTotal
+		bf.RejectReasons = ms.RejectReasons
 		bf.BytesInTotal = ms.BytesInTotal
 		bf.BytesOutTotal = ms.BytesOutTotal
 		bf.TokEstTotal = ms.TokEstTotal
 		bf.Engine = engineMetrics.view(b.Name)
+		if mgr := sessionAdmissions[b.Name]; mgr != nil {
+			af := mgr.aggregateSnapshot()
+			bf.Admission = &af
+		}
 		f.Backends = append(f.Backends, bf)
 
 		f.Totals.InFlight += bf.InFlight
@@ -5205,6 +5661,12 @@ type burstRequestFrame struct {
 	NewTokensEst int     `json:"newTokensEst"`
 	BytesIn      int64   `json:"bytesIn"`
 	BytesOut     int64   `json:"bytesOut"`
+	// RejectReason: the X-Router-Reason for a rejected (429/499/413) request;
+	// "" for accepted ones. The RequestFeed REASON column.
+	RejectReason string `json:"rejectReason,omitempty"`
+	// GateWaitMs: admission-gate wait (keyed traffic only); 0 otherwise.
+	// The RequestFeed GATE WAIT column.
+	GateWaitMs float64 `json:"gateWaitMs"`
 }
 
 // burstLimitMax bounds the number of recent requests ?limit= may return,
@@ -5242,6 +5704,8 @@ func handleBurst(w http.ResponseWriter, r *http.Request) {
 			NewTokensEst: s.NewTokensEst,
 			BytesIn:      s.BytesIn,
 			BytesOut:     s.BytesOut,
+			RejectReason: s.RejectReason,
+			GateWaitMs:   s.GateWaitMs,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -5442,8 +5906,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		NewTokensEst: newTokens,
 		CtxTok:       ctxTok,
 	}
-	recordRejection := func(status int) {
+	recordRejection := func(status int, reason string) {
 		reqContext.Status = status
+		reqContext.RejectReason = reason
 		// Stamp T at completion, like recordRequest: a request that waited
 		// in a queue before being rejected belongs in the burst feed at
 		// the moment it was rejected, not at arrival. DurMs stays
@@ -5477,7 +5942,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s -> %s (model=%s) REJECTED: blocked by tier-0 (tier0Inflight=%d >= threshold %d)",
 			r.Method, r.URL.Path, target.Name, modelName, t0Inflight, target.BlockOnTier0)
 		write429(w, "blocked-by-tier0", target.Name, retry)
-		recordRejection(http.StatusTooManyRequests)
+		recordRejection(http.StatusTooManyRequests, "blocked-by-tier0")
 		return
 	}
 
@@ -5497,7 +5962,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 					// Cancellation wins over any concurrent queue deadline:
 					// 499, recorded only — never write to a closed client
 					// and never enter downstream admission.
-					recordRejection(499)
+					reqContext.GateWaitMs = float64(time.Since(admitStart) / time.Millisecond)
+					mgr.recordGateWait(time.Since(admitStart))
+					mgr.recordGateRejection("client-cancel")
+					recordRejection(499, "client-cancel")
 					return
 				}
 				reason := "session-admission-queue-full"
@@ -5512,8 +5980,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				}
 				log.Printf("%s %s -> %s (model=%s) 429: %s (admission wait=%v)",
 					r.Method, r.URL.Path, target.Name, modelName, reason, time.Since(admitStart))
+				reqContext.GateWaitMs = float64(time.Since(admitStart) / time.Millisecond)
+				mgr.recordGateWait(time.Since(admitStart))
+				mgr.recordGateRejection(reason)
 				write429(w, reason, target.Name, estimateRetryAfter(target.Name))
-				recordRejection(http.StatusTooManyRequests)
+				recordRejection(http.StatusTooManyRequests, reason)
 				return
 			}
 			waitMs := float64(time.Since(admitStart) / time.Millisecond)
@@ -5521,6 +5992,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				log.Printf("%s %s -> %s (model=%s) admitted by session lease (wait=%v)",
 					r.Method, r.URL.Path, target.Name, modelName, time.Since(admitStart))
 			}
+			// The gate-wait figure is the admission gate only; downstream
+			// GPU/slot/prefill queueing is NOT folded into it.
+			reqContext.GateWaitMs = waitMs
+			mgr.recordGateWait(time.Since(admitStart))
 			defer ticket.release()
 			// The lease may have waited: re-snapshot tier-0 in-flight so
 			// the GPU-budget decision below does not use the arrival-time
@@ -5540,18 +6015,28 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				r.Method, r.URL.Path, target.Name, modelName,
 				used, target.GpuWeight, maxB, t0Inflight)
 			if !gpu.tryAcquire(target.GpuWeight, 4, 5*time.Second, cancelCh) {
+				if r.Context().Err() != nil {
+					// Client gave up while waiting at the GPU gate: 499,
+					// recorded only — the client is already gone.
+					recordRejection(499, "client-cancel")
+					return
+				}
 				retry := estimateRetryAfter(target.Name)
 				log.Printf("%s %s -> %s (model=%s) 429: GPU budget full", r.Method, r.URL.Path, target.Name, modelName)
 				write429(w, "gpu-budget-full", target.Name, retry)
-				recordRejection(http.StatusTooManyRequests)
+				recordRejection(http.StatusTooManyRequests, "gpu-budget-full")
 				return
 			}
 		} else {
 			if !gpu.tryAcquire(target.GpuWeight, 4, 5*time.Second, cancelCh) {
+				if r.Context().Err() != nil {
+					recordRejection(499, "client-cancel")
+					return
+				}
 				retry := estimateRetryAfter(target.Name)
 				log.Printf("%s %s -> %s (model=%s) 429: GPU budget full (race)", r.Method, r.URL.Path, target.Name, modelName)
 				write429(w, "gpu-budget-full", target.Name, retry)
-				recordRejection(http.StatusTooManyRequests)
+				recordRejection(http.StatusTooManyRequests, "gpu-budget-full")
 				return
 			}
 		}
@@ -5568,6 +6053,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				in, maxC, waiting+1, t0Inflight)
 		}
 		if !sem.acquire(queueTimeout, cancelCh) {
+			if r.Context().Err() != nil {
+				recordRejection(499, "client-cancel")
+				return
+			}
 			retry := estimateRetryAfter(target.Name)
 			stage := "backend-full"
 			_, _, qW, qMax := sem.snapshot()
@@ -5576,7 +6065,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("%s %s -> %s (model=%s) 429: backend at capacity", r.Method, r.URL.Path, target.Name, modelName)
 			write429(w, stage, target.Name, retry)
-			recordRejection(http.StatusTooManyRequests)
+			recordRejection(http.StatusTooManyRequests, stage)
 			return
 		}
 		defer sem.release()
@@ -5607,6 +6096,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 					pin, pmaxC, pwaiting+1, prefillTokens)
 			}
 			if !prefillSem.acquire(queueTimeout, cancelCh) {
+				if r.Context().Err() != nil {
+					recordRejection(499, "client-cancel")
+					return
+				}
 				retry := estimateRetryAfter(target.Name)
 				stage := "prefill-full"
 				_, _, pqW, pqMax := prefillSem.snapshot()
@@ -5616,7 +6109,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (prefillTokens=%d)",
 					r.Method, r.URL.Path, target.Name, modelName, prefillTokens)
 				write429(w, stage, target.Name, retry)
-				recordRejection(http.StatusTooManyRequests)
+				recordRejection(http.StatusTooManyRequests, stage)
 				return
 			}
 			var prefillOnce sync.Once

@@ -7,6 +7,7 @@
   import LiveSessions from "$lib/LiveSessions.svelte";
   import BackendTable from "$lib/BackendTable.svelte";
   import RequestFeed from "$lib/RequestFeed.svelte";
+  import CapacityPanel from "$lib/CapacityPanel.svelte";
   import StaleBanner from "$lib/StaleBanner.svelte";
   import { LiveStore } from "$lib/live.svelte";
   import { HistoryStore } from "$lib/history.svelte";
@@ -315,6 +316,8 @@
         {layerId}
         onLayer={(id) => (layerId = id)}
       />
+
+      <CapacityPanel frame={live.frame} singleBackend={singleBackendName} />
 
       <div class="live-band" class:log-open={requestLogOpen} bind:this={bandEl}>
         <section class="profile-sheet sheet" aria-label={singleBackend ? "server profile" : "fleet profile"}>

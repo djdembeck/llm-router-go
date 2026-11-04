@@ -15,7 +15,15 @@ import type {
 } from "./api";
 import { nearestIndex, niceMax } from "./format";
 
-export type LayerId = "kv" | "util" | "vram" | "ttft" | "engineTtft" | "prefill" | "decode";
+export type LayerId =
+  | "kv"
+  | "util"
+  | "vram"
+  | "ttft"
+  | "engineTtft"
+  | "prefill"
+  | "decode"
+  | "admission";
 
 export interface LayerDef {
   id: LayerId;
@@ -101,6 +109,16 @@ export const LAYERS: LayerDef[] = [
     fixedMax: 100,
     note: "exporter · device memory",
   },
+  {
+    id: "admission",
+    label: "ADMISSION · ACTIVE",
+    short: "ADM",
+    unit: "",
+    source: "router",
+    device: false,
+    field: "admissionActive",
+    note: "router · session-admission leases held",
+  },
 ];
 
 export function layerById(id: LayerId): LayerDef {
@@ -136,6 +154,10 @@ function backendValue(b: BackendMetrics, layer: LayerDef): number | null {
       return e.status === "ok" ? e.prefillTokS : null;
     case "decode":
       return e.status === "ok" ? e.decodeTokS : null;
+    case "admission":
+      // null (not 0) when admission is disabled for the backend: the lane
+      // must show a hole, not a false "zero leases held".
+      return b.admission?.active ?? null;
     default:
       return null;
   }
@@ -153,6 +175,8 @@ function fleetValue(t: TotalsMetrics, layer: LayerDef): number | null {
       return t.engineOk > 0 ? t.prefillTokS : null;
     case "decode":
       return t.engineOk > 0 ? t.decodeTokS : null;
+    case "admission":
+      return t.admActive;
     default:
       return null;
   }

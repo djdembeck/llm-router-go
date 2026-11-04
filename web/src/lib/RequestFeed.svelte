@@ -61,6 +61,8 @@
       "stream",
       "ttft_ms",
       "dur_ms",
+      "gate_wait_ms",
+      "reject_reason",
       "bytes_in",
       "bytes_out",
       "new_tokens_est",
@@ -77,6 +79,8 @@
           r.stream,
           r.ttftMs.toFixed(1),
           r.durMs.toFixed(1),
+          r.gateWaitMs.toFixed(1),
+          csvEscape(r.rejectReason),
           r.bytesIn,
           r.bytesOut,
           r.newTokensEst,
@@ -137,6 +141,8 @@
             <th class="col-status num">STATUS</th>
             <th class="col-ttft num">TTFT</th>
             <th class="col-dur num">DUR</th>
+            <th class="col-gate num" title="Time in the admission gate only (keyed traffic); not the downstream GPU/slot/prefill waits">GATE</th>
+            <th class="col-reason">REASON</th>
             <th class="col-tok num">TOK <span class="tag est">est</span></th>
           </tr>
         </thead>
@@ -154,11 +160,15 @@
               <td class="col-status num {statusClass(r.status)}">{r.status}</td>
               <td class="col-ttft num">{r.ttftMs > 0 ? fmtMs(r.ttftMs) : "—"}</td>
               <td class="col-dur num">{fmtMs(r.durMs)}</td>
+              <td class="col-gate num">{r.gateWaitMs > 0 ? fmtMs(r.gateWaitMs) : "—"}</td>
+              <td class="col-reason mono {r.rejectReason ? 'warn' : ''}" title={r.rejectReason || undefined}>
+                {r.rejectReason || "—"}
+              </td>
               <td class="col-tok num">{fmtInt(r.newTokensEst)}</td>
             </tr>
           {:else}
             <tr class="empty">
-              <td colspan={singleBackend == null ? 7 : 6}>
+              <td colspan={singleBackend == null ? 9 : 8}>
                 {onlyErrors ? "no 429+ rejections in the recent ring" : "the tape is quiet"}
               </td>
             </tr>
@@ -193,20 +203,27 @@
   .feed .data-table {
     table-layout: fixed;
   }
-  .feed .data-table .col-time { width: 12%; }
-  .feed .data-table .col-backend { width: 13%; }
-  .feed .data-table .col-path { width: 30%; }
-  .feed .data-table .col-status { width: 8%; }
-  .feed .data-table .col-ttft { width: 10%; }
-  .feed .data-table .col-dur { width: 10%; }
+  .feed .data-table .col-time { width: 10%; }
+  .feed .data-table .col-backend { width: 12%; }
+  .feed .data-table .col-path { width: 24%; }
+  .feed .data-table .col-status { width: 7%; }
+  .feed .data-table .col-ttft { width: 8%; }
+  .feed .data-table .col-dur { width: 8%; }
+  .feed .data-table .col-gate { width: 7%; }
+  .feed .data-table .col-reason { width: 14%; }
   .feed .data-table .col-tok { width: 9%; }
   /* The backend column is omitted in single-server mode; PATH absorbs its share. */
-  .feed .data-table.single .col-path { width: 43%; }
+  .feed .data-table.single .col-path { width: 36%; }
   .path {
     max-width: 220px;
     overflow: hidden;
     text-overflow: ellipsis;
     color: var(--ink-3);
+  }
+  .col-reason {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .data-table td.ok {
     color: var(--moss);
@@ -229,7 +246,9 @@
     font-size: 10px;
   }
   @media (max-width: 639px) {
-    .col-path {
+    .col-path,
+    .col-gate,
+    .col-reason {
       display: none;
     }
     .foot {

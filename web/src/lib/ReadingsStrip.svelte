@@ -75,6 +75,9 @@
     engineOk ? (averages?.decodeTokS ?? totals?.decodeTokS ?? null) : null,
   );
   const kvNow = $derived(engineOk ? (totals?.kvPeak ?? null) : null);
+  // Active session-admission leases (fleet rollup). 0 when no backend
+  // enables admission — that is a true zero, not a hole.
+  const admNow = $derived(liveTotals?.admActive ?? 0);
   const poolUsed = $derived(
     m?.backends.every((b) => b.engine.status !== "ok" || b.engine.kvUsedTok != null)
       ? totals?.kvUsedTok
@@ -143,6 +146,26 @@
         </span>
       </div>
     </div>
+
+    <button
+      class="cell"
+      class:on={layerId === "admission"}
+      aria-pressed={layerId === "admission"}
+      onclick={() => onLayer("admission")}
+      title="Active session-admission leases (fleet). Click for the history profile; the Capacity panel shows the per-backend lease/gate breakdown."
+    >
+      <div class="top">
+        <span class="label">ADMISSION</span>
+        <span class="tags"><span class="tag router">router</span></span>
+      </div>
+      <div class="val">
+        <TweenNumber class="value" value={admNow} format={fmtInt} />
+        <span class="unit">leases</span>
+      </div>
+      <div class="sub mono">
+        held · session-admission
+      </div>
+    </button>
 
     <button
       class="cell"
@@ -296,7 +319,8 @@
 <style>
   .readings {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    /* 7 cells: running, waiting, admission, ttft, prefill, decode, kv. */
+    grid-template-columns: repeat(7, minmax(0, 1fr));
     background: var(--panel);
     border-bottom: 1px solid var(--rule);
   }
@@ -397,12 +421,12 @@
   }
   @media (max-width: 1199px) {
     .readings {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
     }
-    .cell:nth-child(3n) {
+    .cell:nth-child(4n) {
       border-right: 0;
     }
-    .cell:nth-child(-n + 3) {
+    .cell:nth-child(-n + 4) {
       border-bottom: 1px solid var(--rule);
     }
   }

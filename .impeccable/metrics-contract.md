@@ -54,6 +54,25 @@ Frame schema (all numbers are `int`/`float64` as Go serializes them):
       "bytesInTotal": 2100000,
       "bytesOutTotal": 158000000,
       "tokEstTotal": 8812345,
+      "rejectReasons": {"gpu-budget-full": 12, "queue-timeout": 3},
+      "admission": {
+        "maxAdmitted": 4,
+        "maxWaiting": 8,
+        "idleTTLms": 30000,
+        "active": 2,
+        "idle": 1,
+        "waiting": 0,
+        "oldestWaitMs": 0,
+        "reclaimedTotal": 5,
+        "gateWaitMs": 12,
+        "gateWaitTotalMs": 1440,
+        "gateWaitCount": 120,
+        "gateWaitTrailMs": 360,
+        "gateWaitTrailCnt": 40,
+        "rejQueueFull": 0,
+        "rejQueueTimeout": 3,
+        "rejClientCancel": 1
+      },
       "engine": {
         "status": "ok",
         "engine": "vllm",
@@ -126,7 +145,8 @@ Frame schema (all numbers are `int`/`float64` as Go serializes them):
     "reqTotal": 1043,
     "bytesInTotal": 2100000,
     "bytesOutTotal": 158000000,
-    "tokEstTotal": 8812345
+    "tokEstTotal": 8812345,
+    "admActive": 3
   }
 }
 ```
@@ -139,9 +159,11 @@ Field semantics (A implements, B displays):
 - `ttftMs` / `ttftSampleCount` — per-backend EWMA (milliseconds) of **time-to-first-byte**, measured ONLY for streaming requests (first response byte minus request start). `ttftSampleCount` is the number of streaming samples behind the EWMA; `0` means "no streaming samples yet" → client renders "—" not "0". The EWMA updates at first response byte (while the request is still live), not at completion. `ttftMsNow` is the most recent single first-byte sample (ms) — the live readout value, no smoothing; `0` until the first streaming first-byte is seen.
 - `reqRate` / `bytesRate` / `tokEstRate` — per-backend **live arrival rates**, requests/second, admitted request-bytes/second, and **estimated new prefill tokens/second** (see honest-boundary note). Computed server-side as a trailing 30 s arrival average from 300 × 100 ms demand buckets, evaluated every 500 ms: `rate = Σ(window demand) / 30`. Completion never subtracts; a bucket leaves the window at the hard 30 s cutoff. See the 2026-10-21 revision below. The rate therefore tracks ARRIVAL, not completion — a long decode contributes its true admission rate from the moment it is accepted, and the tail lingers ~30s after traffic stops instead of spiking to 2×-per-tick and collapsing to zero. Router-originated rejections (429/413) never enter the window — they are not backend demand.
 - `reqTotal` / `bytesInTotal` / `bytesOutTotal` / `tokEstTotal` — monotonically increasing counters since process start (bytesIn = request body bytes, bytesOut = response body bytes actually written, tokEst = sum of `estimateNewTokens` over accepted requests).
+- `rejectReasons` — per-backend **lifetime** router-originated rejection counts keyed by the `X-Router-Reason` string (e.g. `gpu-budget-full`, `session-admission-queue-full`). `null` (JSON) when the backend has never rejected. This is the downstream gate breakdown (GPU budget, slot, queue, prefill); the admission gate's OWN breakdown lives in `admission`.
+- `admission` — the authoritative per-backend session-admission (lease) snapshot, **nil (JSON `null`) when session admission is disabled for this backend**; an object (possibly all-zero) when enabled. Present on servers that support it; absent only on older servers. Fields: `maxAdmitted` (per-backend identity cap), `maxWaiting` (distinct-by-arrival queue bound; 0 rejects newcomers), `idleTTLms` (`SESSION_IDLE_TTL`), `active` (leases with an accepted in-flight request), `idle` (idle leases retaining their slot), `waiting` (live waiters — the same predicate the capacity checks use), `oldestWaitMs` (max age among live waiters, 0 when none), `reclaimedTotal` (pressure reclaims, process lifetime). Gate-wait telemetry is the admission gate ONLY (downstream GPU/slot/prefill queueing is NOT folded in): `gateWaitMs` = lifetime mean ms (`gateWaitTotalMs/gateWaitCount`), `gateWaitTotalMs`/`gateWaitCount` lifetime sum/count, `gateWaitTrailMs`/`gateWaitTrailCnt` the trailing-30s window (live mean = `gateWaitTrailMs/gateWaitTrailCnt`). Rejection breakdown: `rejQueueFull` / `rejQueueTimeout` / `rejClientCancel`. A snapshot read cannot mutate — it never prunes, drains, or grants.
 - `gpu.used` / `gpu.budget` / `gpu.waiting` — live GPU-budget weighted state. `gpu.active` is `true` when `tier0Inflight > 0`. When no GPU budget is configured, `gpu.budget` is `0` and `active` is `false`.
 - `tier0Inflight` — total in-flight across all tier-0 backends.
-- `totals.*` — sum across backends (inFlight, waiting) plus aggregate rates/counters.
+- `totals.*` — sum across backends (inFlight, waiting) plus aggregate rates/counters. `totals.admActive` is the fleet rollup of active session-admission leases (sum over backends with admission enabled; 0 when none enable it) — the fleet value for the admission history layer and the ADMISSION readings cell.
 - `engine` (v2) — the backend's OWN execution truth, scraped from its Prometheus `/metrics` endpoint at 1s (vLLM: always on; SGLang: only when started with `--enable-metrics`). Full field table below.
 
 ### Engine v2 field table
@@ -214,7 +236,9 @@ tape.
       "ttftMs": 320,
       "newTokensEst": 512,
       "bytesIn": 2048,
-      "bytesOut": 158000
+      "bytesOut": 158000,
+      "rejectReason": "gpu-budget-full",
+      "gateWaitMs": 120.5
     }
   ]
 }
@@ -224,6 +248,8 @@ tape.
 - `t` is the completion time for every sample, including router-originated rejections: a 429 that waited in the queue is stamped at the moment it was rejected, not at arrival.
 - `ttftMs` is `0` for non-streaming and for router-originated rejections.
 - `durMs` for a router-originated 429 is the queue-wait time before rejection (arrival → rejection); `t` − `durMs` is the arrival instant.
+- `rejectReason` — the `X-Router-Reason` string for a router-originated rejection (429/413/499); omitted for accepted requests. The RequestFeed REASON column.
+- `gateWaitMs` — the admission-gate wait only, in ms (keyed, session-admission traffic); `0` for unkeyed/disabled traffic. This is the router's OWN queue pressure, NOT the downstream GPU/slot/prefill waits. The RequestFeed GATE WAIT column.
 
 ## 3. GET /metrics/sessions
 
@@ -518,10 +544,20 @@ Response:
       "decodeTokS": [null], "kvPct": [null], "kvHeldPct": [null],
       "kvMax": [null], "kvUsedTok": [null], "kvCapTok": [null],
       "kvMemGB": [null], "weightMemGB": [null], "hitRate": [null],
-      "engineTTFTMs": [null]
+      "engineTTFTMs": [null],
+      "maxQueueDepth": [null], "prefillMax": [null],
+      "admissionMaxAdmitted": [null], "admissionMaxWaiting": [null],
+      "admissionActive": [null], "admissionIdle": [null],
+      "admissionWaiting": [null], "admissionOldestWaitMs": [null],
+      "admissionGateWaitMs": [null], "admissionGateWaitTotalMs": [null],
+      "admissionGateWaitCount": [null], "admissionGateWaitTrailMs": [null],
+      "admissionGateWaitTrailCnt": [null], "admissionRejQueueFull": [null],
+      "admissionRejQueueTimeout": [null], "admissionRejClientCancel": [null],
+      "gpuUsed": [null], "gpuBudget": [null], "gpuWaiting": [null]
     }
   }],
-  "fleet": {"name": "fleet", "t": [0], "series": {}},
+  "fleet": {"name": "fleet", "t": [0], "series": {"gpuUsed": [null],
+             "gpuBudget": [null], "gpuWaiting": [null]}},
   "gpu": [{"key": "", "index": 0, "name": "", "source": "",
            "t": [0], "series": {"utilPct": [null], "memUsedMB": [null],
            "memTotalMB": [null], "tempC": [null], "powerW": [null]}}],
@@ -534,9 +570,30 @@ Response:
 (`ttftMs > 0`) in the router's 4096-sample ring; `coverageMs` is the actual
 span of those samples, so the client must not claim a full-five-minute
 percentile when the ring covers less. Rollups store averages for
-gauges/rates and maxima for `kvMax`/`ttftMax`. The history sampler runs once
-per second independent of SSE clients and shares the fleet aggregation with
-the live frame.
+gauges/rates and maxima for `kvMax`/`ttftMax`/`admissionOldestWaitMs`. The
+history sampler runs once per second independent of SSE clients and shares
+the fleet aggregation with the live frame.
+
+**Additive capacity series (25 → 44 fields).** Per backend, 19 new series
+mirror the live `admission`/router-slot/GPU-budget state: `maxQueueDepth`,
+`prefillMax` (router slot limits, 0 = unlimited/absent);
+`admissionMaxAdmitted`/`admissionMaxWaiting` (lease caps), `admissionActive`
+/`admissionIdle`/`admissionWaiting` (lease/waiter counts),
+`admissionOldestWaitMs` (max-rollup, a pressure peak), `admissionGateWaitMs`
+(lifetime mean ms), `admissionGateWaitTotalMs`/`admissionGateWaitCount`
+(lifetime sum/count), `admissionGateWaitTrailMs`/`admissionGateWaitTrailCnt`
+(trailing-30s window), `admissionRejQueueFull`/`admissionRejQueueTimeout`/
+`admissionRejClientCancel` (gate rejection breakdown); and fleet
+`gpuUsed`/`gpuBudget`/`gpuWaiting` plus fleet `admissionActive` (the
+rollup of active leases, the same figure as `totals.admActive`). A backend
+with session admission
+disabled serializes all `admission*` series as `null` (the presence bit is
+never set) — the client renders `—`, not 0. The fleet carries the GPU-budget
+triplet. **Persistence is now version 3** (the point grew from 25 to 44
+fields and `Flags` widened `uint32` → `uint64`); a v2 snapshot is read by
+a dedicated v2 layout and the 25 shared field indices are copied verbatim
+into v3 (the new capacity fields stay null, never 0). The field set, names,
+and max-rollup membership are compile-checked (a `[histFieldN]` array).
 
 ### Dev mock
 

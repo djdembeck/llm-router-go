@@ -820,6 +820,11 @@ func TestSessionAdmission_LeaseLifecycle(t *testing.T) {
 	}
 }
 
+// TestSessionAdmission_ExpiryTimerReleasesWaiters proves the no-demand arm:
+// without any queued work an idle lease survives until just before its full
+// TTL, then the expiry timer alone (no traffic, no snapshot) frees it. The
+// demand arm (a queued newcomer reclaims the idle lease immediately, no
+// tick) is TestSessionAdmission_ImmediateReclaim.
 func TestSessionAdmission_ExpiryTimerReleasesWaiters(t *testing.T) {
 	const ttl = 5 * time.Second
 	c := newSAManualClock()
@@ -827,37 +832,143 @@ func TestSessionAdmission_ExpiryTimerReleasesWaiters(t *testing.T) {
 	ctx := context.Background()
 
 	tA, _ := a.acquire(ctx, "kA", time.Minute)
-	tA.release() // idle now; cap 1 occupies it for a full TTL
-	out := make(chan *sessionAdmissionTicket, 1)
-	go func() {
-		t3, _ := a.acquire(ctx, "kO", time.Minute)
-		out <- t3
-	}()
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case <-out:
-		t.Fatal("newcomer leaked through a retained idle lease")
-	case <-time.After(5 * time.Millisecond):
+	tA.release() // idle now; no demand, so the full TTL must elapse
+	c.Advance(ttl - time.Millisecond)
+	if held, _ := a.snapshot("kA"); !held {
+		t.Fatal("idle lease expired before its full TTL with no demand")
 	}
-	// The expiry timer — no new request, no snapshot — fires the queue.
-	c.Advance(ttl + time.Millisecond)
-	select {
-	case tk := <-out:
-		tk.release()
-	case <-time.After(2 * time.Second):
-		t.Fatal("expiry timer did not release the newcomer")
-	}
+	// The expiry timer — no new request, no snapshot — frees the slot.
+	c.Advance(2 * time.Millisecond)
 	if held, _ := a.snapshot("kA"); held {
-		t.Fatal("kA lease back after expiry")
+		t.Fatal("idle lease survived its full TTL")
+	}
+	a.mu.Lock()
+	if a.reclaimedTotal != 0 {
+		t.Fatalf("TTL expiry counted as a pressure reclaim: %d", a.reclaimedTotal)
+	}
+	a.mu.Unlock()
+}
+
+// TestSessionAdmission_ImmediateReclaim is the demand arm of idle retention:
+// a live new-identity acquisition reclaims the oldest idle lease in the
+// same critical section — no clock advance, no tick, no TTL — and only an
+// idle (count == 0) lease is ever selected.
+func TestSessionAdmission_ImmediateReclaim(t *testing.T) {
+	const ttl = 30 * time.Second
+	ctx := context.Background()
+
+	// Distinct idle timestamps: the OLDEST idle loses, the newer survives.
+	// Cap 3: all three leases coexist (A active, B and D idle) so the
+	// full-cap reclaim is the only path that can grant C.
+	c := newSAManualClock()
+	a := newSessionAdmission(3, 2, ttl, c)
+	tA, _ := a.acquire(ctx, "kA", time.Minute) // active
+	tB, _ := a.acquire(ctx, "kB", time.Minute)
+	tD, _ := a.acquire(ctx, "kD", time.Minute)
+	tB.release() // idle at T0
+	c.Advance(time.Millisecond)
+	tD.release() // idle at T0+1ms
+	// C (fresh, cap full) must be granted IMMEDIATELY, reclaiming B.
+	tC, err := a.acquire(ctx, "kC", time.Minute)
+	if err != nil {
+		t.Fatalf("C acquire: %v", err)
+	}
+	if held, _ := a.snapshot("kB"); held {
+		t.Fatal("oldest idle B survived the reclaim")
+	}
+	if held, _ := a.snapshot("kD"); !held {
+		t.Fatal("newer idle D was reclaimed instead of B")
+	}
+	if held, _ := a.snapshot("kA"); !held {
+		t.Fatal("active A was reclaimed")
+	}
+	a.mu.Lock()
+	if a.reclaimedTotal != 1 {
+		t.Fatalf("reclaimedTotal = %d, want 1", a.reclaimedTotal)
+	}
+	a.mu.Unlock()
+	tC.release()
+	tA.release()
+
+	// Equal-clock tie: the lexicographically smaller key is picked.
+	c2 := newSAManualClock()
+	a2 := newSessionAdmission(2, 2, ttl, c2)
+	tkE, _ := a2.acquire(ctx, "kE", time.Minute)
+	tkF, _ := a2.acquire(ctx, "kF", time.Minute)
+	tkE.release() // both idle at the same clock instant
+	tkF.release()
+	tkG, err := a2.acquire(ctx, "kG", time.Minute)
+	if err != nil {
+		t.Fatalf("G acquire: %v", err)
+	}
+	if held, _ := a2.snapshot("kE"); held {
+		t.Fatal("tie-break: smaller key kE should have been reclaimed")
+	}
+	if held, _ := a2.snapshot("kF"); !held {
+		t.Fatal("tie-break: larger key kF must survive")
+	}
+	tkG.release()
+
+	// maxWaiting 0 / grace 0 forbid queueing, not service: an idle lease
+	// still yields to an immediate fresh arrival.
+	c3 := newSAManualClock()
+	a3 := newSessionAdmission(1, 0, ttl, c3)
+	tkI, _ := a3.acquire(ctx, "kI", time.Minute)
+	tkI.release() // idle
+	tkN, err := a3.acquire(ctx, "kN", 0)
+	if err != nil {
+		t.Fatalf("zero-grace fresh arrival rejected despite reclaimable idle: %v", err)
+	}
+	tkN.release()
+
+	// All-active cap: nothing idle to yield — a newcomer is rejected and
+	// mints no lease.
+	a5 := newSessionAdmission(2, 0, ttl, c3)
+	tkP, _ := a5.acquire(ctx, "kP", time.Minute)
+	tkQ, _ := a5.acquire(ctx, "kQ", time.Minute)
+	if _, err := a5.acquire(ctx, "kR", time.Minute); !errors.Is(err, errSessionAdmissionQueueFull) {
+		t.Fatalf("all-active cap: err = %v, want queue-full", err)
+	}
+	if held, _ := a5.snapshot("kR"); held {
+		t.Fatal("rejected newcomer minted a lease")
+	}
+	tkQ.release()
+	tkP.release()
+
+	// Multiple accepted requests for one identity share one active lease;
+	// only the FINAL release makes it reclaimable.
+	c4 := newSAManualClock()
+	a4 := newSessionAdmission(1, 2, ttl, c4)
+	tkX1, _ := a4.acquire(ctx, "kX", time.Minute)
+	tkX2, _ := a4.acquire(ctx, "kX", time.Minute)
+	outR := make(chan error, 1)
+	go func() { _, e := a4.acquire(ctx, "kR", time.Minute); outR <- e }()
+	time.Sleep(30 * time.Millisecond)
+	tkX1.release() // count 1: still active
+	select {
+	case <-outR:
+		t.Fatal("newcomer admitted before the final same-identity release")
+	case <-time.After(50 * time.Millisecond):
+	}
+	tkX2.release() // final release: the idle lease is reclaimed by the queue
+	select {
+	case err := <-outR:
+		if err != nil {
+			t.Fatalf("newcomer terminal = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("newcomer not granted by the final release")
 	}
 }
 
-// Clock-only FIFO progression: A's idle expiry freely grants a slot,
-// and the queue head — C, confirmed enqueued before D arrives — must be
-// the one admitted. D's completion follows in the second expiry tick.
+// Clock-free FIFO progression: both cap holders are ACTIVE (real waiting
+// is tested against active leases only — idle leases yield immediately).
+// The queue head — C, confirmed enqueued before D arrives — is the one
+// admitted by A's final release; D proceeds on B's.
 func TestSessionAdmission_FIFOOrderWithoutTraffic(t *testing.T) {
 	const ttl = 10 * time.Second
 	c := newSAManualClock()
+	_ = c
 	a := newSessionAdmission(2, 5, ttl, c)
 	ctx := context.Background()
 
@@ -880,9 +991,7 @@ func TestSessionAdmission_FIFOOrderWithoutTraffic(t *testing.T) {
 	}
 
 	tA, _ := a.acquire(ctx, "kA", time.Minute)
-	tB, _ := a.acquire(ctx, "kB", time.Minute)
-	tA.release()
-	tB.release() // both idle; A idled first
+	tB, _ := a.acquire(ctx, "kB", time.Minute) // both active: no reclaim possible
 
 	out := make(chan string, 2)
 	// C enqueues first and the manager confirms the slot before D
@@ -903,30 +1012,35 @@ func TestSessionAdmission_FIFOOrderWithoutTraffic(t *testing.T) {
 	}()
 	waitFor("D queued", 2)
 
-	// Both idle expiries are due in the same manual tick: A armed first,
-	// so A's drain runs first and grants the queue head C on the freed
-	// slot; B's drain then frees the last slot and grants D. Both grants
-	// publish in one Advance, so completions race on the channel —
-	// assert the full set, order-insensitively.
-	c.Advance(ttl + time.Millisecond)
-	done := map[string]bool{}
-	deadline := time.After(2 * time.Second)
-	for len(done) < 2 {
-		select {
-		case got := <-out:
-			done[got] = true
-		case <-deadline:
-			t.Fatalf("expiries admitted %v, want C and D", done)
+	// A's FINAL release frees its slot; the queue head C is granted
+	// immediately (no expiry, no arrival, no tick).
+	tA.release()
+	select {
+	case got := <-out:
+		if got != "C" {
+			t.Fatalf("queue head grant = %s, want C (FIFO broken)", got)
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queue head C not granted by the release")
+	}
+	// D proceeds on B's release, the same way.
+	tB.release()
+	select {
+	case got := <-out:
+		if got != "D" {
+			t.Fatalf("second grant = %s, want D", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("D not granted by B's release")
 	}
 }
 
 // TestSessionAdmission_FIFOSingleExpiry tightens the no-traffic FIFO test to
-// ONE expiry at a time: B's retention lease expires first and ALONE frees
-// exactly one slot — the queue head C (enqueued before D) is the only grant,
-// and D provably stays queued; A's later expiry (armed one manual-millisecond
-// later, so its deadline is strictly separated from B's) then proceeds D,
-// while C's freshly admitted lease is certified still idle-held.
+// ONE release at a time: A's final release ALONE frees exactly one slot —
+// the queue head C (enqueued before D) is the only grant, and D provably
+// stays queued; B's later release then proceeds the queue head D by
+// RECLAIMING the oldest idle lease (B's — idle leases yield to queued
+// demand, no idle-holder immunity under pressure).
 func TestSessionAdmission_FIFOSingleExpiry(t *testing.T) {
 	const ttl = 10 * time.Second
 	c := newSAManualClock()
@@ -949,11 +1063,9 @@ func TestSessionAdmission_FIFOSingleExpiry(t *testing.T) {
 	}
 
 	tB, _ := a.acquire(ctx, "kB", time.Minute)
-	tB.release() // idle at T0; expiry armed at T0+ttl
 	T1 := c.Now()
-	c.Advance(time.Millisecond) // no timer is due
-	tA, _ := a.acquire(ctx, "kA", time.Minute)
-	tA.release() // idle at T0+1ms; expiry armed AFTER B's
+	c.Advance(time.Millisecond)                // clock separation certificate only
+	tA, _ := a.acquire(ctx, "kA", time.Minute) // both ACTIVE
 	if !c.Now().After(T1) {
 		t.Fatal("manual clock did not advance")
 	}
@@ -965,47 +1077,66 @@ func TestSessionAdmission_FIFOSingleExpiry(t *testing.T) {
 	go func() { tk, _ := a.acquire(ctx, "kD", time.Minute); dOut <- tk }()
 	waitFor("D queued", 2)
 
-	// First tick: only B is due (T0+ttl). Exactly one slot frees; the
-	// queue head C — confirmed enqueued before D — is the ONLY grant.
-	c.Advance(ttl - time.Millisecond)
+	// One release only: A's slot frees; the queue head C — confirmed
+	// enqueued before D — is the ONLY grant, immediately. C's request
+	// stays ACTIVE (we keep its ticket), so its lease is not
+	// reclaimable and D has nothing to claim.
+	tA.release()
+	var tkC *sessionAdmissionTicket
 	select {
-	case tk := <-cOut:
-		tk.release() // C idles now at T0+ttl, timer T0+ttl+ttl
+	case tkC = <-cOut:
 	case <-time.After(2 * time.Second):
-		t.Fatal("queue head C not admitted by the single B-expiry tick")
+		t.Fatal("queue head C not admitted by the single release")
 	}
 	select {
 	case <-dOut:
-		t.Fatal("D admitted on B's single expiry — FIFO order broken")
+		t.Fatal("D admitted on A's single release — FIFO order broken")
 	case <-time.After(200 * time.Millisecond):
 	}
-	if held, since := a.snapshot("kC"); !held || since.IsZero() {
-		t.Fatalf("C lease = held %v since %v, want idle-held", held, since)
+	if held, since := a.snapshot("kC"); !held || !since.IsZero() {
+		t.Fatalf("C lease = held %v since %v, want active", held, since)
 	}
 
-	// Second tick: A at T0+ttl+1ms is the ONLY other due timer — C's own
-	// expiry sits a full TTL (10s) away. D proceeds on the freed slot, and
-	// C's lease survives the tick.
-	c.Advance(2 * time.Millisecond)
+	// Second event: B's release frees the second slot; the queue head
+	// D proceeds by reclaiming B's idle lease (the oldest — it idled
+	// at T0, before any other idle). C stays active throughout.
+	tB.release()
 	select {
-	case tk := <-dOut:
-		tk.release()
+	case tkD := <-dOut:
+		tkD.release()
 	case <-time.After(2 * time.Second):
-		t.Fatal("D not admitted after the second expiry tick")
+		t.Fatal("D not admitted after the second release")
 	}
-	if held, since := a.snapshot("kC"); !held || since.IsZero() {
-		t.Fatalf("C lease outlived... = held %v since %v, want still idle-held", held, since)
+	a.mu.Lock()
+	rec := a.reclaimedTotal
+	a.mu.Unlock()
+	if rec != 2 {
+		t.Fatalf("reclaimedTotal = %d, want 2 (A's idle → C, B's idle → D)", rec)
+	}
+	if held, _ := a.snapshot("kB"); held {
+		t.Fatal("B lease survived the drain reclaim")
 	}
 	if held, _ := a.snapshot("kA"); held {
-		t.Fatal("A lease back after its expiry")
+		t.Fatal("A lease survived the first drain reclaim")
 	}
+	if held, _ := a.snapshot("kD"); !held {
+		t.Fatal("D lease missing after its grant")
+	}
+	// C was never reclaimed: its lease is active (count 1), not idle.
+	if held, since := a.snapshot("kC"); !held || !since.IsZero() {
+		t.Fatalf("C lease disturbed = held %v since %v, want active", held, since)
+	}
+	tkC.release()
 }
 
 func TestSessionAdmission_FIFOSameIdentityPastBlocked(t *testing.T) {
 	// C/D/C with cap 1: D blocks on the full lease; the LATER C (same
-	// identity) slips past D to the held lease and is granted. D's
-	// deadline is 1 minute on the manual clock, so keep the TTL well
-	// below it: D must not time out before the C lease expires.
+	// identity) slips past D to the held lease and is granted. C's
+	// release idles the lease; its full TTL must then elapse (no
+	// reclaimable-idle path exists for D, which holds no ticket) — D
+	// never reclaims a lease it does not own. D's deadline is 1 minute
+	// on the manual clock, so keep the TTL well below it: D must not
+	// time out before the C lease expires.
 	const ttl = 10 * time.Second
 	c := newSAManualClock()
 	a := newSessionAdmission(1, 5, ttl, c)
@@ -1054,47 +1185,83 @@ func TestSessionAdmission_FIFOSameIdentityPastBlocked(t *testing.T) {
 }
 
 func TestSessionAdmission_ReturningArrivalQueuesBehindNewcomer(t *testing.T) {
-	// An identity whose lease fully expired is a NEW identity: it cannot
-	// skip earlier queued newcomers.
+	// A returning identity whose lease was RECLAIMED (or expired) is a
+	// NEW identity: it cannot skip the newcomer that now holds the cap.
+	// C queues behind A's ACTIVE lease; A's final release reclaims
+	// A's idle lease and grants C immediately. A's return finds the cap
+	// full (C ACTIVE, nothing reclaimable): it enqueues behind the
+	// newcomer — no leap. C's completion then reclaims C's idle lease
+	// and grants A — no clock advance, no TTL.
 	const ttl = 5 * time.Second
 	c := newSAManualClock()
 	a := newSessionAdmission(1, 4, ttl, c)
 	ctx := context.Background()
 
 	tA, _ := a.acquire(ctx, "kA", time.Minute)
-	tA.release()
 	cOut := make(chan *sessionAdmissionTicket, 1)
 	go func() { tk, _ := a.acquire(ctx, "kC", time.Minute); cOut <- tk }()
-	c.Advance(ttl + time.Millisecond)
-	select {
-	case tk := <-cOut:
-		// C's turn completes immediately: its lease goes idle NOW; the
-		// full idle TTL from this point must elapse before anything else
-		// (A) may take the slot.
-		tk.release()
-	case <-time.After(2 * time.Second):
-		t.Fatal("C not released on A's expiry")
+	// C confirmed queued (manager counter; the write happens under the
+	// same mutex, so the readback is a stable lower bound).
+	waitFor := func(what string, n int) {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			a.mu.Lock()
+			w := a.waiting
+			a.mu.Unlock()
+			if w >= n {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s (waiting=%d, want %d)", what, w, n)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
 	}
+	waitFor("C queued", 1)
+	// A's final release: the queue head C is granted IMMEDIATELY by
+	// reclaiming A's idle lease — no clock advance, no TTL.
+	tA.release()
+	var tkC *sessionAdmissionTicket
+	select {
+	case tkC = <-cOut:
+	case <-time.After(2 * time.Second):
+		t.Fatal("C not granted by A's release")
+	}
+	if held, _ := a.snapshot("kA"); held {
+		t.Fatal("A lease survived the drain reclaim")
+	}
+	// A's return: kA is gone (RECLAIMED) — a NEW identity. The cap is
+	// full (C ACTIVE, nothing reclaimable): A enqueues behind the
+	// newcomer; no leap, no immediate grant.
 	aOut := make(chan *sessionAdmissionTicket, 1)
 	go func() {
 		tk, _ := a.acquire(ctx, "kA", time.Minute)
 		aOut <- tk
 	}()
-	time.Sleep(50 * time.Millisecond)
+	waitFor("A queued", 1)
 	select {
 	case <-aOut:
-		t.Fatal("expired A leapt over newcomer C in the queue")
+		t.Fatal("returning A leapt over the newcomer")
 	case <-time.After(50 * time.Millisecond):
 	}
-	// C's ticket was already received when the expiry timer granted it
-	// above (it enqueued only while A's lease existed); release it now so
-	// its idle expiry is the event that frees the slot for A.
-	c.Advance(ttl + 2*time.Millisecond) // C's full TTL elapses; grant publication is asynchronous to the clock advancement.
+	// C's turn completes: its lease goes idle NOW; the drain reclaims
+	// it and grants the queue head A in the same critical section —
+	// no clock advance, no TTL.
+	tkC.release()
 	select {
 	case tk := <-aOut:
 		tk.release()
 	case <-time.After(2 * time.Second):
-		t.Fatal("A did not enter after C's expiration")
+		t.Fatal("A not granted by the immediate reclaim")
+	}
+	a.mu.Lock()
+	rec := a.reclaimedTotal
+	a.mu.Unlock()
+	if rec != 2 {
+		t.Fatalf("reclaimedTotal = %d, want 2 (A's idle → C, C's idle → A)", rec)
+	}
+	if held, _ := a.snapshot("kC"); held {
+		t.Fatal("C lease survived the reclaim")
 	}
 }
 
@@ -1104,10 +1271,10 @@ func TestSessionAdmission_CancellationAndTimeout(t *testing.T) {
 	a := newSessionAdmission(1, 4, ttl, c)
 	ctx := context.Background()
 
-	// kA granted then released: idle lease occupies the only slot; C and
-	// D queue. Cancelling C must not admit D; the expiry timer does.
+	// kA ACTIVE (not idle) occupies the only slot: C and D queue behind
+	// an active lease (nothing reclaimable). Cancelling C must not admit
+	// D; A's final release does.
 	tA, _ := a.acquire(ctx, "kA", time.Minute)
-	tA.release()
 	cCtx, cancelC := context.WithCancel(context.Background())
 	cOut := make(chan error, 1)
 	go func() { _, err := a.acquire(cCtx, "kC", time.Minute); cOut <- err }()
@@ -1125,23 +1292,26 @@ func TestSessionAdmission_CancellationAndTimeout(t *testing.T) {
 	}
 	select {
 	case <-dOut:
-		t.Fatal("D admitted while the retained kA lease still occupied the slot")
+		t.Fatal("D admitted while the active kA lease still occupied the slot")
 	case <-time.After(50 * time.Millisecond):
 	}
-	c.Advance(ttl + time.Millisecond)
+	// A's final release grants the queue head D immediately — no expiry,
+	// no arrival, no tick.
+	tA.release()
 	select {
 	case tk := <-dOut:
-		tk.release()
+		_ = tk
 	case <-time.After(2 * time.Second):
-		t.Fatal("D not admitted after the kA lease expired")
+		t.Fatal("D not admitted by the final release")
 	}
 
-	// Queue deadline (hotelTimeout semantics measured on the manager
-	// clock) terminates without admission.
+	// Queue deadline (grace measured on the manager clock) terminates
+	// without admission. D stays ACTIVE through the probe, so the
+	// deadline — not a reclaim — is what ends kTO.
 	toOut := make(chan error, 1)
 	go func() { _, err := a.acquire(ctx, "kTO", 3*time.Second); toOut <- err }()
 	time.Sleep(50 * time.Millisecond)
-	c.Advance(ttl * 2) // beyond kTO's 3s deadline; kD lease (running) survives
+	c.Advance(ttl * 2) // beyond kTO's 3s deadline; kD lease (active) survives
 	select {
 	case err := <-toOut:
 		if !errors.Is(err, errSessionAdmissionTimeout) {
@@ -1159,7 +1329,7 @@ func TestSessionAdmission_QueueFullAndZeroWaiting(t *testing.T) {
 	const ttl = 10 * time.Second
 	c := newSAManualClock()
 	a := newSessionAdmission(1, 1, ttl, c)
-	tA, _ := a.acquire(context.Background(), "kA", time.Minute)
+	tA, _ := a.acquire(context.Background(), "kA", time.Minute) // ACTIVE holder
 	first := make(chan error, 1)
 	go func() { _, err := a.acquire(context.Background(), "kB", time.Minute); first <- err }()
 	time.Sleep(50 * time.Millisecond)
@@ -1174,24 +1344,43 @@ func TestSessionAdmission_QueueFullAndZeroWaiting(t *testing.T) {
 	if held, _ := a.snapshot("kC"); held {
 		t.Fatal("rejected request minted a lease")
 	}
-	// maxWaiting=0 rejects all newcomers once the cap is occupied.
+	// maxWaiting=0 rejects all newcomers once the cap is occupied by an
+	// ACTIVE holder (nothing reclaimable).
 	b := newSessionAdmission(1, 0, ttl, c)
 	bA, _ := b.acquire(context.Background(), "kA", time.Minute)
 	if _, err := b.acquire(context.Background(), "kN", time.Minute); !errors.Is(err, errSessionAdmissionQueueFull) {
 		t.Fatalf("waiting=0 err = %v, want queue-full", err)
 	}
 	bA.release()
-	// kA's expiry frees the slot; queued B finally proceeds.
+	// A's final release grants the queued B immediately (no TTL, no
+	// clock advance): an active-holder cap that frees is not a queue
+	// timeout — B reaches the grant on the release itself.
 	tA.release()
-	c.Advance(ttl + time.Millisecond)
 	select {
 	case err := <-first:
 		if err != nil {
 			t.Fatalf("B terminal = %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("B not admitted after the cap lease expired")
+		t.Fatal("B not admitted on the final release")
 	}
+
+	// Idle-holder / no-waiting: a cap occupied by an IDLE lease with an
+	// EMPTY queue is reclaimable — an immediate fresh arrival succeeds
+	// without any clock advance (queue-full is not triggered).
+	d := newSessionAdmission(1, 1, ttl, c)
+	tkI, _ := d.acquire(context.Background(), "kI", time.Minute)
+	tkI.release() // idle, queue empty
+	tkF, err := d.acquire(context.Background(), "kF", time.Minute)
+	if err != nil {
+		t.Fatalf("idle-holder fresh arrival: %v, want immediate grant", err)
+	}
+	d.mu.Lock()
+	if d.reclaimedTotal != 1 {
+		t.Fatalf("reclaimedTotal = %d, want 1", d.reclaimedTotal)
+	}
+	d.mu.Unlock()
+	tkF.release()
 }
 
 func TestSessionAdmission_ConcurrentRaces(t *testing.T) {
@@ -1279,21 +1468,40 @@ func TestSessionAdmission_GrantRaceRetiredOnce(t *testing.T) {
 // ─── 4. HTTP integration: real router + real engine + manual clock ───────
 
 func TestSessionAdmission_HTTPIdleRetentionAndHolderBypass(t *testing.T) {
-	const ttl = 5 * time.Second
+	const ttl = 30 * time.Second
 	s, engine, c := saHTTPSetup(t, ttl, 2, 4)
+	_ = c
 	url := s.ts.URL + "/v1/chat/completions"
 
-	for _, k := range []string{"A", "B"} {
-		out := saPostAsync(t, url, saChatBody("smoke", k, "hello"))
-		time.Sleep(150 * time.Millisecond) // let the request land in the gate
-		engine.releaseKey(k)
-		if code := <-out; code != 200 {
-			t.Fatalf("key %s status = %d", k, code)
-		}
+	// A and B complete on SEPARATE manual-clock instants (the manager
+	// clock is manual here): A idles strictly before B, so A is
+	// deterministically the OLDEST idle lease — the reclaim victim.
+	outA := saPostAsync(t, url, saChatBody("smoke", "A", "hello"))
+	time.Sleep(150 * time.Millisecond) // let the request land in the gate
+	engine.releaseKey("A")
+	if code := <-outA; code != 200 {
+		t.Fatalf("A status = %d", code)
+	}
+	// A's idle-stamp lands on its handler's DEFERRED release: poll for
+	// it, THEN advance, so A is stamped strictly before B (deterministic
+	// oldest-idle ordering — A is the reclaim victim, not a hash tie).
+	saWaitIdleLease(t, "smoke", saAdmKey(t, "A", "smoke"))
+	c.Advance(time.Millisecond) // A idles strictly before B
+	outB := saPostAsync(t, url, saChatBody("smoke", "B", "hello"))
+	time.Sleep(150 * time.Millisecond) // let the request land in the gate
+	engine.releaseKey("B")
+	if code := <-outB; code != 200 {
+		t.Fatalf("B status = %d", code)
 	}
 	s.awaitIdle(t, 2*time.Second)
 	ka := saAdmKey(t, "A", "smoke")
 	kb := saAdmKey(t, "B", "smoke")
+	// Both deferred releases have landed: each lease is idle-stamped.
+	// (Which is strictly older is racy between the two handler
+	// goroutines, so the reclaim VICTIM below is asserted identity-
+	// agnostically — exactly one of the two is reclaimed.)
+	saWaitIdleLease(t, "smoke", ka)
+	saWaitIdleLease(t, "smoke", kb)
 	feed := sessions.feed()
 	if row := saAdmRow(feed, ka); row == nil || !row.AdmissionLease || row.AdmissionIdleSinceMs <= 0 {
 		t.Fatalf("A row = %+v, want idle held", row)
@@ -1302,11 +1510,18 @@ func TestSessionAdmission_HTTPIdleRetentionAndHolderBypass(t *testing.T) {
 		t.Fatalf("B row = %+v, want idle held", row)
 	}
 
-	// C blocks on the admission gate: it must hold no GPU, execution, or
-	// prefill permit.
+	// C arrives while BOTH leases are idle-held: it must be admitted
+	// IMMEDIATELY (idle reservations yield to live demand — no clock
+	// advance, no TTL), reclaim the oldest idle lease, and reach
+	// upstream with no GPU, execution, or prefill permit leaked before
+	// its grant.
 	cDone := make(chan int, 1)
 	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "C", "hello")); cDone <- out.code }()
-	time.Sleep(200 * time.Millisecond)
+	// The grant + forward are real-time async hops; poll the engine.
+	// By the time the forward lands, C holds exactly its own execution
+	// slot (no GPU/prefill permit — the cap is the only gate it crossed)
+	// and no request sits queued anywhere.
+	saPollEngineSeen(t, engine, "A", "B", "C")
 	if st, err := http.Get(s.ts.URL + "/stats"); err == nil {
 		sb, _ := io.ReadAll(st.Body)
 		st.Body.Close()
@@ -1316,25 +1531,40 @@ func TestSessionAdmission_HTTPIdleRetentionAndHolderBypass(t *testing.T) {
 				Waiting         int32 `json:"waiting"`
 				PrefillInFlight int32 `json:"prefillInFlight"`
 				PrefillWaiting  int32 `json:"prefillWaiting"`
+				Admission       *struct {
+					Active   int   `json:"active"`
+					Idle     int   `json:"idle"`
+					Waiting  int   `json:"waiting"`
+					Reclaims int64 `json:"reclaimedTotal"`
+				} `json:"admission"`
 			} `json:"backends"`
 		}
-		if json.Unmarshal(sb, &stats) == nil && len(stats.Backends) == 1 {
-			if b := stats.Backends[0]; b.InFlight != 0 || b.Waiting != 0 ||
-				b.PrefillInFlight != 0 || b.PrefillWaiting != 0 {
-				t.Fatalf("queued C leaked downstream permits: %+v", b)
-			}
-		} else {
+		if err := json.Unmarshal(sb, &stats); err != nil {
 			t.Fatalf("stats shape: %s", sb)
+		}
+		if len(stats.Backends) != 1 {
+			t.Fatalf("stats shape: %s", sb)
+		}
+		b := stats.Backends[0]
+		if b.InFlight != 1 || b.Waiting != 0 ||
+			b.PrefillInFlight != 0 || b.PrefillWaiting != 0 {
+			t.Fatalf("C at its gate leaked queue depth: %+v", b)
+		}
+		if b.Admission == nil {
+			t.Fatalf("stats admission = null, want an object")
+		}
+		if b.Admission.Active != 1 || b.Admission.Idle != 1 {
+			t.Fatalf("admission = %+v, want active 1 (C) + idle 1 (B)", b.Admission)
+		}
+		if b.Admission.Waiting != 0 {
+			t.Fatalf("admission waiting = %d, want 0", b.Admission.Waiting)
+		}
+		if b.Admission.Reclaims < 1 {
+			t.Fatalf("reclaimedTotal = %d, want >= 1 (idle lease reclaimed for C)", b.Admission.Reclaims)
 		}
 	} else {
 		t.Fatal(err)
 	}
-	if n := len(engine.Seen()); n != 2 {
-		t.Fatalf("C forwarded pre-lease: %v", engine.Seen())
-	}
-
-	// The expiry timer (not a new request) frees a slot; C proceeds.
-	c.Advance(ttl + time.Millisecond)
 	engine.releaseKey("C")
 	select {
 	case code := <-cDone:
@@ -1342,15 +1572,23 @@ func TestSessionAdmission_HTTPIdleRetentionAndHolderBypass(t *testing.T) {
 			t.Fatalf("C status = %d", code)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("C not admitted by the lease expiry timer")
+		t.Fatal("C not admitted by the immediate reclaim")
 	}
 	if got := engine.Seen(); len(got) != 3 || got[2] != "C" {
 		t.Fatalf("seen = %v, want [A B C]", got)
 	}
 	s.awaitIdle(t, 2*time.Second)
 	feed = sessions.feed()
+	// A idled strictly before B (the clock advanced between the two
+	// releases, after A's idle-stamp and before B's): A is
+	// deterministically the OLDEST idle lease and the reclaim victim.
+	// Its historical row stays; its authoritative lease is gone.
 	if row := saAdmRow(feed, ka); row == nil || row.AdmissionLease || row.AdmissionIdleSinceMs != 0 {
-		t.Fatalf("expired A row = %+v, want false/0", row)
+		t.Fatalf("reclaimed A row = %+v, want false/0", row)
+	}
+	// B (newer idle) survived the reclaim and is still idle-held.
+	if row := saAdmRow(feed, kb); row == nil || !row.AdmissionLease || row.AdmissionIdleSinceMs <= 0 {
+		t.Fatalf("B row = %+v, want idle held", row)
 	}
 	// C's single request already completed, so its lease is now
 	// idle-holding: true WITH a set idle-since stamp (the manual clock's
@@ -1363,39 +1601,81 @@ func TestSessionAdmission_HTTPIdleRetentionAndHolderBypass(t *testing.T) {
 func TestSessionAdmission_HOLPHolderRetention(t *testing.T) {
 	const ttl = 5 * time.Second
 	s, engine, c := saHTTPSetup(t, ttl, 2, 4)
+	_ = c
 	url := s.ts.URL + "/v1/chat/completions"
 
-	for _, k := range []string{"A", "B"} {
-		done := saPostAsync(t, url, saChatBody("smoke", k, "hello"))
-		time.Sleep(150 * time.Millisecond)
-		engine.releaseKey(k)
-		if code := <-done; code != 200 {
-			t.Fatalf("key %s = %d", k, code)
-		}
-	}
-	s.awaitIdle(t, 2*time.Second)
-
-	// C queues against the two retained idle leases. A's next turn must
-	// reach the fake upstream while the cap is occupied and C is queued.
+	// A1 and B1 run, gated (ACTIVE leases): the cap is full with
+	// nothing reclaimable, so C — a fresh identity — must be
+	// ADMISSION-queued (proven: enqueued BEFORE A2).
+	a1Done := saPostAsync(t, url, saChatBody("smoke", "A", "one"))
+	time.Sleep(100 * time.Millisecond)
+	b1Done := saPostAsync(t, url, saChatBody("smoke", "B", "one"))
+	time.Sleep(100 * time.Millisecond)
+	saPollAdmittedLeases(t, "smoke", 2)
 	cDone := make(chan int, 1)
 	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "C", "hello")); cDone <- out.code }()
+	saPollAdmissionWaiting(t, "smoke", 1) // C queued — confirmed, before A2
+
+	// A2 arrives while A1 is still ACTIVE (gated): it reuses A's HELD
+	// lease (count 1→2) — head-of-line preference for a held identity —
+	// and is admitted immediately while C is queued behind it. Both
+	// execution slots are full (A1, B1), so A2 is slot-queued, not yet
+	// forwarded. A RECLAIMED/expired returning identity does NOT keep
+	// this priority (it is a newcomer again — covered in
+	// ReturningArrivalQueuesBehindNewcomer).
 	turn2 := saPostAsync(t, url, saChatBody("smoke", "A", "turn two"))
 	time.Sleep(150 * time.Millisecond)
-	// Turn 1's gate opens: the returning holder COMPLETES before the
-	// retention check. (Turn 2 later gets its OWN fresh-identity lease
-	// and gate once the retained set expires on the manual clock.)
-	engine.releaseKey("A")
-	if code := <-turn2; code != 200 {
-		t.Fatalf("returning A status = %d", code)
+	if held, since := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "A", "smoke")); !held || !since.IsZero() {
+		t.Fatalf("A lease = held %v since %v, want active (count 2)", held, since)
 	}
-	// C's handler is intentionally queued in the manager at this point:
-	// do NOT awaitIdle here (no drain is possible while it waits).
+	saPollAdmissionWaiting(t, "smoke", 1) // C still queued; A2 is slot-queued
 	select {
 	case <-cDone:
-		t.Fatal("C released before the retained leases expired")
+		t.Fatal("C released before A2's bypass grant")
 	case <-time.After(100 * time.Millisecond):
 	}
-	c.Advance(ttl + 2*time.Millisecond)
+
+	// A1 completes: A's count 2→1 (still ACTIVE — A2 accepted; no
+	// reclaim). Slot 1 frees; A2 — slot-queued the whole time —
+	// acquires it and FORWARDS (third), before the queued C.
+	engine.releaseKey("A")
+	if code := <-a1Done; code != 200 {
+		t.Fatalf("A1 = %d", code)
+	}
+	saPollEngineSeen(t, engine, "A", "B", "A") // A2 forwarded (third); C not
+	saPollAdmissionWaiting(t, "smoke", 1)      // C still queued behind the bypass
+	if held, since := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "A", "smoke")); !held || !since.IsZero() {
+		t.Fatalf("A lease = held %v since %v, want active (A2 accepted)", held, since)
+	}
+
+	// B1 completes: B's lease goes idle; the drain immediately
+	// reclaims it (the only idle) and grants the queue head C — no TTL,
+	// no new arrival, no clock. C is forwarded to its own gate.
+	engine.releaseKey("B")
+	if code := <-b1Done; code != 200 {
+		t.Fatalf("B1 = %d", code)
+	}
+	saPollEngineSeen(t, engine, "A", "B", "A", "C")
+	mgr := sessionAdmissions["smoke"]
+	mgr.mu.Lock()
+	rec := mgr.reclaimedTotal
+	aLease, okA := mgr.leaseMap[saAdmKey(t, "A", "smoke")]
+	_, okB := mgr.leaseMap[saAdmKey(t, "B", "smoke")]
+	mgr.mu.Unlock()
+	if rec < 1 {
+		t.Fatalf("reclaimedTotal = %d, want >= 1 (B's idle lease yielded to queued C)", rec)
+	}
+	if okB {
+		t.Fatalf("B lease survived the drain reclaim")
+	}
+	if !okA || aLease.count != 1 {
+		t.Fatalf("A lease disturbed by B's release (ok=%v count=%d), want active 1 (A2)", okA, aLease.count)
+	}
+	// Open the two pending gates; both requests complete.
+	engine.releaseKey("A") // A2's gate (A1's was released above)
+	if code := <-turn2; code != 200 {
+		t.Fatalf("A2 = %d", code)
+	}
 	engine.releaseKey("C")
 	select {
 	case code := <-cDone:
@@ -1403,26 +1683,9 @@ func TestSessionAdmission_HOLPHolderRetention(t *testing.T) {
 			t.Fatalf("C = %d", code)
 		}
 	case <-time.After(2 * time.Second):
-		mgr := sessionAdmissions["smoke"]
-		mgr.mu.Lock()
-		le, ok := mgr.leaseMap[saAdmKey(t, "C", "smoke")]
-		var leInfo any = "absent"
-		if ok {
-			leInfo = fmt.Sprintf("idle=%v count=%v", le.idle, le.count)
-		}
-		q, w := mgr.queue.Len(), mgr.waiting
-		names := map[string]bool{}
-		for e := mgr.queue.Front(); e != nil; e = e.Next() {
-			names[e.Value.(*sessionAdmissionWaiter).key] = true
-		}
-		var leaseKeys []string
-		for k := range mgr.leaseMap {
-			leaseKeys = append(leaseKeys, k)
-		}
-		mgr.mu.Unlock()
-		t.Fatalf("C not admitted after TTL; leases=%v(kC state=%v) queue=%d waiting=%d\nqueues=%v",
-			leaseKeys, leInfo, q, w, names)
+		t.Fatal("C not granted by the release-driven reclaim")
 	}
+	s.awaitIdle(t, 2*time.Second)
 }
 
 func TestSessionAdmission_AcceptedLifetimeHold(t *testing.T) {
@@ -1487,7 +1750,7 @@ func TestSessionAdmission_AcceptedLifetimeHold(t *testing.T) {
 		t.Fatal("C admitted while A2 still runs")
 	case <-time.After(50 * time.Millisecond):
 	}
-	engine.releaseKey("A") // A2 done: the lease goes idle NOW, not earlier
+	engine.releaseKey("A") // A2 done: the lease is reclaimed IMMEDIATELY
 	select {
 	case code := <-a2Done:
 		if code != 200 {
@@ -1496,11 +1759,11 @@ func TestSessionAdmission_AcceptedLifetimeHold(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("A2 did not complete")
 	}
-	// A2's deferred release arms the idle expiry timer strictly after
-	// the client read; C is still queued (no drain possible), so wait
-	// for A's lease to report idle before the advance.
-	saWaitIdleLease(t, "smoke", saAdmKey(t, "A", "smoke"))
-	c.Advance(ttl + 2*time.Millisecond)
+	// A2's deferred release is the final accepted release: the queue
+	// head C is granted in that same critical section — no clock
+	// advance, no expiry, no arrival. (Protection while any A request
+	// is outstanding was certified above; the idle TTL no longer gates
+	// a queued newcomer.)
 	engine.releaseKey("C")
 	select {
 	case code := <-cDone:
@@ -1508,7 +1771,7 @@ func TestSessionAdmission_AcceptedLifetimeHold(t *testing.T) {
 			t.Fatalf("C = %d", code)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("C not admitted after the full idle TTL from the final completion")
+		t.Fatal("C not admitted by the final release")
 	}
 	if got := engine.Seen(); len(got) != 3 || got[2] != "C" {
 		t.Fatalf("seen = %v, want C last", got)
@@ -1522,34 +1785,28 @@ func TestSessionAdmission_AcceptedLifetimeHold(t *testing.T) {
 // budget check at zero cost); tier-1 subject "smoke" (weight 1, two
 // running slots, a 1-unit budget, admission cap 2, waiting bound 2).
 //
-//  1. K runs, gated. F (smoke) runs and completes immediately: its
-//     lease idles at t0 (an IDLE lease still occupies a cap slot — the
-//     retention invariant).
-//  2. M is granted the last cap slot, takes the SOLE budget unit and
-//     running slot 1, and is gated upstream.
-//  3. B and C are queued at the admission gate (cap full: idle F +
-//     active M).
-//  4. F's IDLE-LEASE EXPIRY (a timer tick, no traffic) frees a cap slot
-//     → B is granted → and, finding the budget exhausted (M's unit,
-//     M active in the engine gate), QUEUES at it — holding no running
-//     slot (the budget is upstream of the execution slot). C stays
-//     queued and holds no GPU, execution, or prefill permit.
-//  5. A TTL advance while M is accepted (engine gate) and B accepted
-//     (budget queue): both leases stay held with NO idle stamp, the
-//     budget has not moved, and C is still not granted (the cap is
-//     full: idle F + active M).
-//  6. M completes: its idle stamp lands exactly then and the unit
-//     frees → B: unit + slot 1 + engine gate (kept shut). The cap
-//     stays FULL ({M idle}{B active}), so C is still not granted.
-//  7. The next advance fires M's idle-lease EXPIRY → C is granted →
-//     BUDGET-QUEUED behind B (no running slot; the budget is upstream
-//     of the execution slot). B and C both active.
-//  8. B completes at its gate: the unit frees → C: unit + slot 1 +
-//     engine gate (kept shut); B's lease idles exactly then. K
-//     completes (weight 0; the budget is no longer engaged — C is
-//     already past it).
-//  9. C completes at its gate: the FINAL accepted release. B's and
-//     C's idle-stamped leases expire exactly one full TTL later;
+//  1. K runs, gated. F (smoke) runs, takes the SOLE budget unit +
+//     slot 1, and is gated upstream (ACTIVE lease).
+//  2. M is lease-admitted and QUEUES AT THE EXHAUSTED BUDGET behind F
+//     (ACTIVE lease; no running slot — the budget is upstream of the
+//     execution slot).
+//  3. B and C are queued at the ADMISSION gate: the cap is full with
+//     two ACTIVE leases (F, M) — nothing reclaimable.
+//  4. A fresh E (queue bound 2) is hard-rejected
+//     session-admission-queue-full: it cannot overtake, and it cannot
+//     queue.
+//  5. A TTL advance while F (engine gate) and M (budget queue) are
+//     accepted: both leases held WITH NO IDLE STAMP; the budget has
+//     not moved; B and C still not granted.
+//  6. F completes: its lease idles and the drain IMMEDIATELY reclaims
+//     it (no tick) — B is granted → budget-queued behind M (no
+//     running slot).
+//  7. M completes: its idle lease is reclaimed by the drain → C is
+//     granted → budget-queued behind B. B takes M's unit + slot.
+//  8. B completes: C takes the unit + slot; B's lease idles. K
+//     completes (weight 0; the budget is no longer engaged).
+//  9. C completes: the FINAL accepted release. B's and C's
+//     idle-stamped leases expire one full TTL later (no demand);
 //     forward order [K F M B C]; budget and slots drain to zero —
 //     every permit released exactly once.
 //
@@ -1581,143 +1838,136 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 	t.Cleanup(func() { s.awaitIdle(t, 5*time.Second) })
 
 	url := s.ts.URL + "/v1/chat/completions"
-	kF := saAdmKey(t, "F", "smoke")
 	kM := saAdmKey(t, "M", "smoke")
 	kB := saAdmKey(t, "B", "smoke")
 	kC := saAdmKey(t, "C", "smoke")
+	kK := saAdmKey(t, "K", "king")
 
-	// 1. K (king) runs, gated. F (smoke) runs and completes immediately.
+	// 1. K (king) runs, gated. F: sole budget unit + slot 1, gated.
 	kDone := saPostAsync(t, url, saChatBody("king", "K", "hello"))
 	time.Sleep(100 * time.Millisecond)
-	fDone := make(chan int, 1)
-	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "F", "x")); fDone <- out.code }()
-	time.Sleep(100 * time.Millisecond)
-	engine.releaseKey("F")
-	if code := <-fDone; code != 200 {
-		t.Fatalf("F = %d", code)
-	}
 	if t0i := tier0Inflight(); t0i != 1 {
 		t.Fatalf("t0Inflight = %d, want 1 (K running)", t0i)
 	}
-	// The idle arm lands strictly after the client read (deferred ticket
-	// release); wait for it — advancing before the arm loses the tick.
-	saWaitIdleLease(t, "smoke", kF)
-	// 2. M: last cap slot + sole budget unit + running slot 1, gated.
-	mDone := saPostAsync(t, url, saChatBody("smoke", "M", "one"))
+	fDone := saPostAsync(t, url, saChatBody("smoke", "F", "x"))
 	time.Sleep(100 * time.Millisecond)
 	if gUsed, _, gWaiting := gb.snapshot(); gUsed != 1 || gWaiting != 0 {
-		t.Fatalf("M not on the budget: used=%d/1 waiting=%d, want 1/0", gUsed, gWaiting)
+		t.Fatalf("F not on the budget: used=%d/1 waiting=%d, want 1/0", gUsed, gWaiting)
 	}
-	// 3. B, C: admission-queued while the cap is full.
+
+	// 2. M: lease-admitted, BUDGET-QUEUED behind F (no running slot).
+	mDone := saPostAsync(t, url, saChatBody("smoke", "M", "one"))
+	time.Sleep(100 * time.Millisecond)
+	saPollGPU(t, gb, 1, 1) // F (unit) + M (queued).
+	if held, _ := sessionAdmissions["smoke"].snapshot(kM); !held {
+		t.Fatal("M lease not held while budget-queued")
+	}
+	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
+		t.Fatalf("smoke inFlight = %d, want 1 (F only)", in)
+	}
+
+	// 3. B, C: admission-queued while the cap is full with ACTIVE F + M.
 	bDone := saPostAsync(t, url, saChatBody("smoke", "B", "two"))
 	time.Sleep(40 * time.Millisecond)
 	cDone := make(chan int, 1)
 	go func() { out, _ := saPostOutDo(url, saChatBody("smoke", "C", "x")); cDone <- out.code }()
 	time.Sleep(40 * time.Millisecond)
-	if held, _ := sessionAdmissions["smoke"].snapshot(kM); !held {
-		t.Fatal("M lease not held")
-	}
 	if held, _ := sessionAdmissions["smoke"].snapshot(kB); held {
-		t.Fatal("B granted while the cap is full")
+		t.Fatal("B granted while the cap is full with active leases")
 	}
 	if held, _ := sessionAdmissions["smoke"].snapshot(kC); held {
-		t.Fatal("C granted while the cap is full")
+		t.Fatal("C granted while the cap is full with active leases")
 	}
-	if got := engine.Seen(); len(got) != 3 ||
-		!(got[0] == "K" && got[1] == "F" && got[2] == "M") {
-		t.Fatalf("engine seen = %v, want [K F M]", got)
+	if got := engine.Seen(); len(got) != 2 || got[0] != "K" || got[1] != "F" {
+		t.Fatalf("engine seen = %v, want [K F] (M is budget-queued, not forwarded)", got)
 	}
 
-	// 4. F's idle-lease expiry (timer tick, no traffic) frees a cap
-	// slot → B: then QUEUED AT THE EXHAUSTED BUDGET behind M (used 1,
-	// waiting 1); B holds no running slot (budget upstream of it).
+	// 4. Fresh E: the waiting bound (2) is occupied by B + C — E is
+	// hard-rejected, not queued; a newcomer cannot overtake.
+	eCode, eHdr, eBody := saPost(t, url, saChatBody("smoke", "E", "x"))
+	if eCode != http.StatusTooManyRequests ||
+		eHdr.Get("X-Router-Reason") != "session-admission-queue-full" {
+		t.Fatalf("E = %d %q, want 429 session-admission-queue-full: %s",
+			eCode, eHdr.Get("X-Router-Reason"), eBody)
+	}
+
+	// 5. TTL advance with F (engine gate) and M (budget queue) accepted:
+	// both leases held WITH NO IDLE STAMP; budget has not moved; B/C
+	// not granted.
 	c.Advance(2 * ttl)
-	if held, _ := sessionAdmissions["smoke"].snapshot(kB); !held {
-		t.Fatal("B not granted by the idle-lease expiry timer")
-	}
-	saPollGPU(t, gb, 1, 1)             // M (unit) + B (queued).
-	time.Sleep(150 * time.Millisecond) // settle: B's forward at the grant.
-	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
-		t.Fatalf("smoke inFlight = %d, want 1 (M running; B holds no slot while budget-queued)", in)
-	}
-
-	// 5. TTL advance with M accepted (engine gate) and B accepted
-	// (budget queue): both leases held WITH NO IDLE STAMP; C still
-	// not granted and holding no permit.
-	c.Advance(2*ttl + 2*time.Millisecond)
-	for _, k := range []string{kM, kB} {
+	for _, k := range []string{kM, saAdmKey(t, "F", "smoke")} {
 		if held, since := sessionAdmissions["smoke"].snapshot(k); !held || !since.IsZero() {
 			t.Fatalf("active lease %s = held %v since %v, want held (no idle stamp)", k, held, since)
 		}
 	}
-	if held, _ := sessionAdmissions["smoke"].snapshot(kC); held {
-		t.Fatal("C granted while M and B are still accepted")
+	if held, _ := sessionAdmissions["smoke"].snapshot(kB); held {
+		t.Fatal("B granted while F and M are still accepted")
 	}
 	if gUsed, _, gWaiting := gb.snapshot(); gUsed != 1 || gWaiting != 1 {
 		t.Fatalf("budget moved under a TTL advance: used=%d waiting=%d, want 1/1", gUsed, gWaiting)
 	}
 
-	// 6. M completes: its idle stamp lands NOW (one full TTL to
-	// expiry) and the unit frees → B: unit + slot 1 + engine gate
-	// (kept shut). The cap is STILL full ({M idle} + {B active}), so
-	// C stays queued at the gate.
+	// 6. F completes: the final release idles its lease and the drain
+	// RECLAIMS it immediately (no tick) — B is granted, then
+	// BUDGET-QUEUED behind M (no running slot).
+	engine.releaseKey("F")
+	if code := <-fDone; code != 200 {
+		t.Fatalf("F = %d", code)
+	}
+	// F's reclaim + B's grant land on the handler's DEFERRED release
+	// (after the client reads the response): poll for the stable
+	// admitted-set {M, B} (F's lease is gone, B's is granted).
+	saPollAdmittedLeases(t, "smoke", 2)
+	if held, _ := sessionAdmissions["smoke"].snapshot(kB); !held {
+		t.Fatal("B not granted by the release-driven reclaim")
+	}
+	saPollGPU(t, gb, 1, 1)             // M (unit) + B (queued).
+	time.Sleep(150 * time.Millisecond) // settle: no forward (B budget-queued).
+	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
+		t.Fatalf("smoke inFlight = %d, want 1 (M running; B holds no slot while budget-queued)", in)
+	}
+
+	// 7. M completes: its idle lease is reclaimed by the drain → C is
+	// granted → budget-queued behind B. B takes the unit + slot.
 	engine.releaseKey("M")
 	if code := <-mDone; code != 200 {
 		t.Fatalf("M = %d", code)
 	}
-	saWaitIdleLease(t, "smoke", kM)    // stamp lands exactly at exit.
-	saPollGPU(t, gb, 1, 0)             // B holds the freed unit.
-	time.Sleep(150 * time.Millisecond) // settle: B's forward at the grant.
-	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
-		t.Fatalf("smoke inFlight = %d, want 1 (B running)", in)
-	}
-	if held, _ := sessionAdmissions["smoke"].snapshot(kC); held {
-		t.Fatal("C granted while the cap is full ({M idle}{B active})")
-	}
-
-	// 7. The advance: M's idle-lease EXPIRY frees a cap slot → C is
-	// granted → queues at the exhausted budget behind B (unit) — NO
-	// running slot (budget upstream of it). Both leases active.
-	c.Advance(2*ttl + 2*time.Millisecond)
-	if held, _ := sessionAdmissions["smoke"].snapshot(kM); held {
-		t.Fatal("M idle lease outlived its full idle TTL")
-	}
-	for _, k := range []string{kB, kC} {
-		if held, since := sessionAdmissions["smoke"].snapshot(k); !held || !since.IsZero() {
-			t.Fatalf("active lease %s = held %v since %v, want held (no idle stamp)", k, held, since)
-		}
+	// M's reclaim + C's grant land on the handler's DEFERRED release:
+	// poll for the stable admitted-set {B, C} (M's lease is gone, C's
+	// is granted).
+	saPollAdmittedLeases(t, "smoke", 2)
+	if held, _ := sessionAdmissions["smoke"].snapshot(kC); !held {
+		t.Fatal("C not granted by M's release-driven reclaim")
 	}
 	saPollGPU(t, gb, 1, 1)             // B (unit) + C (queued).
-	time.Sleep(150 * time.Millisecond) // settle: C's forward at the grant.
+	time.Sleep(150 * time.Millisecond) // settle: B takes the unit + slot, C stays budget-queued.
 	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
-		t.Fatalf("smoke inFlight = %d, want 1 (B running; C budget-queued, no slot)", in)
+		t.Fatalf("smoke inFlight = %d, want 1 (B running; C budget-queued)", in)
 	}
 
-	// 8. B completes at its gate: the unit frees → C: unit + slot 1 +
-	// engine gate (kept shut). B's lease idles exactly now.
+	// 8. B completes: C takes the unit + slot; B's lease idles. K
+	// completes (weight 0; the budget is no longer engaged — C is
+	// already past it).
 	engine.releaseKey("B")
 	if code := <-bDone; code != 200 {
 		t.Fatalf("B = %d", code)
 	}
-	saWaitIdleLease(t, "smoke", kB)                      // B's stamp: idles exactly at exit.
 	saPollGPU(t, gb, 1, 0)                               // C holds the sole unit.
 	saPollEngineSeen(t, engine, "K", "F", "M", "B", "C") // C is at the gate.
-
-	// K completes (king, weight 0) — the budget check no longer
-	// engages for anything afterwards (t0Inflight 0), which is fine:
-	// C is already past it.
 	engine.releaseKey("K")
 	if code := <-kDone; code != 200 {
 		t.Fatalf("K = %d", code)
 	}
 
 	// 9. C completes at its gate: the FINAL accepted release. B and C
-	// leases are idle-stamped; ONE FULL TTL later, both are gone —
-	// the acceptance, not a new arrival, is what delayed them.
+	// leases are idle-stamped; ONE FULL TTL later (no demand), both
+	// are gone.
 	engine.releaseKey("C")
 	if code := <-cDone; code != 200 {
 		t.Fatalf("C = %d", code)
 	}
+	saWaitIdleLease(t, "smoke", kB) // B's stamp: idles exactly at exit.
 	saWaitIdleLease(t, "smoke", kC)
 	saPollGPU(t, gb, 0, 0) // every permit released exactly once.
 	if in, _, _, _ := slots["smoke"].snapshot(); in != 0 {
@@ -1730,6 +1980,9 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 	if held, _ := sessionAdmissions["smoke"].snapshot(kC); held {
 		t.Fatal("C lease outlived its full idle TTL")
 	}
+	if held, _ := sessionAdmissions["king"].snapshot(kK); held {
+		t.Fatal("K lease outlived its full idle TTL")
+	}
 	saPollEngineSeen(t, engine, "K", "F", "M", "B", "C")
 	s.awaitIdle(t, 3*time.Second)
 }
@@ -1739,8 +1992,8 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 // 8 threshold), so A1 holds the single dedicated prefill slot and A2 —
 // lease-admitted — is QUEUED in the prefill slot's queue behind it.
 // Far past the TTL the lease must not expire while accepted counts are
-// positive; A2 completes in the upstream gate, then the lease idles and
-// expires exactly at a full TTL from the final completion.
+// positive; A2 completes in the upstream gate, then the FINAL release
+// reclaims the idle lease and grants the queue head C immediately.
 func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	// Clock budget: the manual clock drives the production queue-wait
 	// deadlines (queueTimeout 30s) for EVERY queued request — A2's
@@ -1759,12 +2012,12 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	saIsolate(t)
 	c := newSAManualClock()
 	// maxAdmitted = 1: C owns no lease of its own — its single slot is
-	// PERMANENTLY behind A's lease. (With 2 slots C is admitted as a
+	// behind A's lease the whole time. (With 2 slots C is admitted as a
 	// distinct lease immediately and only slot-blocked — its forward
 	// then races A2's at A1's completion, and the intermediate
 	// "C must not complete" assertions go false-positive under real
 	// time.) 1 slot makes the perimeter scenario true in the first
-	// place: C stays lease-queued until A's lease idles AND expires.
+	// place: C stays lease-queued until A's FINAL release.
 	withAdmissionEnv(t, ttl, c, 1, 4)
 	s := newSAServing()
 	// Teardown runs LIFO (last cleanup first), so register in the
@@ -1814,9 +2067,9 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	// Far past the TTL with A1 accepted (engine gate), A2 accepted and
 	// stuck in the prefill slot queue behind A1's first-byte-gated
 	// hold, and C QUEUED in the admission queue (cap 1: A's lease is
-	// the only occupant): the lease must RETAIN, C must stay queued,
-	// and nothing past the first forward is new — A2 is NOT forwarded
-	// while A1's slot is held.
+	// the only occupant): the ACTIVE lease must RETAIN, C must stay
+	// queued, and nothing past the first forward is new — A2 is NOT
+	// forwarded while A1's slot is held.
 	c.Advance(ttl * 10)
 	if held, _ := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "A", "smoke")); !held {
 		t.Fatal("A lease expired while accepted requests are outstanding")
@@ -1852,17 +2105,18 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	// A2 completes: NOW the lease idles. Full TTL from here → expiry.
+	// A2 completes: the FINAL accepted release idles the lease and the
+	// drain reclaims it immediately — C is granted in that same
+	// critical section, no clock advance, no TTL.
 	engine.releaseKey("A") // A2's gate
 	if code := <-done2; code != 200 {
 		t.Fatalf("A2 = %d", code)
 	}
-	// A2 is the only A request finishing now and the only engine
-	// traffic admitted before A's lease expires: C is ADMISSION-queued
-	// (cap 1, A lease held), so no forward of its can exist yet.
+	// A2 is the only A request finishing now: C is ADMISSION-queued
+	// (cap 1, A lease held), so no forward of its can exist until the
+	// final release.
 	saPollEngineSeen(t, engine, "A", "A")
-	saWaitIdleLease(t, "smoke", saAdmKey(t, "A", "smoke"))
-	c.Advance(ttl + 2*time.Millisecond)
+	saPollAdmissionWaiting(t, "smoke", 0) // C granted by the final release
 	engine.releaseKey("C")
 	select {
 	case code := <-cDone:
@@ -1870,10 +2124,10 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 			t.Fatalf("C = %d", code)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("C not admitted after the full idle TTL from the final completion")
+		t.Fatal("C not admitted by the final release")
 	}
 	// C is small and admission-queued the whole time: it can only
-	// forward AFTER A's lease expired, i.e. strictly after A2's
+	// forward after the final release, i.e. strictly after A2's
 	// forward. Order A, A, C is forced.
 	saPollEngineSeen(t, engine, "A", "A", "C")
 	s.awaitIdle(t, 3*time.Second)
@@ -1884,6 +2138,7 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 
 	t.Run("queue-full", func(t *testing.T) {
 		s, engine, c := saHTTPSetup(t, ttl, 1, 1)
+		_ = c
 		url := s.ts.URL + "/v1/chat/completions"
 		aDone := saPostAsync(t, url, saChatBody("smoke", "A", "x"))
 		// A's lease must be ADMITTED (not merely sent) before B can be
@@ -1904,21 +2159,13 @@ func TestSessionAdmission_TerminalBounds(t *testing.T) {
 		if held, _ := sessionAdmissions["smoke"].snapshot(saAdmKey(t, "C", "smoke")); held {
 			t.Fatal("rejected C minted a lease")
 		}
+		// A is ACTIVE (gated): its completion grants the queue head B
+		// immediately — no idle arm, no clock advance, no TTL handoff.
+		// B's forward lands upstream right after A's gate opens.
 		engine.releaseKey("A")
 		if c0 := <-aDone; c0 != 200 {
 			t.Fatalf("A = %d", c0)
 		}
-		// A's handler only arms the idle expiry timer when its deferred
-		// ticket release lands — strictly after the client read — so wait
-		// for the idle arm before advancing (B is still queued, so a full
-		// drain is impossible and not needed).
-		saWaitIdleLease(t, "smoke", saAdmKey(t, "A", "smoke"))
-		// A's expiry timer frees the lease (clock-driven, no traffic); B
-		// (still queued) proceeds and opens its OWN upstream gate — release
-		// it before the test ends.
-		c.Advance(ttl + 2*time.Millisecond)
-		// B's grant is a real-time async hop (wake → handler → forward):
-		// wait for the forward to land upstream before releasing its gate.
 		saPollEngineSeen(t, engine, "A", "B")
 		engine.releaseKey("B")
 		if c1 := <-bDone; c1 != 200 {
@@ -2344,8 +2591,9 @@ func TestSessionAdmission_BackendIsolationAndQueryModelRouting(t *testing.T) {
 		t.Fatalf("b2 = %d", code2)
 	}
 
-	// Per-backend caps: b2's fresh key enqueues behind b2's own fresh key
-	// lease; b1 (empty after its expiry) grants immediately.
+	// Per-backend caps: b2's fresh key RECLAIMS b2's own idle lease
+	// immediately (cap 1, no demand-queued waiters, no clock advance);
+	// b1 (empty after its expiry) grants immediately on its own map.
 	tk1, err := sessionAdmissions["b1"].acquire(context.Background(), saAdmKey(t, "Z", "b1"), time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -2356,17 +2604,20 @@ func TestSessionAdmission_BackendIsolationAndQueryModelRouting(t *testing.T) {
 		out2 <- tk2
 	}()
 	select {
-	case <-out2:
-		t.Fatal("b2 fresh key admitted before b2's idle lease expired")
-	case <-time.After(100 * time.Millisecond):
-	}
-	c.Advance(ttl + 2*time.Millisecond) // b2's idle TTL: frees b2's own slot
-	select {
 	case tk2 := <-out2:
 		releaseTk2 := tk2
 		defer releaseTk2.release()
 	case <-time.After(2 * time.Second):
-		t.Fatal("b2 fresh key not granted after b2's own lease expired")
+		t.Fatal("b2 fresh key not granted by the immediate reclaim")
+	}
+	mgr2 := sessionAdmissions["b2"]
+	mgr2.mu.Lock()
+	if mgr2.reclaimedTotal != 1 {
+		t.Fatalf("b2 reclaimedTotal = %d, want 1 (S lease yielded to Z)", mgr2.reclaimedTotal)
+	}
+	mgr2.mu.Unlock()
+	if held, _ := mgr2.snapshot(saAdmKey(t, "S", "b2")); held {
+		t.Fatal("b2 S lease survived the reclaim")
 	}
 	// b1's grant is b1's independent lease; b2 must not touch it.
 	if held, _ := sessionAdmissions["b1"].snapshot(saAdmKey(t, "Z", "b1")); !held {
@@ -2439,6 +2690,7 @@ func TestSessionAdmission_429EnvelopeParity(t *testing.T) {
 
 	t.Run("queue-full", func(t *testing.T) {
 		s, engine, c := saHTTPSetup(t, ttl, 1, 1)
+		_ = c
 		url := s.ts.URL + "/v1/chat/completions"
 		aDone := saPostAsync(t, url, saChatBody("smoke", "A", "x"))
 		saPollAdmittedLeases(t, "smoke", 1)
@@ -2448,16 +2700,12 @@ func TestSessionAdmission_429EnvelopeParity(t *testing.T) {
 		saPollAdmissionWaiting(t, "smoke", 1)
 		code, hdr, body := saPost(t, url, saChatBody("smoke", "C", "x"))
 		check(t, code, hdr, body, "session-admission-queue-full")
-		// A's completion idles its lease (cap 1 retains it for the full
-		// TTL): B is admitted only on the clock-driven expiry, not the
-		// completion itself. Consume A's client response so its deferred
-		// ticket release can land before the idle arm is awaited.
+		// A is ACTIVE (gated): its completion grants the queue head B
+		// immediately — no idle arm, no clock advance, no TTL handoff.
 		engine.releaseKey("A")
 		if cA := <-aDone; cA != 200 {
 			t.Fatalf("A = %d, want 200", cA)
 		}
-		saWaitIdleLease(t, "smoke", saAdmKey(t, "A", "smoke"))
-		c.Advance(ttl + 2*time.Millisecond)
 		// B's grant is a real-time async hop (wake → forward): wait for
 		// B's forward to land upstream, then open ITS gate.
 		saPollEngineSeen(t, engine, "A", "B")
@@ -2465,10 +2713,10 @@ func TestSessionAdmission_429EnvelopeParity(t *testing.T) {
 		select {
 		case code := <-bDone:
 			if code != 200 {
-				t.Errorf("B after expiry = %d, want 200", code)
+				t.Errorf("B after the release = %d, want 200", code)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("B not admitted after the cap lease expired")
+			t.Fatal("B not admitted by the final release")
 		}
 	})
 
@@ -2704,9 +2952,9 @@ func TestSessionAdmission_FeedEvictionKeepsLeaseAuthority(t *testing.T) {
 	}
 	tkA.release()
 	// kB is an admitted-but-unstarted identity (no r.start): absent from
-	// the live/aggregate map; the lease is independent authority. It
-	// enqueues (cap 1, kA idle-holding) and must be driven out the
-	// SAME leaks/expiry path while the feed stores evict.
+	// the live/aggregate map; the lease is independent authority. It is
+	// a live demand, so it RECLAIMS the idle kA lease immediately (cap
+	// 1) — no expiry, no clock advance — while the feed stores evict.
 	type acqRes struct {
 		tk  *sessionAdmissionTicket
 		err error
@@ -2720,14 +2968,18 @@ func TestSessionAdmission_FeedEvictionKeepsLeaseAuthority(t *testing.T) {
 	if row := saAdmRow(r.feed(), saAdmKey(t, "B", "x")); row != nil {
 		t.Fatal("admitted-but-unforwarded request appeared as a feed row")
 	}
-	c.Advance(ttl + 2*time.Millisecond)
 	resB := <-outB
 	if resB.err != nil {
-		t.Fatalf("kB not granted after kA lease expiry: %v", resB.err)
+		t.Fatalf("kB not granted by the immediate reclaim: %v", resB.err)
 	}
 	tk := resB.tk
+	a.mu.Lock()
+	if a.reclaimedTotal != 1 {
+		t.Fatalf("reclaimedTotal = %d, want 1 (kA yielded to kB)", a.reclaimedTotal)
+	}
+	a.mu.Unlock()
 	if held, _ := a.snapshot("kA"); held {
-		t.Fatal("kA lease outlived its TTL under eviction pressure")
+		t.Fatal("kA lease survived the reclaim")
 	}
 	if held, _ := a.snapshot("kB"); !held {
 		t.Fatal("kB lease vanished with no traffic")
@@ -2736,5 +2988,51 @@ func TestSessionAdmission_FeedEvictionKeepsLeaseAuthority(t *testing.T) {
 	c.Advance(ttl + 2*time.Millisecond)
 	if held, _ := a.snapshot("kB"); held {
 		t.Fatal("kB lease outlived its TTL")
+	}
+}
+
+// TestSessionAdmission_GateTelemetry pins the admission-gate telemetry
+// (lifetime gate-wait sum/count/mean + trailing-30s window, and the
+// rejection-reason breakdown) that the capacity panel reads. The trailing
+// window uses the wall clock (production rate-window convention), so every
+// sample recorded "now" falls inside the window — the trail sum must equal
+// the lifetime sum and the trail count must equal the lifetime count.
+func TestSessionAdmission_GateTelemetry(t *testing.T) {
+	a := newSessionAdmission(2, 2, 10*time.Second, newSAManualClock())
+
+	// No traffic: all-zero frame, no phantom samples.
+	f := a.aggregateSnapshot()
+	if f.GateWaitTotalMs != 0 || f.GateWaitCount != 0 || f.GateWaitMs != 0 ||
+		f.GateWaitTrailMs != 0 || f.GateWaitTrailCnt != 0 ||
+		f.RejQueueFull != 0 || f.RejQueueTimeout != 0 || f.RejClientCancel != 0 {
+		t.Fatalf("empty telemetry = %+v, want all zero", f)
+	}
+
+	// Two granted gate-waits: 100ms + 250ms. Truncation is exact for whole
+	// milliseconds, so total = 350, count = 2, mean = 175 (integer divide).
+	a.recordGateWait(100 * time.Millisecond)
+	a.recordGateWait(250 * time.Millisecond)
+	f = a.aggregateSnapshot()
+	if f.GateWaitTotalMs != 350 || f.GateWaitCount != 2 || f.GateWaitMs != 175 {
+		t.Fatalf("gate wait = total %d, count %d, mean %d; want 350/2/175",
+			f.GateWaitTotalMs, f.GateWaitCount, f.GateWaitMs)
+	}
+	if f.GateWaitTrailMs != 350 || f.GateWaitTrailCnt != 2 {
+		t.Fatalf("trailing window = %d/%d, want 350/2 (both recorded now)",
+			f.GateWaitTrailMs, f.GateWaitTrailCnt)
+	}
+
+	// Reason breakdown: each recognized reason bumps its own counter; an
+	// unknown reason is ignored (a downstream-gate reason like gpu-budget-full
+	// lives in the registry's per-backend map, not the admission frame).
+	a.recordGateRejection("session-admission-queue-full")
+	a.recordGateRejection("session-admission-queue-full")
+	a.recordGateRejection("session-admission-timeout")
+	a.recordGateRejection("client-cancel")
+	a.recordGateRejection("gpu-budget-full") // not an admission-gate reason
+	f = a.aggregateSnapshot()
+	if f.RejQueueFull != 2 || f.RejQueueTimeout != 1 || f.RejClientCancel != 1 {
+		t.Fatalf("reasons = full %d, timeout %d, cancel %d; want 2/1/1",
+			f.RejQueueFull, f.RejQueueTimeout, f.RejClientCancel)
 	}
 }

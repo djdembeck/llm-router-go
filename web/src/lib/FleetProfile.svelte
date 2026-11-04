@@ -199,6 +199,8 @@
         return "--amber";
       case "decode":
         return "--moss";
+      case "admission":
+        return "--verm";
       case "util":
       case "vram":
         return "--sand-lit";
