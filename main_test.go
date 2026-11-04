@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -833,9 +834,73 @@ func TestMetrics_RecordRequest_CounterIncrements(t *testing.T) {
 	if s2.ReqTotal != 1 || s2.TokEstTotal != 10 {
 		t.Errorf("subject counters = %+v, want reqTotal=1 tokEst=10", s2)
 	}
-	// Unknown backend: zero snapshot, not a panic or stale value.
-	if zero := m.snapshot("ghost"); zero != (backendMetricSnapshot{}) {
+	// Unknown backend: zero snapshot, not a panic or stale value. (Cannot
+	// compare the whole struct: it now carries a reject-reason map.)
+	if zero := m.snapshot("ghost"); zero.TTFTMs != 0 || zero.ReqRate != 0 || zero.ReqTotal != 0 ||
+		zero.RejectedTotal != 0 || zero.RejectReasons != nil ||
+		zero.BytesInTotal != 0 || zero.BytesOutTotal != 0 || zero.TokEstTotal != 0 {
 		t.Errorf("unknown backend snapshot = %+v, want zero", zero)
+	}
+}
+
+// TestMetrics_RecordRequest_RejectReasons pins the per-backend rejection-reason
+// breakdown: rejected samples accumulate by X-Router-Reason string, accepted
+// samples never do, and the snapshot returns a copy (mutating it must not
+// corrupt the registry).
+func TestMetrics_RecordRequest_RejectReasons(t *testing.T) {
+	m := newTestMetrics()
+	now := time.Now()
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 429,
+		RejectReason: "gpu-budget-full",
+	})
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 429,
+		RejectReason: "gpu-budget-full",
+	})
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 429,
+		RejectReason: "backend-queue-full",
+	})
+	// 413: counts in the per-backend reason map like a 429, but is NEVER a
+	// router 429 (its reason is not in router429Reasons, and the 429 counter
+	// is gated on status==429).
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 413,
+		RejectReason: "body-too-large",
+	})
+	// Accepted: no reason (""), must not pollute the map.
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 200, accepted: true,
+	})
+
+	m.computeRates(time.Now())
+	s := m.snapshot("b")
+	if s.RejectedTotal != 4 {
+		t.Fatalf("rejectedTotal = %d, want 4", s.RejectedTotal)
+	}
+	if s.RejectReasons["gpu-budget-full"] != 2 {
+		t.Errorf("gpu-budget-full = %d, want 2", s.RejectReasons["gpu-budget-full"])
+	}
+	if s.RejectReasons["backend-queue-full"] != 1 {
+		t.Errorf("backend-queue-full = %d, want 1", s.RejectReasons["backend-queue-full"])
+	}
+	if s.RejectReasons["body-too-large"] != 1 {
+		t.Errorf("body-too-large = %d, want 1 (413 counts in the reason map)", s.RejectReasons["body-too-large"])
+	}
+	if len(s.RejectReasons) != 3 {
+		t.Errorf("len(rejectReasons) = %d, want 3 (accepted must not count)", len(s.RejectReasons))
+	}
+	// 413 must never increment a router-429 counter: the 429 breakdown is
+	// 3 (the two 429s above) with the 413 absent from it.
+	if s.Router429 == nil || s.Router429.Total != 3 {
+		t.Errorf("router429 total = %+v, want 3 (413 is not a router 429)", s.Router429)
+	}
+	// The snapshot carries a copy: mutating it must not corrupt the registry.
+	s.RejectReasons["gpu-budget-full"] = 999
+	s2 := m.snapshot("b")
+	if s2.RejectReasons["gpu-budget-full"] != 2 {
+		t.Errorf("registry mutated by snapshot mutation: gpu-budget-full = %d, want 2", s2.RejectReasons["gpu-budget-full"])
 	}
 }
 
@@ -2497,6 +2562,69 @@ func TestHandleBurst_LimitClamp(t *testing.T) {
 	}
 }
 
+// TestHandleBurst_ReasonAndGateWait pins the additive burst fields: a
+// rejected request carries its X-Router-Reason, and a keyed request carries
+// its admission-gate wait. The frame is the client's RequestFeed contract.
+func TestHandleBurst_ReasonAndGateWait(t *testing.T) {
+	m := newTestMetrics()
+	now := time.Now()
+	// A rejected request (downstream gate) with a reason.
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 429,
+		RejectReason: "gpu-budget-full",
+	})
+	// An accepted keyed request with an admission-gate wait.
+	m.recordRequest("b", requestSample{
+		T: now, Backend: "b", Status: 200, accepted: true, GateWaitMs: 120.5,
+	})
+
+	saveMetrics := metrics
+	metrics = m
+	t.Cleanup(func() { metrics = saveMetrics })
+	srv := httptest.NewServer(buildMetricsMux())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics/burst?limit=2")
+	if err != nil {
+		t.Fatalf("burst: %v", err)
+	}
+	var burst struct {
+		Requests []struct {
+			Status       int     `json:"status"`
+			RejectReason string  `json:"rejectReason"`
+			GateWaitMs   float64 `json:"gateWaitMs"`
+		} `json:"requests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&burst); err != nil {
+		t.Fatalf("burst decode: %v", err)
+	}
+	resp.Body.Close()
+	if len(burst.Requests) != 2 {
+		t.Fatalf("burst = %d entries, want 2", len(burst.Requests))
+	}
+	var rejected, accepted bool
+	for _, r := range burst.Requests {
+		switch {
+		case r.Status == 429:
+			rejected = true
+			if r.RejectReason != "gpu-budget-full" {
+				t.Errorf("rejected rejectReason = %q, want gpu-budget-full", r.RejectReason)
+			}
+		case r.Status == 200:
+			accepted = true
+			if r.GateWaitMs != 120.5 {
+				t.Errorf("accepted gateWaitMs = %v, want 120.5", r.GateWaitMs)
+			}
+			if r.RejectReason != "" {
+				t.Errorf("accepted rejectReason = %q, want empty", r.RejectReason)
+			}
+		}
+	}
+	if !rejected || !accepted {
+		t.Fatalf("burst missing expected status 429/200 entries")
+	}
+}
+
 func firstTokInt(b struct {
 	Requests []struct {
 		NewTokensEst int `json:"newTokensEst"`
@@ -3051,6 +3179,109 @@ func TestHistory_SnapshotRoundTrip(t *testing.T) {
 	}
 	if got := len(h2.gpus["GPU-1"].raw.ordered()); got != 1 {
 		t.Fatalf("loaded gpu raw points = %d, want 1", got)
+	}
+}
+
+// TestHistory_V2Migration loads a genuine V2 snapshot (25 fields, uint32
+// flags) and verifies the reader migrates it to V3: the shared 25 series
+// survive with their values, the GPU point survives, and the 19 new capacity
+// fields stay null (an old snapshot has no capacity data — they must not be
+// reported as 0). A version that is neither 2 nor 3 is dropped.
+func TestHistory_V2Migration(t *testing.T) {
+	path := t.TempDir() + "/history.gob"
+	now := time.Now().UnixMilli()
+
+	// Build a V2 wire point: inFlight=7, kvPct=42, ttftMax via max flag.
+	var p2 histPointV2
+	p2.T = now - 2000
+	p2.V[hiInFlight] = 7
+	p2.V[hiKVPct] = 42
+	p2.Flags = (1 << uint(hiInFlight)) | (1 << uint(hiKVPct))
+
+	v2 := historySnapshotV2{
+		Version: 2,
+		SavedAt: now,
+		Backends: map[string]histSeriesSnapV2{
+			"b": {Raw: []histPointV2{p2}},
+		},
+		Fleet: histSeriesSnapV2{Raw: []histPointV2{p2}},
+		GPUs: map[string]histGPUSnap{
+			"GPU-1": {Raw: []gpuPoint{{T: now - 2000, V: [guFieldN]float32{guUtil: 88}, Flags: 1 << guUtil}}},
+		},
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := gob.NewEncoder(f).Encode(v2); err != nil {
+		t.Fatalf("encode v2: %v", err)
+	}
+	f.Close()
+
+	h := newHistoryStore()
+	h.configure(path)
+	h.loadSnapshot(path)
+
+	pts := h.backends["b"].raw.ordered()
+	if len(pts) != 1 {
+		t.Fatalf("backend raw points = %d, want 1 (V2 not migrated)", len(pts))
+	}
+	p := pts[0]
+	if !hpHas(p, hiInFlight) || p.V[hiInFlight] != 7 {
+		t.Errorf("inFlight = %v set=%v, want 7/set", p.V[hiInFlight], hpHas(p, hiInFlight))
+	}
+	if !hpHas(p, hiKVPct) || p.V[hiKVPct] != 42 {
+		t.Errorf("kvPct = %v set=%v, want 42/set", p.V[hiKVPct], hpHas(p, hiKVPct))
+	}
+	// The new capacity fields must be null, not zero.
+	if hpHas(p, hiAdmActive) || hpHas(p, hiGpuWaiting) || hpHas(p, hiAdmGateWaitMs) {
+		t.Errorf("new capacity field set on a migrated V2 point: flags=%b", p.Flags)
+	}
+	// The FLEET series migrates too: the seeded V2 point carries over with
+	// its V2 values (inFlight=7, kvPct=42) and null new capacity fields.
+	// (The raw ring may hold a zero-point tail, so locate the point by its
+	// carried value, mirroring the backend series above.)
+	var fpFound bool
+	for _, fp := range h.fleet.raw.ordered() {
+		if !hpHas(fp, hiInFlight) {
+			continue
+		}
+		fpFound = true
+		if fp.V[hiInFlight] != 7 {
+			t.Errorf("fleet inFlight = %v, want 7", fp.V[hiInFlight])
+		}
+		if !hpHas(fp, hiKVPct) || fp.V[hiKVPct] != 42 {
+			t.Errorf("fleet kvPct = %v set=%v, want 42/set", fp.V[hiKVPct], hpHas(fp, hiKVPct))
+		}
+		if hpHas(fp, hiAdmActive) || hpHas(fp, hiGpuWaiting) {
+			t.Errorf("fleet new capacity field set on a migrated V2 point: flags=%b", fp.Flags)
+		}
+	}
+	if !fpFound {
+		t.Errorf("fleet V2 point with inFlight not found (V2 fleet not migrated)")
+	}
+	// GPU point survives (its layout never changed).
+	if g := h.gpus["GPU-1"].raw.ordered(); len(g) != 1 || g[0].V[guUtil] != 88 {
+		t.Errorf("gpu raw = %+v, want 1 point util=88", g)
+	}
+}
+
+// TestHistory_BadVersionDropped confirms a snapshot with a version that is
+// neither 2 (migratable) nor 3 (current) is ignored, not partially loaded.
+func TestHistory_BadVersionDropped(t *testing.T) {
+	path := t.TempDir() + "/history.gob"
+	h := newHistoryStore()
+	h.configure(path)
+	// A V1-era file: version 1, no data. The V3 decode sees version 1 != 3;
+	// the V2 reader sees version 1 != 2. Both reject → nothing loaded.
+	var v historySnapshotV2
+	v.Version = 1
+	f, _ := os.Create(path)
+	gob.NewEncoder(f).Encode(v)
+	f.Close()
+	h.loadSnapshot(path)
+	if len(h.backends) != 0 || len(h.gpus) != 0 {
+		t.Fatalf("bad-version snapshot loaded data: backends=%d gpus=%d", len(h.backends), len(h.gpus))
 	}
 }
 
@@ -4247,6 +4478,9 @@ func TestProxy_OversizedBodyRejected(t *testing.T) {
 	if s.BytesIn != 1024 {
 		t.Errorf("bytesIn = %d, want 1024 (capped at maxBodyBytes)", s.BytesIn)
 	}
+	if s.RejectReason != "body-too-large" {
+		t.Errorf("sample rejectReason = %q, want body-too-large", s.RejectReason)
+	}
 }
 
 // TestGPURegistry_ScrapeTransitions covers the registry's status machine:
@@ -4526,6 +4760,426 @@ func TestLoadMetricsAllowedHosts_NormalizesEntries(t *testing.T) {
 // /metrics/sessions is 200 session-feed JSON, / (SPA) answers without a
 // guard error (200 with the webui tag, 404 on the plain stub — both
 // prove the guard delegated past it).
+
+func TestPressureStreamingGateExitBeforeCompletion(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("first"))
+		w.(http.Flusher).Flush()
+		close(entered)
+		<-release
+		w.Write([]byte("last"))
+	}))
+	defer upstream.Close()
+	defer free()
+	withRouterEnv(t, []Backend{{Name: "smoke", URL: upstream.URL}}, map[string]int{"smoke": 1}, nil)
+	saIsolate(t)
+	proxies["smoke"] = newTestProxy(upstream.URL)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleProxy(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"smoke","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	}()
+	<-entered
+	metrics.computeRates(time.Now())
+	snap := metrics.snapshot("smoke")
+	if snap.QueueWait == nil || snap.QueueWait.Execution.Samples != 1 {
+		free()
+		<-done
+		t.Fatal("gate exit not visible during stream")
+	}
+	if len(metrics.burst(10)) != 0 {
+		free()
+		<-done
+		t.Fatal("unfinished stream recorded as complete")
+	}
+	free()
+	<-done
+	metrics.computeRates(time.Now())
+	snap = metrics.snapshot("smoke")
+	samples := metrics.burst(10)
+	if snap.QueueWait.Execution.Samples != 1 || len(samples) != 1 || samples[0].QueueWait.Present != (1<<queueStageExecution) || samples[0].TTFTMs < 0 {
+		t.Fatalf("completion duplicated/lost observation: %+v %+v", snap, samples)
+	}
+}
+
+func TestPressureAdmissionReasonHandlers(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		t.Run(fmt.Sprint(timeout), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+			defer upstream.Close()
+			withRouterEnv(t, []Backend{{Name: "smoke", URL: upstream.URL}}, map[string]int{"smoke": 2}, nil)
+			saIsolate(t)
+			c := newSAManualClock()
+			waiting := 0
+			if timeout {
+				waiting = 1
+			}
+			withAdmissionEnv(t, time.Minute, c, 1, waiting)
+			mgr := sessionAdmissions["smoke"]
+			ticket, err := mgr.acquire(context.Background(), "holder", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ticket.release()
+			saved := queueTimeout
+			queueTimeout = 15 * time.Millisecond
+			defer func() { queueTimeout = saved }()
+			rec := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				handleProxy(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(saChatBody("smoke", "new", "hello"))))
+			}()
+			if timeout {
+				saPollAdmissionWaiting(t, "smoke", 1)
+				c.Advance(time.Second)
+			}
+			<-done
+			reason := "session-admission-queue-full"
+			if timeout {
+				reason = "session-admission-timeout"
+			}
+			s := metrics.burst(1)[0]
+			if rec.Code != 429 || rec.Header().Get("X-Router-Reason") != reason || s.RejectReason != reason || s.QueueWait.Present != 1 {
+				t.Fatalf("admission rejection %+v", s)
+			}
+			metrics.computeRates(time.Now())
+			if metrics.snapshot("smoke").Router429.Total != 1 {
+				t.Fatal("admission rejection not counted")
+			}
+			// The MANAGER's own breakdown must reflect the rejection reason
+			// through the handler path (not just the direct
+			// recordGateRejection unit test).
+			f := mgr.aggregateSnapshot()
+			if timeout {
+				if f.RejQueueTimeout != 1 || f.RejQueueFull != 0 || f.RejClientCancel != 0 {
+					t.Fatalf("manager counters = %+v, want timeout=1 only", f)
+				}
+			} else if f.RejQueueFull != 1 || f.RejQueueTimeout != 0 || f.RejClientCancel != 0 {
+				t.Fatalf("manager counters = %+v, want full=1 only", f)
+			}
+		})
+	}
+}
+
+// TestPressureAdmissionClientCancel pins the manager-side rejection counter
+// for the handler's 499 arm: a keyed request queued at a full cap whose
+// client cancels before the queue deadline is recorded by the MANAGER as a
+// client-cancel (RejClientCancel) — the existing reason-handler test only
+// asserts the queue-full and queue-timeout arms through handleProxy. The
+// 499 sample keeps an EMPTY reason (recordRejection(499, "")); the
+// manager's breakdown is the only place the cancel is counted.
+func TestPressureAdmissionClientCancel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer upstream.Close()
+	withRouterEnv(t, []Backend{{Name: "smoke", URL: upstream.URL}}, map[string]int{"smoke": 2}, nil)
+	saIsolate(t)
+	c := newSAManualClock()
+	// maxWaiting=1 so the queued request can be cancelled, not hard-rejected
+	// by a full queue.
+	withAdmissionEnv(t, time.Minute, c, 1, 1)
+	mgr := sessionAdmissions["smoke"]
+	ticket, err := mgr.acquire(context.Background(), "holder", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ticket.release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(saChatBody("smoke", "new", "hello"))).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleProxy(rec, req)
+	}()
+	// The request is queued behind the active "holder" lease; cancel the
+	// client well before the 30s queue deadline.
+	saPollAdmissionWaiting(t, "smoke", 1)
+	cancel()
+	<-done
+
+	// The 499 arm is record-only (it never writes to the closed client), so
+	// the response writer stays untouched — the 499 and its empty reason
+	// live in the burst ring, and the manager's rejection counter is the only
+	// place the cancel identity is counted.
+	s := metrics.burst(1)[0]
+	if s.Status != 499 || s.RejectReason != "" {
+		t.Fatalf("sample = status %d reason %q, want 499/empty", s.Status, s.RejectReason)
+	}
+	f := mgr.aggregateSnapshot()
+	if f.RejClientCancel != 1 {
+		t.Fatalf("RejClientCancel = %d, want 1", f.RejClientCancel)
+	}
+	if f.RejQueueFull != 0 || f.RejQueueTimeout != 0 {
+		t.Fatalf("unrelated counters bumped: full=%d timeout=%d", f.RejQueueFull, f.RejQueueTimeout)
+	}
+	// A client cancel is a 499, never a router 429: the backend's 429
+	// counter must stay zero.
+	if got := metrics.snapshot("smoke").Router429; got != nil && got.Total != 0 {
+		t.Fatalf("429 total = %d, want 0 (cancel is not a router 429)", got.Total)
+	}
+}
+
+func TestPressureRatesPoolingAndCutoff(t *testing.T) {
+	m := newMetricsRegistry()
+	m.ringCap = 1
+	for _, d := range []time.Duration{100 * time.Millisecond, 300 * time.Millisecond} {
+		m.recordGateWait("a", queueStageExecution, d)
+	}
+	m.recordGateWait("b", queueStageExecution, 900*time.Millisecond)
+	m.recordAccept("a", 10, 2)
+	for _, reason := range router429Reasons {
+		m.recordRequest("a", requestSample{Status: 429, RejectReason: reason})
+	}
+	for _, s := range []requestSample{{Status: 429, accepted: true}, {Status: 413, RejectReason: "body-too-large"}, {Status: 499}, {Status: 502}} {
+		m.recordRequest("a", s)
+	}
+	m.computeRates(time.Now())
+	a, b := m.snapshot("a"), m.snapshot("b")
+	if a.Router429.Total != 8 || a.ReqRate != 1.0/30 || a.QueueWait.Execution.Samples != 2 {
+		t.Fatalf("lost same-bucket observations: %+v", a)
+	}
+	for i, r := range a.Router429.ByReason {
+		if r.Reason != router429Reasons[i] || r.Total != 1 || r.Rate != 1.0/30 {
+			t.Fatalf("reason %+v", r)
+		}
+	}
+	f := metricsFrame{Backends: []backendFrame{{QueueWait: a.QueueWait, Router429: a.Router429}, {QueueWait: b.QueueWait}}}
+	applyFleetAggregates(&f)
+	if got := f.Totals.QueueWait.Execution; got.SumMs != 1300 || got.Samples != 3 {
+		t.Fatalf("not pooled: %+v", got)
+	}
+	if a.QueueWait.Execution.SumMs/float64(a.QueueWait.Execution.Samples) != 200 {
+		t.Fatal("backend mean")
+	}
+	if m.snapshot("unused").QueueWait != nil || m.snapshot("unused").Router429 != nil {
+		t.Fatal("unused summaries must be null")
+	}
+	m.computeRates(time.Now().Add(31 * time.Second))
+	a = m.snapshot("a")
+	if a.QueueWait != nil || a.Router429.Total != 8 || a.Router429.Rate != 0 {
+		t.Fatalf("cutoff lost totals or kept window: %+v", a)
+	}
+	if len(m.burst(100)) != 1 {
+		t.Fatal("ring fixture did not evict")
+	}
+}
+
+func TestPressureHistoryReasonRates(t *testing.T) {
+	m := newMetricsRegistry()
+	for _, reason := range router429Reasons {
+		m.recordRequest("b", requestSample{Status: 429, RejectReason: reason})
+	}
+	m.computeRates(time.Now())
+	reasons := m.snapshot("b").Router429
+	enabled := pointFromBackend(backendFrame{Admission: &admissionFrame{}, Router429: reasons})
+	disabled := pointFromBackend(backendFrame{Router429: reasons})
+	unknown := pointFromBackend(backendFrame{Admission: &admissionFrame{}})
+	names := [...]string{"router429BlockedByTier0Rate", "router429SessionQueueFullRate", "router429SessionTimeoutRate", "router429GpuBudgetFullRate", "router429BackendFullRate", "router429BackendQueueFullRate", "router429PrefillFullRate", "router429PrefillQueueFullRate"}
+	for i, name := range names {
+		field := hiRouter429BlockedByTier0Rate + i
+		if histFieldNames[field] != name || !hpHas(enabled, field) || math.Abs(float64(enabled.V[field])-1.0/30) > 1e-8 {
+			t.Fatalf("reason field %s missing or wrong", name)
+		}
+		// Per-reason rates mirror the total for ANY backend that reports
+		// router429 — admission state gates the admission* gauges only, so a
+		// disabled backend's 429 breakdown must be populated identically.
+		if !hpHas(disabled, field) || math.Abs(float64(disabled.V[field])-1.0/30) > 1e-8 {
+			t.Fatalf("disabled reason field %s missing or wrong", name)
+		}
+		if hpHas(unknown, field) {
+			t.Fatalf("reason field %s populated without router429", name)
+		}
+	}
+	var acc histAccum
+	acc.add(enabled)
+	zero := pointFromBackend(backendFrame{Admission: &admissionFrame{}, Router429: newRouter429Frame()})
+	acc.add(zero)
+	rolled := acc.flush(0)
+	for i := range names {
+		field := hiRouter429BlockedByTier0Rate + i
+		if math.Abs(float64(rolled.V[field])-1.0/60) > 1e-8 {
+			t.Fatalf("reason field %d did not average", field)
+		}
+	}
+}
+
+func TestPressureHistoryExpandedAndLegacy(t *testing.T) {
+	if histFieldN != 59 {
+		t.Fatalf("histFieldN=%d", histFieldN)
+	}
+	q := &queueWaitFrame{Execution: waitSummary{SumMs: 400, Samples: 2}}
+	p := pointFromBackend(backendFrame{QueueWait: q, Router429: &router429Frame{Rate: 1.0 / 30}})
+	p.T = time.Now().UnixMilli() - 2000
+	if !hpHas(p, hiPrefillWaitSamplesRate) || !hpHas(p, hiRouter429Rate) || math.Abs(float64(p.V[hiExecutionWaitMsRate])-400.0/30) > 0.001 {
+		t.Fatal("expanded presence/rates")
+	}
+	path := t.TempDir() + "/pressure.gob"
+	h := newHistoryStore()
+	h.configure(path)
+	sh := newSeriesHistory()
+	sh.add(p, p.T)
+	h.backends["b"] = sh
+	h.save()
+	restored := newHistoryStore()
+	restored.configure(path)
+	restored.loadSnapshot(path)
+	got := restored.backends["b"].raw.ordered()[0]
+	if got != p {
+		t.Fatalf("round trip: %+v != %+v", got, p)
+	}
+	if err := os.WriteFile(path, []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	restored = newHistoryStore()
+	restored.loadSnapshot(path)
+	if len(restored.backends) != 0 {
+		t.Fatal("partial corrupt restore")
+	}
+}
+
+func TestPressureBurstPresenceAndReason(t *testing.T) {
+	for _, tc := range []struct {
+		s      requestSample
+		reason string
+	}{
+		{requestSample{Status: 200}, `"rejectReason":null`},
+		{requestSample{Status: 200, RejectReason: ""}, `"rejectReason":null`},
+		{requestSample{Status: 499}, `"rejectReason":""`},
+		{requestSample{Status: 429, accepted: true}, `"rejectReason":null`},
+		{requestSample{Status: 502}, `"rejectReason":null`},
+		{requestSample{Status: 429, RejectReason: "backend-full"}, `"rejectReason":"backend-full"`},
+		{requestSample{Status: 413, RejectReason: "body-too-large"}, `"rejectReason":"body-too-large"`},
+	} {
+		tc.s.QueueWait.set(queueStageExecution, 100*time.Millisecond)
+		b, err := json.Marshal(burstRequestFrame{RejectReason: burstRejectReason(tc.s), QueueWait: tc.s.QueueWait})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), tc.reason) || !strings.Contains(string(b), `"queueWaitMs":{"admission":null,"gpu":null,"execution":100,"prefill":null}`) {
+			t.Fatalf("wire: %s", b)
+		}
+	}
+	b, _ := json.Marshal(queueWaitTimes{})
+	if string(b) != "null" {
+		t.Fatalf("unreached=%s", b)
+	}
+}
+
+func TestPressureGateHandlerOutcomes(t *testing.T) {
+	for _, stage := range []queueStage{queueStageExecution, queueStagePrefill, queueStageGPU} {
+		for _, outcome := range []string{"handoff", "timeout", "cancel"} {
+			if stage == queueStageGPU && outcome == "timeout" {
+				continue
+			} // GPU's fixed five-second wait is covered by its semaphore tests.
+			t.Run(fmt.Sprintf("%d/%s", stage, outcome), func(t *testing.T) {
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) }))
+				defer upstream.Close()
+				list := []Backend{{Name: "smoke", URL: upstream.URL, Tier: 1, GpuWeight: 1, LargePrefillThresholdTokens: 1}}
+				if stage == queueStageGPU {
+					list = append(list, Backend{Name: "king", Tier: 0})
+				}
+				withRouterEnv(t, list, map[string]int{"smoke": 2, "king": 1}, map[string]int{"smoke": 1})
+				saIsolate(t)
+				proxies["smoke"] = newTestProxy(upstream.URL)
+				savedTimeout := queueTimeout
+				queueTimeout = 30 * time.Millisecond
+				defer func() { queueTimeout = savedTimeout }()
+				var release func()
+				switch stage {
+				case queueStageExecution:
+					slots["smoke"] = newSlot(1, 1)
+					slots["smoke"].acquire(time.Second, nil)
+					release = slots["smoke"].release
+				case queueStagePrefill:
+					prefillSlots["smoke"] = newSlot(1, 1)
+					prefillSlots["smoke"].acquire(time.Second, nil)
+					release = prefillSlots["smoke"].release
+				case queueStageGPU:
+					slots["king"].acquire(time.Second, nil)
+					defer slots["king"].release()
+					gpu = &gpuBudget{max: 1}
+					gpu.cond = sync.NewCond(&gpu.mu)
+					gpu.tryAcquire(1, 4, time.Second, nil)
+					release = func() { gpu.release(1) }
+				}
+				var once sync.Once
+				free := func() { once.Do(release) }
+				defer free()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(saChatBody("smoke", "", "large prompt"))).WithContext(ctx)
+				rec := httptest.NewRecorder()
+				done := make(chan struct{})
+				go func() { defer close(done); handleProxy(rec, req) }()
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					waiting := 0
+					switch stage {
+					case queueStageExecution:
+						_, _, w, _ := slots["smoke"].snapshot()
+						waiting = int(w)
+					case queueStagePrefill:
+						_, _, w, _ := prefillSlots["smoke"].snapshot()
+						waiting = int(w)
+					case queueStageGPU:
+						_, _, waiting = gpu.snapshot()
+					}
+					if waiting == 1 {
+						break
+					}
+					if time.Now().After(deadline) {
+						cancel()
+						<-done
+						t.Fatal("gate not reached")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				if outcome == "cancel" {
+					cancel()
+				} else if outcome == "handoff" {
+					free()
+				}
+				<-done
+				samples := metrics.burst(10)
+				if len(samples) != 1 {
+					t.Fatalf("samples=%v", samples)
+				}
+				s := samples[0]
+				if s.QueueWait.Present&(1<<stage) == 0 || s.QueueWait.Ms[stage] <= 0 {
+					t.Fatalf("missing gate duration: %+v", s)
+				}
+				if outcome == "cancel" {
+					if s.Status != 499 || s.RejectReason != "" || rec.Body.Len() != 0 || rec.Flushed {
+						t.Fatalf("cancellation wrote response: %+v %s", s, rec.Body.String())
+					}
+				} else if outcome == "timeout" {
+					if s.Status != 429 || s.RejectReason != rec.Header().Get("X-Router-Reason") {
+						t.Fatalf("reason mismatch: %+v", s)
+					}
+				} else if s.Status != 200 || !s.accepted {
+					t.Fatalf("handoff: %+v", s)
+				}
+				metrics.computeRates(time.Now())
+				snap := metrics.snapshot("smoke")
+				if snap.QueueWait.stage(stage).Samples != 1 {
+					t.Fatalf("gate double counted: %+v", snap.QueueWait)
+				}
+				if outcome != "timeout" && snap.Router429 != nil {
+					t.Fatal("non rejection incremented router429")
+				}
+				if outcome != "handoff" && stage != queueStagePrefill && s.QueueWait.Present&(1<<queueStagePrefill) != 0 {
+					t.Fatal("later gate fabricated")
+				}
+			})
+		}
+	}
+}
+
 func TestManagementMux_Guard403Host(t *testing.T) {
 	// The guard's VIEW of the allowlist: seed one live session row so a
 	// hostile /metrics/sessions caller CAN observe a leak (sessions and

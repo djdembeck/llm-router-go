@@ -9,6 +9,7 @@ import { browser } from "$app/env";
 import {
   emptyEngine,
   getJSON,
+  type StatsResponse,
   type BurstRequest,
   type Frame,
   type SessionsFeed,
@@ -23,26 +24,6 @@ export interface FeedInfo {
   gone: boolean;
 }
 
-interface StatsBackend {
-  name: string;
-  url: string;
-  tier: number;
-  inFlight: number;
-  maxConcurrent: number;
-  waiting: number;
-  maxQueueDepth: number;
-  prefillInFlight: number;
-  prefillWaiting: number;
-  prefillMax: number;
-  avgDurationS: number;
-}
-interface StatsResponse {
-  backends: StatsBackend[];
-  gpuUsed: number;
-  gpuBudget: number;
-  gpuWaiting: number;
-  tier0Inflight: number;
-}
 
 const LIVE_FRAMES_CAP = 900;
 
@@ -155,6 +136,10 @@ export class LiveStore {
       return;
     }
     if (!j || !Array.isArray(j.backends) || typeof j.t !== "number") return;
+    // totals.queueWait / totals.router429 arrive already pooled by the
+    // server's applyFleetAggregates (sum the sums, sum the counts); the
+    // client trusts the server's fleet rollup, never re-pools per-backend
+    // frames.
     if (f.kind !== "stats") this.stopStats();
     const sig = j.backends.map((b) => b.name).sort().join("|");
     if (this.backendSig && sig !== this.backendSig) {
@@ -377,13 +362,22 @@ export class LiveStore {
       tokEstRate: 0,
       reqTotal: 0,
       rejectTotal: 0,
+      // The /stats fallback carries the admission lease snapshot (authoritative)
+      // but not the per-backend lifetime refusal breakdown — null there, not a
+      // fake zero, so the panel's refusal-reasons row stays empty.
+      rejectReasons: null,
       bytesInTotal: 0,
       bytesOutTotal: 0,
       tokEstTotal: 0,
       engine: { ...emptyEngine },
+      admission: b.admission,
+      router429: null,
+      queueWait: null,
+      engineQueue: b.engineQueue ?? null,
     }));
     const inFlight = backends.reduce((a, b) => a + b.inFlight, 0);
     const waiting = backends.reduce((a, b) => a + b.waiting, 0);
+    const admActive = backends.reduce((a, b) => a + (b.admission?.active ?? 0), 0);
     return {
       t,
       backends,
@@ -399,6 +393,9 @@ export class LiveStore {
       totals: {
         inFlight,
         waiting,
+        admActive,
+        router429: null,
+        queueWait: null,
         reqRate: 0,
         bytesRate: 0,
         tokEstRate: 0,

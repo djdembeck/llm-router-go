@@ -51,6 +51,16 @@
     return "ok";
   }
 
+  function waitValue(v: number | null | undefined): string {
+    return v == null || !Number.isFinite(v) ? "—" : v === 0 ? "0" : fmtMs(v);
+  }
+  function csvNumber(v: number | null | undefined): string {
+    return v == null || !Number.isFinite(v) ? "" : v.toFixed(1);
+  }
+  function gateTitle(r: BurstRequest): string {
+    return "Admission gate visible; stage gate waits: " + (["admission", "gpu", "execution", "prefill"] as const)
+      .map((stage) => stage + ": " + waitValue(r.queueWaitMs?.[stage])).join("; ");
+  }
   function exportCsv(): void {
     const head = [
       "completed_ms",
@@ -64,6 +74,11 @@
       "bytes_in",
       "bytes_out",
       "new_tokens_est",
+      "reason",
+      "admission_wait_ms",
+      "gpu_wait_ms",
+      "execution_wait_ms",
+      "prefill_wait_ms",
     ];
     const lines = [head.join(",")];
     for (const r of requests) {
@@ -80,6 +95,11 @@
           r.bytesIn,
           r.bytesOut,
           r.newTokensEst,
+          csvEscape(r.rejectReason ?? ""),
+          csvNumber(r.queueWaitMs?.admission),
+          csvNumber(r.queueWaitMs?.gpu),
+          csvNumber(r.queueWaitMs?.execution),
+          csvNumber(r.queueWaitMs?.prefill),
         ].join(","),
       );
     }
@@ -137,6 +157,8 @@
             <th class="col-status num">STATUS</th>
             <th class="col-ttft num">TTFT</th>
             <th class="col-dur num">DUR</th>
+            <th class="col-gate num" title="Time in the admission gate only (keyed traffic); not the downstream GPU/slot/prefill waits">GATE WAIT</th>
+            <th class="col-reason">REASON</th>
             <th class="col-tok num">TOK <span class="tag est">est</span></th>
           </tr>
         </thead>
@@ -154,11 +176,15 @@
               <td class="col-status num {statusClass(r.status)}">{r.status}</td>
               <td class="col-ttft num">{r.ttftMs > 0 ? fmtMs(r.ttftMs) : "—"}</td>
               <td class="col-dur num">{fmtMs(r.durMs)}</td>
+              <td class="col-gate num"><details><summary title={gateTitle(r)}>{waitValue(r.gateWaitMs)}</summary><span class="detail">{gateTitle(r)}</span></details></td>
+              <td class="col-reason mono {r.status === 429 ? 'water' : ''}" title={r.rejectReason || undefined}>
+                {r.rejectReason || (r.status === 429 ? "upstream / unknown" : "—")}
+              </td>
               <td class="col-tok num">{fmtInt(r.newTokensEst)}</td>
             </tr>
           {:else}
             <tr class="empty">
-              <td colspan={singleBackend == null ? 7 : 6}>
+              <td colspan={singleBackend == null ? 9 : 8}>
                 {onlyErrors ? "no 429+ rejections in the recent ring" : "the tape is quiet"}
               </td>
             </tr>
@@ -192,21 +218,36 @@
   }
   .feed .data-table {
     table-layout: fixed;
+    min-width: 800px;
   }
-  .feed .data-table .col-time { width: 12%; }
-  .feed .data-table .col-backend { width: 13%; }
-  .feed .data-table .col-path { width: 30%; }
-  .feed .data-table .col-status { width: 8%; }
-  .feed .data-table .col-ttft { width: 10%; }
-  .feed .data-table .col-dur { width: 10%; }
+  .feed .data-table .col-time { width: 10%; }
+  .feed .data-table .col-backend { width: 12%; }
+  .feed .data-table .col-path { width: 24%; }
+  .feed .data-table .col-status { width: 7%; }
+  .feed .data-table .col-ttft { width: 8%; }
+  .feed .data-table .col-dur { width: 8%; }
+  .feed .data-table .col-gate { width: 7%; }
+  .feed .data-table .col-reason { width: 14%; }
   .feed .data-table .col-tok { width: 9%; }
   /* The backend column is omitted in single-server mode; PATH absorbs its share. */
-  .feed .data-table.single .col-path { width: 43%; }
+  .feed .data-table.single .col-path { width: 36%; }
   .path {
     max-width: 220px;
     overflow: hidden;
     text-overflow: ellipsis;
     color: var(--ink-3);
+  }
+  .col-reason {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The expanded GATE WAIT body is a ~110-char stage breakdown: let it wrap
+     inside the 7% column (nowrap stays on the short summary value, so the
+     collapsed view is unchanged). */
+  .col-gate {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .data-table td.ok {
     color: var(--moss);
@@ -229,7 +270,9 @@
     font-size: 10px;
   }
   @media (max-width: 639px) {
-    .col-path {
+    .col-path,
+    .col-gate,
+    .col-reason {
       display: none;
     }
     .foot {

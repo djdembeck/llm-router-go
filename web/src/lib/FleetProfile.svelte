@@ -8,6 +8,7 @@
   } from "./api";
   import {
     buildLanes,
+    LAYERS,
     fmtLayerValue,
     layerById,
     scaleFor,
@@ -26,7 +27,7 @@
     history,
     frames,
     framesVersion,
-    layerId,
+    layerId = $bindable(),
     range,
     selected,
     singleBackend,
@@ -199,6 +200,14 @@
         return "--amber";
       case "decode":
         return "--moss";
+      case "admission":
+      case "admissionQueue":
+      case "executionQueue":
+      case "prefillQueue":
+        return "--amber";
+      case "engineQueue":
+      case "router429":
+        return "--water";
       case "util":
       case "vram":
         return "--sand-lit";
@@ -664,6 +673,7 @@
   <div class="profile-head">
     <div class="row wrap">
       <span class="label">{singleBackend !== null ? "SERVER PROFILE" : "FLEET PROFILE"}</span>
+      <label class="detail muted">Layer <select class="btn" bind:value={layerId}>{#each LAYERS as option (option.id)}<option value={option.id}>{option.label}</option>{/each}</select></label>
       <span class="tag {layer.source}">{layer.source}</span>
       <span class="detail muted">{layer.note}</span>
     </div>

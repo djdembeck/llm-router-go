@@ -46,6 +46,37 @@ interface MockBackend {
   bytesOutTotal: number;
   tokEstTotal: number;
   spikeTicks: number;
+  // session-admission lease caps (0 = admission disabled for this backend)
+  maxAdmitted: number;
+  maxWaiting: number;
+  // session-admission lease state (simulated)
+  admActive: number;
+  admIdle: number;
+  admWaiting: number;
+  admOldestWaitMs: number;
+  admReclaimed: number;
+  admGateMs: number;
+  admGateTotalMs: number;
+  admGateCount: number;
+  admRejFull: number;
+  admRejTimeout: number;
+  admRejCancel: number;
+  rejectReasons: Record<string, number>;
+  // trailing-30s gate-exit telemetry (simulated; a 60-tick decayed window
+  // at the 500ms dev stream cadence)
+  qwAdmMs: number;
+  qwAdmN: number;
+  qwGpuMs: number;
+  qwGpuN: number;
+  qwExecMs: number;
+  qwExecN: number;
+  qwPrefMs: number;
+  qwPrefN: number;
+  // router-originated 429s (simulated): lifetime totals + 60-tick window
+  r429Total: number;
+  r429Window: number;
+  r429ByReason: Record<string, number>;
+  r429WindowByReason: Record<string, number>;
   // engine's own /metrics truth (simulated)
   engRunning: number;
   engWaiting: number;
@@ -80,6 +111,33 @@ const BACKENDS: MockBackend[] = [
     bytesOutTotal: 183000000,
     tokEstTotal: 4210000,
     spikeTicks: 0,
+    // admission off for the king: the panel shows its slot fill instead.
+    maxAdmitted: 0,
+    maxWaiting: 0,
+    admActive: 0,
+    admIdle: 0,
+    admWaiting: 0,
+    admOldestWaitMs: 0,
+    admReclaimed: 0,
+    admGateMs: 0,
+    admGateTotalMs: 0,
+    admGateCount: 0,
+    admRejFull: 0,
+    admRejTimeout: 0,
+    admRejCancel: 0,
+    rejectReasons: {},
+    qwAdmMs: 0,
+    qwAdmN: 0,
+    qwGpuMs: 0,
+    qwGpuN: 0,
+    qwExecMs: 0,
+    qwExecN: 0,
+    qwPrefMs: 0,
+    qwPrefN: 0,
+    r429Total: 0,
+    r429Window: 0,
+    r429ByReason: {},
+    r429WindowByReason: {},
     engRunning: 2,
     engWaiting: 0,
     engKV: 42,
@@ -111,6 +169,33 @@ const BACKENDS: MockBackend[] = [
     bytesOutTotal: 74000000,
     tokEstTotal: 1810000,
     spikeTicks: 0,
+    // admission on for the subject: the panel shows its lease/gate state.
+    maxAdmitted: 3,
+    maxWaiting: 4,
+    admActive: 1,
+    admIdle: 0,
+    admWaiting: 0,
+    admOldestWaitMs: 0,
+    admReclaimed: 3,
+    admGateMs: 12,
+    admGateTotalMs: 1440,
+    admGateCount: 120,
+    admRejFull: 2,
+    admRejTimeout: 9,
+    admRejCancel: 4,
+    rejectReasons: { "gpu-budget-full": 38, "session-admission-queue-full": 2 },
+    qwAdmMs: 144,
+    qwAdmN: 12,
+    qwGpuMs: 0,
+    qwGpuN: 0,
+    qwExecMs: 96,
+    qwExecN: 8,
+    qwPrefMs: 0,
+    qwPrefN: 0,
+    r429Total: 40,
+    r429Window: 0,
+    r429ByReason: { "gpu-budget-full": 38, "session-admission-queue-full": 2 },
+    r429WindowByReason: {},
     engRunning: 1,
     engWaiting: 0,
     engKV: 58,
@@ -119,6 +204,14 @@ const BACKENDS: MockBackend[] = [
     engTTFT: 590,
   },
 ];
+
+// The fixed eight router-429 reasons in the live frame's stable order
+// (mirrors ROUTER_429_REASONS in api.ts; kept local — the mock imports
+// types from api, not runtime values).
+const REASONS = [
+  "blocked-by-tier0", "session-admission-queue-full", "session-admission-timeout",
+  "gpu-budget-full", "backend-full", "backend-queue-full", "prefill-full", "prefill-queue-full",
+] as const;
 
 const clamp = (v: number, lo: number, hi: number) =>
   Math.min(hi, Math.max(lo, v));
@@ -138,6 +231,11 @@ export interface BurstReq {
   newTokensEst: number;
   bytesIn: number;
   bytesOut: number;
+  // X-Router-Reason for a router-originated rejection; null for accepted
+  // (the wire contract's null-for-accepted, never an empty string).
+  rejectReason: string | null;
+  // Admission-gate wait in ms (keyed traffic); 0 for unkeyed/disabled.
+  gateWaitMs: number;
 }
 const BURST_CAP = 500;
 let ring: BurstReq[] = [];
@@ -180,6 +278,15 @@ function spawnRequest(t: number): void {
   const bytesOut = rejected
     ? Math.round(120 + Math.random() * 300)
     : Math.round(durMs * (8 + Math.random() * 10));
+  // Keyed traffic (admission enabled) sits in the gate before admission; the
+  // king is unkeyed, so its gate wait is 0. A spike rejection carries a
+  // reason and a (short) gate wait; a 502 is upstream, not a router refusal.
+  const keyed = b.maxAdmitted > 0;
+  const gateWaitMs = keyed ? Math.round(5 + Math.random() * (b.spikeTicks > 0 ? 400 : 60)) : 0;
+  let rejectReason: string | null = null;
+  if (status === 429) {
+    rejectReason = Math.random() < 0.3 ? "session-admission-queue-full" : "gpu-budget-full";
+  }
   pending.push({
     t: t + durMs,
     start: t,
@@ -192,6 +299,8 @@ function spawnRequest(t: number): void {
     newTokensEst: rejected ? 0 : tokEst,
     bytesIn,
     bytesOut,
+    rejectReason,
+    gateWaitMs,
   });
   if (rejected) b.rejectTotal++;
   if (!rejected) {
@@ -259,6 +368,92 @@ function tick(): Frame {
     b.engPrefill = Math.round(walk(b.engPrefill, spike ? 900 : 350, 0, 12000));
     b.engDecode = Math.round(b.engRunning * walk(b.engDecode / Math.max(1, b.engRunning), 25, 80, 220));
     b.engTTFT = Math.round(walk(b.engTTFT, 45, 90, 1400));
+    // admission leases track the subject's saturation: at cap during a spike,
+    // newcomers queue and the gate rejects a few; idle leases free on the
+    // downswing. The king has admission off (maxAdmitted 0) and stays inert.
+    if (b.maxAdmitted > 0) {
+      const leased = b.admActive + b.admIdle;
+      b.admActive = clamp(Math.round(walk(b.admActive, 0.8, 0, b.maxAdmitted)), 0, b.maxAdmitted);
+      // idle holds a few slots after a request finishes; spikes burn them.
+      b.admIdle = clamp(
+        Math.round(walk(b.admIdle, 0.6, 0, Math.max(0, b.maxAdmitted - b.admActive))),
+        0,
+        Math.max(0, b.maxAdmitted - b.admActive),
+      );
+      b.admWaiting = spike
+        ? Math.round(walk(b.admWaiting, 1.4, 0, b.maxWaiting))
+        : Math.random() < 0.2 ? 1 : 0;
+      b.admOldestWaitMs = b.admWaiting > 0 ? Math.round(walk(b.admOldestWaitMs, 400, 120, 4000)) : 0;
+      // every queued newcomer that is admitted or rejected accrues gate wait.
+      const arrivals = Math.round(b.admWaiting + Math.random() * 2);
+      if (arrivals > 0) {
+        b.admGateTotalMs += arrivals * Math.round(20 + Math.random() * 120);
+        b.admGateCount += arrivals;
+        b.admGateMs = Math.round(b.admGateTotalMs / b.admGateCount);
+      }
+      if (spike && leased >= b.maxAdmitted && Math.random() < 0.3) {
+        if (b.admWaiting >= b.maxWaiting) {
+          b.admRejFull++;
+          b.rejectReasons["session-admission-queue-full"] =
+            (b.rejectReasons["session-admission-queue-full"] ?? 0) + 1;
+        } else if (Math.random() < 0.5) {
+          b.admRejTimeout++;
+          b.rejectReasons["session-admission-timeout"] =
+            (b.rejectReasons["session-admission-timeout"] ?? 0) + 1;
+        } else {
+          b.admRejCancel++;
+          b.rejectReasons["client-cancel"] = (b.rejectReasons["client-cancel"] ?? 0) + 1;
+        }
+      }
+      // pressure reclaims an idle lease when the cap is full and there's demand.
+      if (spike && leased >= b.maxAdmitted && b.admIdle > 0 && Math.random() < 0.4) {
+        b.admIdle--;
+        b.admReclaimed++;
+      }
+    }
+    // Trailing-30s gate-exit telemetry: one decayed 60-tick window at the
+    // 500ms dev cadence, per backend. Each tick accrues a few gate exits —
+    // every stage the traffic attempts (admission only for keyed traffic;
+    // execution always; the GPU stage only while tier-0 runs; prefill when
+    // the queue is non-empty).
+    {
+      const gateExits = (baseMs: number, p: number) => {
+        const n = Math.random() < p ? 1 + Math.round(Math.random() * 2) : 0;
+        return { ms: n * Math.round(baseMs * (0.5 + Math.random())), n };
+      };
+      const keyed = b.maxAdmitted > 0;
+      const a = gateExits(24, keyed ? (b.admWaiting > 0 ? 0.75 : 0.35) : 0);
+      const x = gateExits(35, b.waiting > 0 ? 0.7 : 0.25);
+      const g = BACKENDS[0].inFlight > 0 ? gateExits(48, 0.2) : { ms: 0, n: 0 };
+      const pf = b.prefillWaiting > 0 ? gateExits(30, 0.6) : { ms: 0, n: 0 };
+      const d = 0.983;
+      b.qwAdmMs = Math.round(b.qwAdmMs * d + a.ms);
+      b.qwAdmN = Math.round(b.qwAdmN * d + a.n);
+      b.qwGpuMs = Math.round(b.qwGpuMs * d + g.ms);
+      b.qwGpuN = Math.round(b.qwGpuN * d + g.n);
+      b.qwExecMs = Math.round(b.qwExecMs * d + x.ms);
+      b.qwExecN = Math.round(b.qwExecN * d + x.n);
+      b.qwPrefMs = Math.round(b.qwPrefMs * d + pf.ms);
+      b.qwPrefN = Math.round(b.qwPrefN * d + pf.n);
+      // Router-originated 429s: the subject's saturation rejects a few per
+      // tick (a rate of at most ~2/30s), split across its refusal reasons.
+      if (spike && b.tier > 0 && Math.random() < 0.4) {
+        const reason =
+          b.admWaiting >= b.maxWaiting
+            ? "session-admission-queue-full"
+            : Math.random() < 0.5
+              ? "gpu-budget-full"
+              : "backend-full";
+        b.r429Total++;
+        b.r429Window++;
+        b.r429ByReason[reason] = (b.r429ByReason[reason] ?? 0) + 1;
+        b.r429WindowByReason[reason] = (b.r429WindowByReason[reason] ?? 0) + 1;
+      }
+      b.r429Window = Math.round(b.r429Window * d);
+      for (const k of Object.keys(b.r429WindowByReason)) {
+        b.r429WindowByReason[k] = Math.round(b.r429WindowByReason[k] * d);
+      }
+    }
     stepEngineV2(i, spike);
     const n = Math.random() < b.reqRate * 0.5
       ? Math.round(b.reqRate * 0.5) + 1
@@ -291,10 +486,63 @@ function tick(): Frame {
     tokEstRate: b.tokEstRate,
     reqTotal: b.reqTotal,
     rejectTotal: b.rejectTotal,
+    // null when admission is disabled (the king) — matches the router's
+    // null-when-off contract, so the panel renders the slot-fill fallback.
+    rejectReasons: Object.keys(b.rejectReasons).length ? b.rejectReasons : null,
     bytesInTotal: b.bytesInTotal,
     bytesOutTotal: b.bytesOutTotal,
     tokEstTotal: b.tokEstTotal,
+    admission:
+      b.maxAdmitted > 0
+        ? {
+            maxAdmitted: b.maxAdmitted,
+            maxWaiting: b.maxWaiting,
+            idleTTLms: 30000,
+            active: b.admActive,
+            idle: b.admIdle,
+            waiting: b.admWaiting,
+            oldestWaitMs: b.admOldestWaitMs,
+            reclaimedTotal: b.admReclaimed,
+            gateWaitMs: b.admGateMs,
+            gateWaitTotalMs: b.admGateTotalMs,
+            gateWaitCount: b.admGateCount,
+            rejQueueFull: b.admRejFull,
+            rejQueueTimeout: b.admRejTimeout,
+            rejClientCancel: b.admRejCancel,
+          }
+        : null,
     engine: engineV2(i),
+    // null when no gate exit has ever been recorded in the window — the
+    // router nils the frame on a zero 30s count, never a zero-filled one.
+    queueWait:
+      b.qwAdmN + b.qwGpuN + b.qwExecN + b.qwPrefN > 0
+        ? {
+            admission: { sumMs: b.qwAdmMs, samples: b.qwAdmN },
+            gpu: { sumMs: b.qwGpuMs, samples: b.qwGpuN },
+            execution: { sumMs: b.qwExecMs, samples: b.qwExecN },
+            prefill: { sumMs: b.qwPrefMs, samples: b.qwPrefN },
+          }
+        : null,
+    // null until the first router-originated 429 (the subject's spike
+    // rejects); the king (tier 0, unkeyed) never 429s and stays null.
+    router429:
+      b.r429Total > 0
+        ? {
+            total: b.r429Total,
+            rate: +(b.r429Window / 30).toFixed(3),
+            byReason: REASONS.map((reason) => ({
+              reason,
+              total: b.r429ByReason[reason] ?? 0,
+              rate: +((b.r429WindowByReason[reason] ?? 0) / 30).toFixed(3),
+            })),
+          }
+        : null,
+    // The engine's own scrape-cadence queue time (not the router's 30s
+    // window); null while the engine reports no queue time.
+    engineQueue:
+      b.engWaiting > 0
+        ? { sumMs: Math.round(b.engWaiting * (140 + Math.random() * 60)), samples: 1 }
+        : null,
   }));
 
   return {
@@ -335,6 +583,7 @@ function tick(): Frame {
     totals: {
       inFlight: BACKENDS.reduce((a, b) => a + b.inFlight, 0),
       waiting: BACKENDS.reduce((a, b) => a + b.waiting, 0),
+      admActive: BACKENDS.reduce((a, b) => a + b.admActive, 0),
       reqRate: +BACKENDS.reduce((a, b) => a + b.reqRate, 0).toFixed(2),
       bytesRate: BACKENDS.reduce((a, b) => a + b.bytesRate, 0),
       tokEstRate: BACKENDS.reduce((a, b) => a + b.tokEstRate, 0),
@@ -359,6 +608,36 @@ function tick(): Frame {
       kvMemGB: 28.4,
       weightMemGB: 12.1,
       hitRate: (ENG[0].hitRate + ENG[1].hitRate) / 2,
+      // The fleet rollups the server's applyFleetAggregates publishes:
+      // per-stage sums/counts pooled (never a mean of means); the 429
+      // total/rate and per-reason rows summed across backends. Both are
+      // null while no backend reports the field.
+      queueWait: backends.some((b) => b.queueWait)
+        ? (["admission", "gpu", "execution", "prefill"] as const).reduce(
+            (acc, stage) => {
+              acc[stage] = backends.reduce(
+                (s, b) => ({
+                  sumMs: s.sumMs + (b.queueWait?.[stage]?.sumMs ?? 0),
+                  samples: s.samples + (b.queueWait?.[stage]?.samples ?? 0),
+                }),
+                { sumMs: 0, samples: 0 },
+              );
+              return acc;
+            },
+            {} as Record<string, { sumMs: number; samples: number }>,
+          )
+        : null,
+      router429: backends.some((b) => b.router429)
+        ? {
+            total: backends.reduce((n, b) => n + (b.router429?.total ?? 0), 0),
+            rate: +backends.reduce((n, b) => n + (b.router429?.rate ?? 0), 0).toFixed(3),
+            byReason: REASONS.map((reason) => ({
+              reason,
+              total: backends.reduce((n, b) => n + (b.router429?.byReason.find((r) => r.reason === reason)?.total ?? 0), 0),
+              rate: +backends.reduce((n, b) => n + (b.router429?.byReason.find((r) => r.reason === reason)?.rate ?? 0), 0).toFixed(3),
+            })),
+          }
+        : null,
     },
   };
 }
@@ -982,6 +1261,46 @@ export function mockHistory(range: RangeName): HistoryResponse {
       +clamp(0.8 + wave(i, 17, bi) * 0.5 + spike(i) / 60, 0, 9).toFixed(2),
     );
     const hit = col((i) => +clamp(0.36 + wave(i, 41, bi * 2) * 0.1, 0.1, 0.75).toFixed(3));
+    // Active session-admission leases: null for a backend with admission off
+    // (the king) — never a fake zero; the subject follows its lease walk and
+    // pins at cap through the saturation spike.
+    const admissionActive = b.maxAdmitted > 0
+      ? col((i) =>
+          Math.round(clamp(b.admActive + wave(i, 25, bi * 1.3) * 0.9 + spike(i) / 8, 0, b.maxAdmitted)),
+        )
+      : col(() => null);
+    // Admission-queue depth: null for a backend with admission off (the
+    // king) — never a fake zero.
+    const admissionWaiting = b.maxAdmitted > 0
+      ? col((i) => Math.round(clamp(wave(i, 11, bi + 2) > 0.4 ? 1 + spike(i) / 17 : 0, 0, b.maxWaiting)))
+      : col(() => null);
+    // Router-429 rate: null for a backend that never emitted a router 429;
+    // once present, all eight per-reason rows are present too (zeros for
+    // unused reasons), matching the live byReason contract.
+    const has429 = b.r429Total > 0;
+    const r429Rate = has429
+      ? col((i) => +clamp(0.15 + Math.max(0, wave(i, 9, bi)) * 0.2 + spike(i) / 50, 0, 3).toFixed(3))
+      : col(() => null);
+    const r429ReasonRate = (frac: number, phase: number) =>
+      has429
+        ? col((i) => +clamp((r429Rate[i] ?? 0) * frac * (0.7 + wave(i, 11, phase) * 0.3), 0, 3).toFixed(3))
+        : col(() => null);
+    const zeroOr = has429 ? col(() => 0) : col(() => null);
+    // Per-stage gate-exit rates (trailing-30s sum/count ÷ 30): the admission
+    // stage is keyed traffic only — 0 (not null) for the unkeyed king.
+    const pos = (f: number) => Math.max(0, f);
+    const admMsRate = b.maxAdmitted > 0
+      ? col((i) => Math.round(clamp(22 * (0.5 + pos(wave(i, 12, bi))) + spike(i) / 8, 0, 400)))
+      : col(() => 0);
+    const admSamplesRate = b.maxAdmitted > 0
+      ? col((i) => +(0.4 + pos(wave(i, 12, bi)) * 0.6).toFixed(2))
+      : col(() => 0);
+    const gpuMsRate = col((i) => Math.round(clamp(20 * (0.5 + pos(wave(i, 18, bi + 2))) + spike(i) / 10, 0, 300)));
+    const gpuSamplesRate = col((i) => +(0.1 + pos(wave(i, 18, bi + 2)) * 0.15).toFixed(2));
+    const execMsRate = col((i) => Math.round(clamp(30 * (0.5 + pos(wave(i, 14, bi + 1))) + spike(i) / 8, 0, 400)));
+    const execSamplesRate = col((i) => +(0.3 + pos(wave(i, 14, bi + 1)) * 0.5).toFixed(2));
+    const prefMsRate = col((i) => Math.round(clamp(10 * (0.5 + pos(wave(i, 15, bi + 3))) + spike(i) / 10, 0, 250)));
+    const prefSamplesRate = col((i) => +(0.05 + pos(wave(i, 15, bi + 3)) * 0.1).toFixed(2));
     return {
       name: b.name,
       t,
@@ -1011,6 +1330,25 @@ export function mockHistory(range: RangeName): HistoryResponse {
         weightMemGB: sg ? col(() => 12.1) : col(() => null),
         hitRate: hit,
         engineTTFTMs: col((i) => Math.round(ttft[i]! * 0.88)),
+        admissionActive,
+        admissionWaiting,
+        router429Rate: r429Rate,
+        router429BlockedByTier0Rate: zeroOr,
+        router429SessionQueueFullRate: r429ReasonRate(0.4, bi),
+        router429SessionTimeoutRate: r429ReasonRate(0.2, bi + 1),
+        router429GpuBudgetFullRate: r429ReasonRate(0.3, bi + 2),
+        router429BackendFullRate: r429ReasonRate(0.15, bi + 3),
+        router429BackendQueueFullRate: zeroOr,
+        router429PrefillFullRate: zeroOr,
+        router429PrefillQueueFullRate: zeroOr,
+        admissionWaitMsRate: admMsRate,
+        admissionWaitSamplesRate: admSamplesRate,
+        gpuWaitMsRate: gpuMsRate,
+        gpuWaitSamplesRate: gpuSamplesRate,
+        executionWaitMsRate: execMsRate,
+        executionWaitSamplesRate: execSamplesRate,
+        prefillWaitMsRate: prefMsRate,
+        prefillWaitSamplesRate: prefSamplesRate,
       },
     };
   });
@@ -1074,6 +1412,29 @@ export function mockHistory(range: RangeName): HistoryResponse {
       kvMemGB: sum("kvMemGB"),
       weightMemGB: sum("weightMemGB"),
       hitRate: avgOf("hitRate"),
+      // Fleet rollup of active leases (sum over enabled backends).
+      admissionActive: sum("admissionActive"),
+      // Fleet admission-queue depth: sum over enabled backends; null when
+      // no backend has admission (a disabled fleet never reports 0).
+      admissionWaiting: sum("admissionWaiting"),
+      // Fleet prefill-slot queue depth (a level, like the live edge's sum).
+      prefillWaiting: sum("prefillWaiting"),
+      // Fleet router-429 rate: sum of per-backend 30s rates; null when no
+      // backend has ever emitted a router 429. Per-reason rates stay
+      // per-backend — the router's fleet row carries only the total.
+      router429Rate: sum("router429Rate"),
+      // Fleet gate-exit rates: pooled sums — the ms-rate sums the per-backend
+      // sum-rates and the sample-rate sums the per-backend sample-rates, so
+      // the panel's fleet mean (sum-rate ÷ sample-rate) is the pooled mean,
+      // not a mean of per-backend means (sum the sums, sum the counts).
+      admissionWaitMsRate: sum("admissionWaitMsRate"),
+      admissionWaitSamplesRate: sum("admissionWaitSamplesRate"),
+      gpuWaitMsRate: sum("gpuWaitMsRate"),
+      gpuWaitSamplesRate: sum("gpuWaitSamplesRate"),
+      executionWaitMsRate: sum("executionWaitMsRate"),
+      executionWaitSamplesRate: sum("executionWaitSamplesRate"),
+      prefillWaitMsRate: sum("prefillWaitMsRate"),
+      prefillWaitSamplesRate: sum("prefillWaitSamplesRate"),
     },
   };
 

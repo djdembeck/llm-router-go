@@ -15,7 +15,20 @@ import type {
 } from "./api";
 import { nearestIndex, niceMax } from "./format";
 
-export type LayerId = "kv" | "util" | "vram" | "ttft" | "engineTtft" | "prefill" | "decode";
+export type LayerId =
+  | "kv"
+  | "util"
+  | "vram"
+  | "ttft"
+  | "engineTtft"
+  | "prefill"
+  | "decode"
+  | "admission"
+  | "admissionQueue"
+  | "executionQueue"
+  | "prefillQueue"
+  | "engineQueue"
+  | "router429";
 
 export interface LayerDef {
   id: LayerId;
@@ -101,7 +114,25 @@ export const LAYERS: LayerDef[] = [
     fixedMax: 100,
     note: "exporter · device memory",
   },
+  {
+    id: "admission",
+    label: "ADMISSION · ACTIVE",
+    short: "ADM",
+    unit: "",
+    source: "router",
+    device: false,
+    field: "admissionActive",
+    note: "router · session-admission leases held",
+  },
 ];
+
+LAYERS.push(
+  { id: "admissionQueue", label: "ADMISSION QUEUE", short: "ADM Q", unit: "requests", source: "router", device: false, field: "admissionWaiting", note: "router · admission queue · bucket averages in history" },
+  { id: "executionQueue", label: "EXECUTION QUEUE", short: "EXEC Q", unit: "requests", source: "router", device: false, field: "waiting", note: "router · execution queue · bucket averages in history" },
+  { id: "prefillQueue", label: "PREFILL QUEUE", short: "PREFILL Q", unit: "requests", source: "router", device: false, field: "prefillWaiting", note: "router · prefill queue · bucket averages in history" },
+  { id: "engineQueue", label: "ENGINE QUEUE", short: "ENGINE Q", unit: "requests", source: "engine", device: false, field: "engineWaiting", note: "engine · scraped backlog · bucket averages in history" },
+  { id: "router429", label: "ROUTER 429", short: "429", unit: "req/s", source: "router", device: false, field: "router429Rate", note: "router · trailing-30s average · req/s" },
+);
 
 export function layerById(id: LayerId): LayerDef {
   return LAYERS.find((l) => l.id === id) ?? LAYERS[0];
@@ -136,12 +167,21 @@ function backendValue(b: BackendMetrics, layer: LayerDef): number | null {
       return e.status === "ok" ? e.prefillTokS : null;
     case "decode":
       return e.status === "ok" ? e.decodeTokS : null;
+    case "admission":
+      // null (not 0) when admission is disabled for the backend: the lane
+      // must show a hole, not a false "zero leases held".
+      return b.admission?.active ?? null;
+    case "admissionQueue": return b.admission?.waiting ?? null;
+    case "executionQueue": return b.waiting ?? null;
+    case "prefillQueue": return b.prefillWaiting ?? null;
+    case "engineQueue": return e.status === "ok" ? e.waiting : null;
+    case "router429": return b.router429?.rate ?? null;
     default:
       return null;
   }
 }
 
-function fleetValue(t: TotalsMetrics, layer: LayerDef): number | null {
+function fleetValue(t: TotalsMetrics, layer: LayerDef, frame?: Frame): number | null {
   switch (layer.id) {
     case "kv":
       return t.engineOk > 0 ? t.kvPeak : null;
@@ -153,6 +193,13 @@ function fleetValue(t: TotalsMetrics, layer: LayerDef): number | null {
       return t.engineOk > 0 ? t.prefillTokS : null;
     case "decode":
       return t.engineOk > 0 ? t.decodeTokS : null;
+    case "admission":
+      return t.admActive;
+    case "admissionQueue": return frame && frame.backends.some(b => b.admission) ? frame.backends.reduce((n, b) => n + (b.admission?.waiting ?? 0), 0) : null;
+    case "executionQueue": return t.waiting ?? null;
+    case "prefillQueue": return frame && frame.backends.length ? frame.backends.reduce((n, b) => n + b.prefillWaiting, 0) : null;
+    case "engineQueue": return t.engineOk > 0 ? t.engineWaiting : null;
+    case "router429": return t.router429?.rate ?? null;
     default:
       return null;
   }
@@ -250,7 +297,7 @@ export function buildLanes(
       // Merge after the last real sample, not the history grid's end.
       const last = fleetPts.length ? fleetPts[fleetPts.length - 1].t : 0;
       if (f.t <= last) continue;
-      fleetPts.push({ t: f.t, v: fleetValue(f.totals, layer) });
+      fleetPts.push({ t: f.t, v: fleetValue(f.totals, layer, f) });
     }
     lanes.push({
       key: "__fleet",
@@ -323,7 +370,7 @@ function gpuSeriesAt(g: HistoryGpuSeries, layer: LayerDef, i: number): number | 
 
 function productFleetCurrent(frames: Frame[], layer: LayerDef): number | null {
   if (!frames.length) return null;
-  return fleetValue(frames[frames.length - 1].totals, layer);
+  return fleetValue(frames[frames.length - 1].totals, layer, frames[frames.length - 1]);
 }
 
 function lastValue(pts: LanePoint[]): number | null {
@@ -363,11 +410,15 @@ export function scaleFor(
       if (p.v != null && p.v > peak) peak = p.v;
     }
   }
-  const max = niceMax(Math.max(peak, 1));
-  const fmt = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : `${Math.round(v)}`);
+  const pressure = layer.unit === "requests" || layer.unit === "req/s";
+  const max = niceMax(pressure ? (peak > 0 ? peak : 1) : Math.max(peak, 1));
+  // Sub-10 non-pressure values keep two decimals so the four tick labels
+  // stay distinct (a max of 1 must not collapse 0.5/1.0 to "1" and lose
+  // the top-of-scale label); the k-formatting above 1000 is unchanged.
+  const fmt = (v: number) => pressure ? fmtPressureValue(v) : (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v < 10 ? v.toFixed(2) : `${Math.round(v)}`);
   return {
     max,
-    ticks: [0.25, 0.5, 0.75, 1].map((f) => ({ v: max * f, label: fmt(max * f) })),
+    ticks: [0.25, 0.5, 0.75, 1].map((f) => ({ v: max * f, label: fmt(max * f) })).filter((t, i, all) => all.findIndex((x) => x.label === t.label) === i),
   };
 }
 
@@ -402,8 +453,16 @@ export function summaryAt(lane: Lane, from: number, to: number): {
     : { last, avg: null, min: null, max: null };
 }
 
+const pressureFormatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: 3 });
+export function fmtPressureValue(v: number): string {
+  if (!Number.isFinite(v)) return "—";
+  if (v === 0) return "0";
+  return Math.abs(v) < 0.001 ? v.toExponential(1) : pressureFormatter.format(v);
+}
+
 export function fmtLayerValue(layer: LayerDef, v: number | null): string {
   if (v == null || !Number.isFinite(v)) return "—";
+  if (layer.unit === "requests" || layer.unit === "req/s") return `${fmtPressureValue(v)} ${layer.unit}`;
   if (layer.unit === "%") return `${v.toFixed(v < 10 ? 1 : 0)}%`;
   if (layer.unit === "ms") return v < 1000 ? `${Math.round(v)}ms` : `${(v / 1000).toFixed(2)}s`;
   return v >= 1000 ? `${(v / 1000).toFixed(1)}k` : `${Math.round(v)}`;

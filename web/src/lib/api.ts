@@ -140,6 +140,40 @@ export const emptyEngine: EngineMetrics = {
   httpStatus: 0,
 };
 
+// The per-backend session-admission (lease) snapshot. null in the frame when
+// session admission is disabled for the backend; an object (possibly
+// all-zero) when enabled. The authoritative view of router-side capacity
+// admission — the thing the dashboard's "backend at capacity" complaint is
+// about. Gate-wait figures are the admission gate ONLY, not downstream.
+export interface AdmissionMetrics {
+  maxAdmitted: number;
+  maxWaiting: number;
+  idleTTLms: number;
+  active: number;
+  idle: number;
+  waiting: number;
+  oldestWaitMs: number;
+  reclaimedTotal: number;
+  gateWaitMs: number;
+  gateWaitTotalMs: number;
+  gateWaitCount: number;
+  rejQueueFull: number;
+  rejQueueTimeout: number;
+  rejClientCancel: number;
+}
+
+export const ROUTER_429_REASONS = [
+  "blocked-by-tier0", "session-admission-queue-full", "session-admission-timeout",
+  "gpu-budget-full", "backend-full", "backend-queue-full", "prefill-full", "prefill-queue-full",
+] as const;
+export type QueueStage = "admission" | "gpu" | "execution" | "prefill";
+export interface WaitSummary { sumMs: number; samples: number }
+export type QueueWait = Record<QueueStage, WaitSummary>;
+export interface Router429 {
+  total: number;
+  rate: number;
+  byReason: { reason: string; total: number; rate: number }[];
+}
 export interface BackendMetrics {
   name: string;
   url: string;
@@ -161,10 +195,18 @@ export interface BackendMetrics {
   tokEstRate: number;
   reqTotal: number;
   rejectTotal: number;
+  // Per-backend lifetime router-originated rejection counts keyed by the
+  // X-Router-Reason string. null when the backend has never rejected.
+  rejectReasons: Record<string, number> | null;
   bytesInTotal: number;
   bytesOutTotal: number;
   tokEstTotal: number;
   engine: EngineMetrics;
+  // null when session admission is disabled for this backend.
+  admission?: AdmissionMetrics | null;
+  queueWait?: QueueWait | null;
+  router429?: Router429 | null;
+  engineQueue?: WaitSummary | null;
 }
 
 export interface GpuMetrics {
@@ -217,6 +259,19 @@ export interface TotalsMetrics {
   kvMemGB: number;
   weightMemGB: number;
   hitRate: number;
+  // Fleet rollup of active session-admission leases (0 when none enabled).
+  admActive: number;
+  router429?: Router429 | null;
+  queueWait?: QueueWait | null;
+}
+
+export interface StatsBackend extends Pick<BackendMetrics, "name" | "url" | "tier" | "inFlight" | "maxConcurrent" | "waiting" | "maxQueueDepth" | "prefillInFlight" | "prefillWaiting" | "prefillMax" | "avgDurationS" | "admission" | "engineQueue"> {}
+export interface StatsResponse {
+  backends: StatsBackend[];
+  gpuUsed: number;
+  gpuBudget: number;
+  gpuWaiting: number;
+  tier0Inflight: number;
 }
 
 /** One SSE frame: a full live snapshot. */
@@ -242,6 +297,11 @@ export interface BurstRequest {
   newTokensEst: number;
   bytesIn: number;
   bytesOut: number;
+  // X-Router-Reason for a router-originated rejection; "" for accepted.
+  rejectReason?: string | null;
+  queueWaitMs?: Record<QueueStage, number | null> | null;
+  // Admission-gate wait in ms (keyed traffic only); 0 for unkeyed/disabled.
+  gateWaitMs: number;
 }
 
 export interface LiveReq {
@@ -335,7 +395,54 @@ export type HistoryField =
   | "kvMemGB"
   | "weightMemGB"
   | "hitRate"
-  | "engineTTFTMs";
+  | "engineTTFTMs"
+  // Additive capacity series (25 → 59 fields): router slot
+  // limits, the admission lease/gate breakdown, the fleet GPU-budget
+  // triplet, the router-429 per-reason rates, and the per-stage gate-wait
+  // sum/sample rates. The admission LEASE gauges (maxAdmitted, maxWaiting,
+  // active, idle, waiting, oldestWaitMs) are null for a backend without
+  // session admission enabled — its gate-wait (admissionGateWaitMs,
+  // admissionGateWaitTotalMs, admissionGateWaitCount) and rejection
+  // (admissionRej*) series are too, since they live in the same frame.
+  // The router429* series (total and per-reason) are null for a backend
+  // that never emitted a router 429. The gate-wait rate pairs
+  // (*WaitMsRate/*WaitSamplesRate) are null until a gate exit is recorded
+  // in the trailing-30s window — for the admission stage, 0 samples for an
+  // unkeyed backend — which tracks queue-wait presence, not 429 history.
+  | "maxQueueDepth"
+  | "prefillMax"
+  | "admissionMaxAdmitted"
+  | "admissionMaxWaiting"
+  | "admissionActive"
+  | "admissionIdle"
+  | "admissionWaiting"
+  | "admissionOldestWaitMs"
+  | "admissionGateWaitMs"
+  | "admissionGateWaitTotalMs"
+  | "admissionGateWaitCount"
+  | "admissionRejQueueFull"
+  | "admissionRejQueueTimeout"
+  | "admissionRejClientCancel"
+  | "gpuUsed"
+  | "gpuBudget"
+  | "gpuWaiting"
+  | "router429Rate"
+  | "router429BlockedByTier0Rate"
+  | "router429SessionQueueFullRate"
+  | "router429SessionTimeoutRate"
+  | "router429GpuBudgetFullRate"
+  | "router429BackendFullRate"
+  | "router429BackendQueueFullRate"
+  | "router429PrefillFullRate"
+  | "router429PrefillQueueFullRate"
+  | "admissionWaitMsRate"
+  | "admissionWaitSamplesRate"
+  | "gpuWaitMsRate"
+  | "gpuWaitSamplesRate"
+  | "executionWaitMsRate"
+  | "executionWaitSamplesRate"
+  | "prefillWaitMsRate"
+  | "prefillWaitSamplesRate";
 
 export type Series = Partial<Record<HistoryField, (number | null)[]>>;
 
