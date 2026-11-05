@@ -157,7 +157,9 @@ BACKENDS='[
     "blockOnTier0": 0,
     "maxQueueDepth": 2,
     "maxConcurrentLargePrefill": 1,
-    "largePrefillThresholdTokens": 8192
+    "largePrefillThresholdTokens": 8192,
+    "largePrefillKVThresholdPct": 80,
+    "largePrefillMaxQueue": 16
   }
 ]'
 ```
@@ -173,6 +175,8 @@ BACKENDS='[
 | `maxQueueDepth` | Maximum pending requests beyond `maxConcurrent`; defaults to `2`. |
 | `maxConcurrentLargePrefill` | Maximum concurrent large-prefill requests. `0` disables large-prefill limiting. |
 | `largePrefillThresholdTokens` | Estimated prompt-token count (whole conversation) that triggers large-prefill logic; defaults to `8192`. |
+| `largePrefillKVThresholdPct` | Parks a **cold** large prefill while the backend's live engine KV usage is at or above this percentage (from the backend's `/metrics` scrape). `0` disables the pressure gate. Requires `maxConcurrentLargePrefill > 0`; metrics unavailable or not `ok` fails open. |
+| `largePrefillMaxQueue` | Bounds the park queue for cold pressure-gated prefills and the large-prefill permit queue; defaults to `4`. Overflow receives `429` with `X-Router-Reason: prefill-queue-full`. |
 
 ### Scalar environment variables
 
@@ -431,7 +435,11 @@ A weighted GPU semaphore models shared GPU capacity. Each backend also has a slo
 
 ### Prefill protection and load balancing
 
-The router estimates new prefill tokens from request bodies. Backends can cap concurrent large prefills to prevent a massive prompt from blocking smaller requests. Large-prefill slots are bounded using `PREFILL_TOKENS_PER_SEC` for non-streaming requests and release on the first response byte for streaming requests.
+The router estimates new prefill tokens from request bodies. Backends can cap concurrent large prefills to prevent a massive prompt from blocking smaller requests. Large-prefill slots are bounded using `PREFILL_TOKENS_PER_SEC` for non-streaming requests and release on the first response byte for streaming requests. The large-prefill gate runs **before** the per-backend execution slot, so a queued large prefill never occupies a decode slot.
+
+With `largePrefillKVThresholdPct` set, a large prefill also needs engine KV headroom: while the backend's live engine KV usage is at or above that percentage, a **cold** large prefill parks in the pressure queue (bounded by `largePrefillMaxQueue`) instead of starting. Parking does not hold the large-prefill permit, so a warm request can still run. Small requests always bypass this gate. A parked request re-checks pressure after acquiring the permit and hands it back if pressure rose in the meantime; one `MAX_QUEUE_TIMEOUT` bounds the whole prefill phase (pressure wait plus permit queue).
+
+A request counts as warm when session admission reactivated an existing lease (active or idle). That is a cheap "recently active conversation" hint, **not** proof that the engine still holds the prefix: the router cannot see per-request cache residency before the engine schedules it. With admission off or keyed traffic absent, every large prefill is treated as cold. Metrics unavailable or not `ok` fails open, so a scrape outage never freezes large prefills.
 
 Per-backend request durations are tracked with an exponentially weighted moving average (EWMA). Routing uses these durations with current load to reduce latency and avoid herd behavior.
 

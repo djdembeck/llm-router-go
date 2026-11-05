@@ -46,6 +46,13 @@ type Backend struct {
 	MaxQueueDepth               int    `json:"maxQueueDepth"`               // queued beyond maxConcurrent before 429 (default 2)
 	MaxConcurrentLargePrefill   int    `json:"maxConcurrentLargePrefill"`   // max concurrent large prefills; 0 = disabled
 	LargePrefillThresholdTokens int    `json:"largePrefillThresholdTokens"` // estimated prompt tokens to qualify as "large prefill" (default 8192)
+	// LargePrefillKVThresholdPct parks COLD large prefills while the backend's
+	// live engine KV usage is at or above this percentage. 0 disables the
+	// pressure gate. Requires MaxConcurrentLargePrefill > 0.
+	LargePrefillKVThresholdPct float64 `json:"largePrefillKVThresholdPct"`
+	// LargePrefillMaxQueue bounds both the cold pressure waiters and the
+	// large-prefill permit queue for this backend (default 4).
+	LargePrefillMaxQueue int `json:"largePrefillMaxQueue"`
 }
 
 // ─── Parsed body (single-pass, heavy fields stay raw) ──────────────────────
@@ -155,6 +162,40 @@ func (s *slotManager) release() {
 
 func (s *slotManager) snapshot() (inflight, max, waiting, maxQueue int32) {
 	return atomic.LoadInt32(&s.inflight), s.max, atomic.LoadInt32(&s.waiting), s.maxQueue
+}
+
+// ─── Large-prefill pressure gate ──────────────────────────────────────────
+//
+// A cold large prefill parks here while the backend's live engine KV usage is
+// at or above largePrefillKVThresholdPct. The gate is deliberately separate
+// from the prefill execution permit: a parked request must not hold the permit
+// a warm request can use. It only bounds the number of parked cold requests,
+// so a pressure wave cannot grow the router's queue without limit.
+
+type prefillPressureGate struct {
+	waiting int32
+	max     int32
+}
+
+func newPrefillPressureGate(max int32) *prefillPressureGate {
+	return &prefillPressureGate{max: max}
+}
+
+// enter reserves one parking place. false = the pressure queue is full.
+func (p *prefillPressureGate) enter() bool {
+	if atomic.AddInt32(&p.waiting, 1) > p.max {
+		atomic.AddInt32(&p.waiting, -1)
+		return false
+	}
+	return true
+}
+
+func (p *prefillPressureGate) leave() {
+	atomic.AddInt32(&p.waiting, -1)
+}
+
+func (p *prefillPressureGate) snapshot() int32 {
+	return atomic.LoadInt32(&p.waiting)
 }
 
 // ─── GPU budget (weighted semaphore, only active when tier-0 is busy) ──────
@@ -3069,7 +3110,7 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 			existing.timer.Stop()
 			existing.timer = nil
 		}
-		t := ticketFor(a, existing)
+		t := ticketFor(a, existing, true)
 		a.mu.Unlock()
 		return t, nil
 	}
@@ -3087,14 +3128,14 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 			if len(a.leaseMap) < a.maxAdmitted {
 				l := &sessionAdmissionLease{key: key, count: 1}
 				a.leaseMap[key] = l
-				t := ticketFor(a, l)
+				t := ticketFor(a, l, false)
 				a.mu.Unlock()
 				return t, nil
 			}
 			if a.idleReclaim && a.reclaimOldestIdleLocked() {
 				l := &sessionAdmissionLease{key: key, count: 1}
 				a.leaseMap[key] = l
-				t := ticketFor(a, l)
+				t := ticketFor(a, l, false)
 				a.mu.Unlock()
 				return t, nil
 			}
@@ -3269,16 +3310,20 @@ func (a *sessionAdmission) waiterTimeout(w *sessionAdmissionWaiter) {
 	a.mu.Unlock()
 }
 
-// ticketFor ties a lease to a one-release ticket.
-func ticketFor(a *sessionAdmission, l *sessionAdmissionLease) *sessionAdmissionTicket {
-	return &sessionAdmissionTicket{mgr: a, lease: l}
+// ticketFor ties a lease to a one-release ticket. reused reports that the
+// grant reactivated an existing lease (active or idle) rather than minting a
+// fresh identity; callers use it as the cheap "this conversation was recently
+// active" hint for cache-sensitive decisions.
+func ticketFor(a *sessionAdmission, l *sessionAdmissionLease, reused bool) *sessionAdmissionTicket {
+	return &sessionAdmissionTicket{mgr: a, lease: l, reused: reused}
 }
 
 // sessionAdmissionTicket is a single admission grant; release is once-guarded.
 type sessionAdmissionTicket struct {
-	mgr   *sessionAdmission
-	lease *sessionAdmissionLease
-	once  sync.Once
+	mgr    *sessionAdmission
+	lease  *sessionAdmissionLease
+	reused bool
+	once   sync.Once
 }
 
 // release returns the lease's accepted count by one; the final release of
@@ -3382,7 +3427,7 @@ func (a *sessionAdmission) drainLocked() {
 				delete(a.leaseMap, w.key)
 			} else {
 				a.queue.Remove(front)
-				a.grantWaiterLocked(w, l)
+				a.grantWaiterLocked(w, l, true) // existing lease reactivated
 				front = a.queue.Front()
 				continue
 			}
@@ -3397,7 +3442,7 @@ func (a *sessionAdmission) drainLocked() {
 			// grant's single ticket balances.
 			l := &sessionAdmissionLease{key: w.key}
 			a.leaseMap[w.key] = l
-			a.grantWaiterLocked(w, l)
+			a.grantWaiterLocked(w, l, false) // fresh identity
 			front = a.queue.Front()
 			continue
 		}
@@ -3411,14 +3456,14 @@ func (a *sessionAdmission) drainLocked() {
 // grantWaiterLocked publishes the grant and the ticket atomically under mu,
 // then wakes the waiter. The count/ticket is held BEFORE publication so a
 // cancelled acquire walks the once-release path exactly once.
-func (a *sessionAdmission) grantWaiterLocked(w *sessionAdmissionWaiter, l *sessionAdmissionLease) {
+func (a *sessionAdmission) grantWaiterLocked(w *sessionAdmissionWaiter, l *sessionAdmissionLease, reused bool) {
 	l.count++
 	l.idle = false
 	l.idleSince = time.Time{}
 	if l.timer != nil {
 		l.timer.Stop()
 	}
-	w.ticket = ticketFor(a, l)
+	w.ticket = ticketFor(a, l, reused)
 	w.pending = false
 	if w.timer != nil {
 		w.timer.Stop()
@@ -3591,8 +3636,9 @@ func estimateCtxTokens(parsed *parsedBody) int {
 var (
 	backends            []Backend
 	client              = &http.Client{Timeout: 30 * time.Second}
-	slots               map[string]*slotManager // per-backend concurrency slots
-	prefillSlots        map[string]*slotManager // per-backend large-prefill slots (released on first response byte)
+	slots               map[string]*slotManager         // per-backend concurrency slots
+	prefillSlots        map[string]*slotManager         // per-backend large-prefill slots (released on first response byte)
+	prefillPressure     map[string]*prefillPressureGate // per-backend cold large-prefill parking
 	gpu                 *gpuBudget
 	queueTimeout                                    = 30 * time.Second
 	maxBodyBytes        int64                       = 16 << 20
@@ -3855,6 +3901,7 @@ func main() {
 
 	slots = make(map[string]*slotManager)
 	prefillSlots = make(map[string]*slotManager)
+	prefillPressure = make(map[string]*prefillPressureGate)
 	durations = make(map[string]*durationTracker)
 	totalWeight := 0
 	for _, b := range backends {
@@ -3867,7 +3914,14 @@ func main() {
 			slots[b.Name] = newSlot(int32(b.MaxConcurrent), mq)
 		}
 		if b.MaxConcurrentLargePrefill > 0 {
-			prefillSlots[b.Name] = newSlot(int32(b.MaxConcurrentLargePrefill), 4)
+			mq := int32(b.LargePrefillMaxQueue)
+			if mq <= 0 {
+				mq = 4
+			}
+			prefillSlots[b.Name] = newSlot(int32(b.MaxConcurrentLargePrefill), mq)
+			if b.LargePrefillKVThresholdPct > 0 {
+				prefillPressure[b.Name] = newPrefillPressureGate(mq)
+			}
 		}
 		if b.GpuWeight > 0 {
 			totalWeight += b.GpuWeight
@@ -4075,6 +4129,11 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		pIn, pMax, pWaiting, _ := int32(0), int32(0), int32(0), int32(0)
 		if s, ok := prefillSlots[b.Name]; ok {
 			pIn, pMax, pWaiting, _ = s.snapshot()
+			// Cold large prefills parked on engine KV pressure are waiting
+			// work too; the dashboard's PREFILL Q should include them.
+			if pg, ok := prefillPressure[b.Name]; ok {
+				pWaiting += pg.snapshot()
+			}
 		}
 		stats = append(stats, stat{
 			Name:            b.Name,
@@ -4239,6 +4298,50 @@ func rawContentLen(raw json.RawMessage) int {
 		return total
 	}
 	return 0
+}
+
+// enginePressureHigh reports whether the backend's live engine KV usage is at
+// or above the configured large-prefill pressure threshold. A disabled
+// threshold, or an engine whose /metrics scrape is not currently ok, fails
+// open: a metrics outage must not freeze large prefills.
+func enginePressureHigh(b Backend) bool {
+	if b.LargePrefillKVThresholdPct <= 0 {
+		return false
+	}
+	v := engineMetrics.view(b.Name)
+	if v.Status != "ok" {
+		return false
+	}
+	return v.KVPct >= b.LargePrefillKVThresholdPct
+}
+
+// waitForPrefillHeadroom blocks until the backend's live KV usage drops below
+// the pressure threshold, the prefill-phase deadline passes, or the request is
+// cancelled. It re-reads the 1s engine scrape; a metrics outage fails open.
+func waitForPrefillHeadroom(b Backend, deadline time.Time, cancel <-chan struct{}) bool {
+	if !enginePressureHigh(b) {
+		return true
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	for {
+		select {
+		case <-cancel:
+			return false
+		case <-timer.C:
+			return false
+		case <-ticker.C:
+			if !enginePressureHigh(b) {
+				return true
+			}
+		}
+	}
 }
 
 // estimateRetryAfter returns a rough seconds estimate of when a slot frees.
@@ -6215,6 +6318,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	cancelCh := r.Context().Done()
 	t0Inflight := tier0Inflight()
+	// warm is true when the admission gate reactivated an existing lease.
+	// It is a cheap "this conversation was recently active" hint, not proof
+	// that its prefix is still resident in the engine's KV cache.
+	warm := false
 
 	// ── Step 1: Cross-tier blocking ────────────────────────────────────────
 	// If tier-0 in-flight count meets or exceeds this backend's blockOnTier0
@@ -6285,6 +6392,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			// The gate-wait figure is the admission gate only; downstream
 			// GPU/slot/prefill queueing is NOT folded into it.
 			// Admission wait was recorded at gate exit.
+			warm = ticket.reused
 			defer ticket.release()
 			// The lease may have waited: re-snapshot tier-0 in-flight so
 			// the GPU-budget decision below does not use the arrival-time
@@ -6318,7 +6426,122 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		defer gpu.release(target.GpuWeight)
 	}
 
-	// ── Step 3: Per-backend slot ──────────────────────────────────────────
+	// ── Step 3: Large prefill admission ──────────────────────────────────
+	// A large prefill is one whose estimated prompt tokens exceed the
+	// backend's threshold. The estimate covers the whole conversation because
+	// the router has no per-request evidence that any prefix is cached; a
+	// short final turn must not exempt a long prompt.
+	//
+	// The permit limits concurrent large prefills and is acquired BEFORE the
+	// per-backend execution slot, so parked large work never occupies a decode
+	// slot. A COLD large prefill (no reused admission lease) parks in the
+	// pressure gate while the backend's live engine KV usage is at or above
+	// largePrefillKVThresholdPct; a warm request skips the pressure wait and
+	// small requests skip this step entirely. The pressure gate is separate
+	// from the permit: parked cold work cannot block a warm request.
+	prefillSem := prefillSlots[target.Name]
+	prefillRelease := func() {} // no-op by default
+	prefillHeld := false
+	if prefillSem != nil {
+		threshold := target.LargePrefillThresholdTokens
+		if threshold == 0 {
+			threshold = 8192
+		}
+		if prefillTok >= threshold {
+			pressureGated := !warm && target.LargePrefillKVThresholdPct > 0
+			gate := prefillPressure[target.Name]
+			parked := false
+			leavePressure := func() {
+				if parked {
+					gate.leave()
+					parked = false
+				}
+			}
+			defer leavePressure() // one balanced exit for every rejection/cancel
+			// One deadline bounds the whole prefill phase: pressure waiting and
+			// permit queueing share it, so retries cannot extend the wait.
+			prefillDeadline := time.Now().Add(queueTimeout)
+			for {
+				if pressureGated && !parked && enginePressureHigh(target) {
+					if gate == nil || !gate.enter() {
+						log.Printf("%s %s -> %s (model=%s) 429: prefill pressure queue full (prefillTokens=%d)",
+							r.Method, r.URL.Path, target.Name, modelName, prefillTok)
+						write429(w, "prefill-queue-full", target.Name, estimateRetryAfter(target.Name))
+						recordRejection(http.StatusTooManyRequests, "prefill-queue-full")
+						return
+					}
+					parked = true
+					pin, pmaxC, pwaiting, _ := prefillSem.snapshot()
+					log.Printf("%s %s -> %s (model=%s) parked at prefill pressure (kv>=%.1f%%, prefillTokens=%d, prefill=%d/%d waiting=%d)",
+						r.Method, r.URL.Path, target.Name, modelName,
+						target.LargePrefillKVThresholdPct, prefillTok, pin, pmaxC, pwaiting)
+				}
+				if parked && !waitForPrefillHeadroom(target, prefillDeadline, cancelCh) {
+					if r.Context().Err() != nil {
+						recordRejection(499, "")
+						return
+					}
+					log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (kv pressure, prefillTokens=%d)",
+						r.Method, r.URL.Path, target.Name, modelName, prefillTok)
+					write429(w, "prefill-full", target.Name, estimateRetryAfter(target.Name))
+					recordRejection(http.StatusTooManyRequests, "prefill-full")
+					return
+				}
+				leavePressure() // now a permit waiter, counted by prefillWaiting
+				pin, pmaxC, pwaiting, _ := prefillSem.snapshot()
+				if pin >= pmaxC {
+					log.Printf("%s %s -> %s (model=%s) queued at prefill (%d/%d, waiting=%d, prefillTokens=%d)",
+						r.Method, r.URL.Path, target.Name, modelName,
+						pin, pmaxC, pwaiting+1, prefillTok)
+				}
+				remaining := time.Until(prefillDeadline)
+				if remaining <= 0 {
+					if r.Context().Err() != nil {
+						recordRejection(499, "")
+						return
+					}
+					log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (prefill deadline, prefillTokens=%d)",
+						r.Method, r.URL.Path, target.Name, modelName, prefillTok)
+					write429(w, "prefill-full", target.Name, estimateRetryAfter(target.Name))
+					recordRejection(http.StatusTooManyRequests, "prefill-full")
+					return
+				}
+				gateStart := time.Now()
+				acquired := prefillSem.acquire(remaining, cancelCh)
+				recordWait(queueStagePrefill, gateStart)
+				if !acquired {
+					if r.Context().Err() != nil {
+						recordRejection(499, "")
+						return
+					}
+					stage := "prefill-full"
+					_, _, pqW, pqMax := prefillSem.snapshot()
+					if pqW >= pqMax {
+						stage = "prefill-queue-full"
+					}
+					log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (prefillTokens=%d)",
+						r.Method, r.URL.Path, target.Name, modelName, prefillTok)
+					write429(w, stage, target.Name, estimateRetryAfter(target.Name))
+					recordRejection(http.StatusTooManyRequests, stage)
+					return
+				}
+				// Pressure can rise while this request queues for the permit.
+				// Re-check under the permit; if it did, hand the permit back and
+				// park again instead of forwarding into a full cache.
+				if pressureGated && enginePressureHigh(target) {
+					prefillSem.release()
+					continue
+				}
+				var prefillOnce sync.Once
+				prefillRelease = func() { prefillOnce.Do(prefillSem.release) }
+				prefillHeld = true
+				defer prefillRelease()
+				break
+			}
+		}
+	}
+
+	// ── Step 4: Per-backend slot ──────────────────────────────────────────
 	sem := slots[target.Name]
 	if sem != nil {
 		in, maxC, waiting, _ := sem.snapshot()
@@ -6349,65 +6572,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		defer sem.release()
 	}
 
-	// ── Step 3.5: Large prefill throttle ─────────────────────────────────
-	// Limits how many concurrent large prefills a backend processes. A large
-	// prefill is one whose estimated prompt tokens exceed the backend's
-	// threshold. The estimate covers the whole conversation because the router
-	// has no per-request evidence that any prefix is cached; a short final turn
-	// must not exempt a long prompt. The slot is released on the first response
-	// byte for streaming requests, or after the estimated prefill duration
-	// (prefillTokens / PREFILL_TOKENS_PER_SEC) for non-streaming requests.
-	// Small requests skip this entirely. Soft-queued up to maxQueue, then 429.
-	prefillSem := prefillSlots[target.Name]
-	prefillRelease := func() {} // no-op by default
-	if prefillSem != nil {
-		threshold := target.LargePrefillThresholdTokens
-		if threshold == 0 {
-			threshold = 8192
-		}
-		prefillTokens := prefillTok
-		if prefillTokens >= threshold {
-			pin, pmaxC, pwaiting, _ := prefillSem.snapshot()
-			if pin >= pmaxC {
-				log.Printf("%s %s -> %s (model=%s) queued at prefill (%d/%d, waiting=%d, prefillTokens=%d)",
-					r.Method, r.URL.Path, target.Name, modelName,
-					pin, pmaxC, pwaiting+1, prefillTokens)
-			}
-			gateStart := time.Now()
-			acquired := prefillSem.acquire(queueTimeout, cancelCh)
-			recordWait(queueStagePrefill, gateStart)
-			if !acquired {
-				if r.Context().Err() != nil {
-					recordRejection(499, "")
-					return
-				}
-				retry := estimateRetryAfter(target.Name)
-				stage := "prefill-full"
-				_, _, pqW, pqMax := prefillSem.snapshot()
-				if pqW >= pqMax {
-					stage = "prefill-queue-full"
-				}
-				log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (prefillTokens=%d)",
-					r.Method, r.URL.Path, target.Name, modelName, prefillTokens)
-				write429(w, stage, target.Name, retry)
-				recordRejection(http.StatusTooManyRequests, stage)
-				return
-			}
-			var prefillOnce sync.Once
-			prefillRelease = func() { prefillOnce.Do(prefillSem.release) }
-			if !parsed.Stream {
-				// Non-streaming: response headers arrive only after full
-				// generation, so first-byte release would hold the slot through
-				// all of decode. Bound the hold to the estimated prefill duration;
-				// whichever fires first (timer or first byte) wins via the Once.
-				hold := time.Duration(float64(prefillTokens) / float64(prefillTokensPerSec) * float64(time.Second))
-				timer := time.AfterFunc(hold, prefillRelease)
-				defer timer.Stop()
-			}
-		}
-	}
-
-	// ── Step 4: Forward ───────────────────────────────────────────────────
+	// ── Step 5: Forward ───────────────────────────────────────────────────
 	in, maxC, waiting, _ := int32(0), int32(0), int32(0), int32(0)
 	if sem != nil {
 		in, maxC, waiting, _ = sem.snapshot()
@@ -6488,6 +6653,17 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		tracker.finish(target.Name, r.URL.Path, status, ttftMs, tracker.bytesOut)
 	}()
+
+	// Non-streaming responses arrive only after full generation, so a
+	// first-byte release would hold the large-prefill permit through decode.
+	// Bound that hold to the estimated prefill duration, starting only now
+	// that forwarding is certain; the first byte or the timer wins via the
+	// once-guarded release.
+	if prefillHeld && !parsed.Stream {
+		hold := time.Duration(float64(prefillTok) / float64(prefillTokensPerSec) * float64(time.Second))
+		timer := time.AfterFunc(hold, prefillRelease)
+		defer timer.Stop()
+	}
 
 	proxy.ServeHTTP(tracker, r)
 	proxyReturned = true
