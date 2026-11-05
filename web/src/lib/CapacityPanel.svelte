@@ -102,7 +102,7 @@
               </tbody>
             </table>
           </div>
-          <p class="detail muted">Idle TTL <span class="mono">{duration(b.admission?.idleTTLms)}</span> · lifetime idle reclaims <span class="mono">{historical ? "live only / —" : figure(b.admission?.reclaimedTotal)}</span> · idle reservations yield to waiting work; they do not pin KV cache</p>
+          <p class="detail muted">Idle TTL <span class="mono">{duration(b.admission?.idleTTLms)}</span> · lifetime idle reclaims <span class="mono">{historical ? "live only / —" : figure(b.admission?.reclaimedTotal)}</span> · {historical || b.admission?.idleReclaim !== false ? "idle reservations yield to waiting work" : "idle reservations hold their full TTL before queued work may take the slot"} — admission capacity, not KV cache</p>
           <div class="table-scroll">
             <table class="data-table reasons">
               <caption class="detail muted">Router 429 · {historical ? "30s avg · req/s · lifetime totals live only" : "lifetime totals · trailing-30s req/s"}{!historical && !b.router429 ? (feedKind === "stats" ? " · unavailable" : " · no router 429s") : ""}</caption>
