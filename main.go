@@ -4344,6 +4344,25 @@ func waitForPrefillHeadroom(b Backend, deadline time.Time, cancel <-chan struct{
 	}
 }
 
+// gateGrace bounds one blocking gate's wait by the request's absolute
+// pre-forward deadline. A zero deadline (admission off or keyless traffic)
+// keeps the legacy per-gate limit exactly.
+func gateGrace(deadline time.Time, limit time.Duration) time.Duration {
+	if deadline.IsZero() {
+		return limit
+	}
+	if remaining := time.Until(deadline); remaining < limit {
+		return remaining
+	}
+	return limit
+}
+
+// preForwardExpired reports whether the request's absolute pre-forward
+// deadline has passed. Keyless/off traffic has no deadline and never expires.
+func preForwardExpired(deadline time.Time) bool {
+	return !deadline.IsZero() && !time.Now().Before(deadline)
+}
+
 // estimateRetryAfter returns a rough seconds estimate of when a slot frees.
 func estimateRetryAfter(name string) int {
 	avg := durations[name].avgSeconds()
@@ -6279,6 +6298,15 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if sessionAdmissionSettings.Enabled {
 		admKey = admissionKeyFor(&parsed, r, target.Name, sessionAdmissionSettings.KeySource, sessionAdmissionSettings.keyName)
 	}
+	// One absolute pre-forward deadline for keyed admission traffic: every
+	// blocking gate below shares the remaining budget instead of receiving a
+	// fresh timeout. Keyless/off traffic keeps the legacy per-gate behavior.
+	// This deadline never touches the upstream request context, so a request
+	// that starts forwarding is not cut off when the admission budget expires.
+	var preForwardDeadline time.Time
+	if admKey != "" {
+		preForwardDeadline = time.Now().Add(queueTimeout)
+	}
 	sessKey := sessionKeyFor(&parsed)
 	if admKey != "" {
 		sessKey = admKey
@@ -6306,6 +6334,26 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		// record); the last-message newTokens stays in the burst feed only.
 		sessions.finishRejection(reqContext.Backend, r.URL.Path, sessKey, ctxTok, prefillTok, status, reqContext.DurMs)
 		metrics.recordRequest(reqContext.Backend, reqContext)
+	}
+
+	// expireForward rejects a keyed request whose absolute pre-forward budget
+	// is gone. It is checked before every downstream gate and once more before
+	// forwarding, because a gate with free capacity can grant immediately
+	// without consulting any timer. Handler defers release whatever the
+	// request already holds.
+	expireForward := func() bool {
+		if !preForwardExpired(preForwardDeadline) {
+			return false
+		}
+		if r.Context().Err() != nil {
+			recordRejection(499, "")
+			return true
+		}
+		log.Printf("%s %s -> %s (model=%s) 429: session-admission-timeout (pre-forward budget exhausted)",
+			r.Method, r.URL.Path, target.Name, modelName)
+		write429(w, "session-admission-timeout", target.Name, estimateRetryAfter(target.Name))
+		recordRejection(http.StatusTooManyRequests, "session-admission-timeout")
+		return true
 	}
 
 	recordWait := func(stage queueStage, start time.Time) {
@@ -6353,7 +6401,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if admKey != "" {
 		if mgr := sessionAdmissions[target.Name]; mgr != nil {
 			admitStart := time.Now()
-			ticket, aerr := mgr.acquire(r.Context(), admKey, queueTimeout)
+			ticket, aerr := mgr.acquire(r.Context(), admKey, gateGrace(preForwardDeadline, queueTimeout))
 			recordWait(queueStageAdmission, admitStart)
 			mgr.recordGateWait(time.Since(admitStart))
 			if aerr != nil {
@@ -6401,6 +6449,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A grant can arrive after the absolute budget expires (the admission
+	// waiter's own timer and a concurrent release can race), so check the
+	// deadline before spending any downstream capacity.
+	if expireForward() {
+		return
+	}
+
 	// ── Step 2: GPU budget (only for tier-1 subjects, only when tier-0 active) ──
 	// The king (tier 0) is never constrained by GPU budget — it IS the budget.
 	// Subjects with gpuWeight get squeezed into the remaining budget when king runs.
@@ -6411,7 +6466,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			log.Printf("%s %s -> %s (model=%s) queued at GPU budget (gpu=%d+%d/%d, tier0=%d)", r.Method, r.URL.Path, target.Name, modelName, used, target.GpuWeight, maxB, t0Inflight)
 		}
 		gateStart := time.Now()
-		acquired := gpu.tryAcquire(target.GpuWeight, 4, 5*time.Second, cancelCh)
+		acquired := gpu.tryAcquire(target.GpuWeight, 4, gateGrace(preForwardDeadline, 5*time.Second), cancelCh)
 		recordWait(queueStageGPU, gateStart)
 		if !acquired {
 			if r.Context().Err() != nil {
@@ -6424,6 +6479,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer gpu.release(target.GpuWeight)
+	}
+	if expireForward() {
+		return
 	}
 
 	// ── Step 3: Large prefill admission ──────────────────────────────────
@@ -6459,8 +6517,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			defer leavePressure() // one balanced exit for every rejection/cancel
 			// One deadline bounds the whole prefill phase: pressure waiting and
-			// permit queueing share it, so retries cannot extend the wait.
-			prefillDeadline := time.Now().Add(queueTimeout)
+			// permit queueing share it, so retries cannot extend the wait. For
+			// keyed admission traffic this is the request's absolute
+			// pre-forward deadline; legacy traffic keeps its own phase budget.
+			prefillDeadline := preForwardDeadline
+			if prefillDeadline.IsZero() {
+				prefillDeadline = time.Now().Add(queueTimeout)
+			}
 			for {
 				if pressureGated && !parked && enginePressureHigh(target) {
 					if gate == nil || !gate.enter() {
@@ -6541,6 +6604,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if expireForward() {
+		return
+	}
+
 	// ── Step 4: Per-backend slot ──────────────────────────────────────────
 	sem := slots[target.Name]
 	if sem != nil {
@@ -6551,7 +6618,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				in, maxC, waiting+1, t0Inflight)
 		}
 		gateStart := time.Now()
-		acquired := sem.acquire(queueTimeout, cancelCh)
+		acquired := sem.acquire(gateGrace(preForwardDeadline, queueTimeout), cancelCh)
 		recordWait(queueStageExecution, gateStart)
 		if !acquired {
 			if r.Context().Err() != nil {
@@ -6570,6 +6637,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer sem.release()
+	}
+
+	// Final backstop: a free execution slot grants immediately without
+	// consulting a timer, so re-check the absolute budget before committing
+	// the request upstream. Every acquired permit is released by its defer.
+	if expireForward() {
+		return
 	}
 
 	// ── Step 5: Forward ───────────────────────────────────────────────────
