@@ -762,6 +762,8 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 	savedBackends := backends
 	savedSlots := slots
 	savedPrefillSlots := prefillSlots
+	savedPrefillPressure := prefillPressure
+	savedEngineMetrics := engineMetrics
 	savedDurations := durations
 	savedGpu := gpu
 	savedProxies := proxies
@@ -771,6 +773,8 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 	backends = list
 	slots = make(map[string]*slotManager)
 	prefillSlots = make(map[string]*slotManager)
+	prefillPressure = make(map[string]*prefillPressureGate)
+	engineMetrics = newEngineRegistry()
 	durations = make(map[string]*durationTracker)
 	for _, b := range list {
 		durations[b.Name] = &durationTracker{}
@@ -794,6 +798,8 @@ func withRouterEnv(t *testing.T, list []Backend, slotMax, slotQueue map[string]i
 		backends = savedBackends
 		slots = savedSlots
 		prefillSlots = savedPrefillSlots
+		prefillPressure = savedPrefillPressure
+		engineMetrics = savedEngineMetrics
 		durations = savedDurations
 		gpu = savedGpu
 		proxies = savedProxies
