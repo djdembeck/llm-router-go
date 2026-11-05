@@ -2746,6 +2746,13 @@ type sessionAdmissionConfig struct {
 	MaxAdmitted int // per-backend cap; 0 until resolved by the loader
 	MaxWaiting  int // distinct-by-arrival queue bound per backend; 0 = reject newcomers
 	IdleTTL     time.Duration
+	// IdleReclaim selects whether an idle lease yields its admitted slot to
+	// live demand before its TTL elapses. True (SESSION_IDLE_RECLAIM=on, the
+	// default) is work-conserving: a newcomer or a release draining a
+	// non-empty queue takes the oldest idle slot immediately. False
+	// (SESSION_IDLE_RECLAIM=off) holds every idle lease for the full
+	// SESSION_IDLE_TTL; only genuine expiry hands the slot to the FIFO queue.
+	IdleReclaim bool
 	KeySource   string // canonical: prompt_cache_key | user | header:<Name>
 	// keyName is the selected header name when KeySource is header:<Name>.
 	keyName string
@@ -2811,6 +2818,15 @@ func loadSessionAdmissionConfig(getenv func(string) string, backends []Backend) 
 			return cfg, fmt.Errorf("invalid SESSION_IDLE_TTL %q", v)
 		}
 		d = pd
+	}
+
+	switch v := getenv("SESSION_IDLE_RECLAIM"); v {
+	case "", "on":
+		cfg.IdleReclaim = true
+	case "off":
+		cfg.IdleReclaim = false
+	default:
+		return cfg, fmt.Errorf("invalid SESSION_IDLE_RECLAIM %q", v)
 	}
 
 	switch src := getenv("SESSION_KEY_SOURCE"); src {
@@ -2961,12 +2977,15 @@ type sessionAdmissionWaiter struct {
 // sessionAdmission is the bounded per-backend lease gate: a lease map
 // (authoritative for capacity) plus a strict-FIFO queue of blocked
 // arrivals. All state moves under mu; timers carry the lease pointer and
-// generation so stale callbacks can no-op.
+// generation so stale callbacks can no-op. Idle leases either yield their
+// slot to demand immediately (idleReclaim, the default) or hold it for the
+// full TTL (SESSION_IDLE_RECLAIM=off).
 type sessionAdmission struct {
 	mu             sync.Mutex
 	maxAdmitted    int
 	maxWaiting     int
 	ttl            time.Duration
+	idleReclaim    bool // false = idle leases hold their slot for the full TTL
 	clock          admissionClock
 	leaseMap       map[string]*sessionAdmissionLease
 	queue          *list.List
@@ -2989,7 +3008,17 @@ type sessionAdmission struct {
 	rejClientCancel int64
 }
 
+// newSessionAdmission builds a manager with the default work-conserving
+// idle policy: an idle lease yields its slot to live demand immediately.
 func newSessionAdmission(maxAdmitted, maxWaiting int, ttl time.Duration, clock admissionClock) *sessionAdmission {
+	return newSessionAdmissionWithPolicy(maxAdmitted, maxWaiting, ttl, true, clock)
+}
+
+// newSessionAdmissionWithPolicy sets the idle-lease policy explicitly.
+// idleReclaim=true is work-conserving (the default); false holds every idle
+// lease for its full TTL, so a queued waiter is admitted only when that TTL
+// genuinely expires.
+func newSessionAdmissionWithPolicy(maxAdmitted, maxWaiting int, ttl time.Duration, idleReclaim bool, clock admissionClock) *sessionAdmission {
 	if clock == nil {
 		clock = productionAdmissionClock{}
 	}
@@ -2997,6 +3026,7 @@ func newSessionAdmission(maxAdmitted, maxWaiting int, ttl time.Duration, clock a
 		maxAdmitted: maxAdmitted,
 		maxWaiting:  maxWaiting,
 		ttl:         ttl,
+		idleReclaim: idleReclaim,
 		clock:       clock,
 		leaseMap:    map[string]*sessionAdmissionLease{},
 		queue:       list.New(),
@@ -3046,10 +3076,12 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 
 	// Fresh identity: admit now when NO earlier live newcomer (still
 	// queued, no lease of its own) would be bypassed. Free capacity
-	// grants immediately; a full cap grants by reclaiming the oldest
-	// idle lease — an idle reservation yields to live demand, even with
-	// maxWaiting == 0 or grace <= 0 (those values forbid queueing, not
-	// service with reclaimable capacity).
+	// grants immediately. With idle reclamation enabled (default), a full
+	// cap may also grant by reclaiming the oldest idle lease — an idle
+	// reservation yields to live demand, even with maxWaiting == 0 or
+	// grace <= 0 (those values forbid queueing, not service with
+	// reclaimable capacity). With SESSION_IDLE_RECLAIM=off the idle lease
+	// holds its full TTL, so a full cap always queues.
 	if !a.blockedByQueueLocked() {
 		if ctx.Err() == nil {
 			if len(a.leaseMap) < a.maxAdmitted {
@@ -3059,7 +3091,7 @@ func (a *sessionAdmission) acquire(ctx context.Context, key string, grace time.D
 				a.mu.Unlock()
 				return t, nil
 			}
-			if a.reclaimOldestIdleLocked() {
+			if a.idleReclaim && a.reclaimOldestIdleLocked() {
 				l := &sessionAdmissionLease{key: key, count: 1}
 				a.leaseMap[key] = l
 				t := ticketFor(a, l)
@@ -3166,6 +3198,10 @@ func (a *sessionAdmission) blockedByQueueLocked() bool {
 // generation incremented BEFORE the map delete, so the expiry callback can
 // no-op through the pointer/generation check. reclaimedTotal counts pressure
 // reclaims only — a due lease expiring on its own TTL is not one.
+//
+// Only called while idleReclaim is enabled; with SESSION_IDLE_RECLAIM=off an
+// idle lease is never forfeited early, it leaves solely through its TTL
+// expiry (idleExpiry/pruneIdleLocked), which then drains the FIFO queue.
 func (a *sessionAdmission) reclaimOldestIdleLocked() bool {
 	var victim *sessionAdmissionLease
 	for _, l := range a.leaseMap {
@@ -3262,9 +3298,11 @@ func (t *sessionAdmissionTicket) release() {
 }
 
 // releaseLocked decrements the accepted count; on the final release the
-// lease goes idle and the queue drains IMMEDIATELY: a live queued newcomer
-// reclaims the freed (or oldest other idle) slot without waiting for an
-// arrival, a polling tick, or the TTL. Caller holds mu.
+// lease goes idle and the queue drains. With idle reclamation enabled
+// (default) a live queued newcomer takes the freed (or oldest other idle)
+// slot without waiting for an arrival, a polling tick, or the TTL. With
+// SESSION_IDLE_RECLAIM=off the freed lease keeps its slot for the full TTL,
+// so the drain does nothing until that expiry timer fires. Caller holds mu.
 func (a *sessionAdmission) releaseLocked(l *sessionAdmissionLease) {
 	if l.count > 0 {
 		l.count--
@@ -3350,7 +3388,7 @@ func (a *sessionAdmission) drainLocked() {
 			}
 		}
 		grant := len(a.leaseMap) < a.maxAdmitted
-		if !grant {
+		if !grant && a.idleReclaim {
 			grant = a.reclaimOldestIdleLocked()
 		}
 		if grant {
@@ -3446,9 +3484,12 @@ func (a *sessionAdmission) idleExpiry(lease *sessionAdmissionLease, gen uint64) 
 // admissionFrame is the manager's authoritative aggregate state, copied
 // under mu. No lease keys or waiter identities leave the manager.
 type admissionFrame struct {
-	MaxAdmitted    int   `json:"maxAdmitted"`
-	MaxWaiting     int   `json:"maxWaiting"`
-	IdleTTLms      int64 `json:"idleTTLms"`
+	MaxAdmitted int   `json:"maxAdmitted"`
+	MaxWaiting  int   `json:"maxWaiting"`
+	IdleTTLms   int64 `json:"idleTTLms"`
+	// IdleReclaim is the effective policy: true = idle reservations yield
+	// to waiting work immediately; false = they hold their full TTL.
+	IdleReclaim    bool  `json:"idleReclaim"`
 	Active         int   `json:"active"`
 	Idle           int   `json:"idle"`
 	Waiting        int   `json:"waiting"`
@@ -3479,6 +3520,7 @@ func (a *sessionAdmission) aggregateSnapshot() admissionFrame {
 		MaxAdmitted:    a.maxAdmitted,
 		MaxWaiting:     a.maxWaiting,
 		IdleTTLms:      int64(a.ttl / time.Millisecond),
+		IdleReclaim:    a.idleReclaim,
 		ReclaimedTotal: a.reclaimedTotal,
 	}
 	now := a.clock.Now()
@@ -3804,9 +3846,10 @@ func main() {
 					waiting = 2
 				}
 			}
-			sessionAdmissions[b.Name] = newSessionAdmission(cap, waiting, admissionCfg.IdleTTL, nil)
-			log.Printf("  session admission: %s cap=%d waiting=%d ttl=%s keySource=%s",
-				b.Name, cap, waiting, admissionCfg.IdleTTL, admissionCfg.KeySource)
+			sessionAdmissions[b.Name] = newSessionAdmissionWithPolicy(
+				cap, waiting, admissionCfg.IdleTTL, admissionCfg.IdleReclaim, nil)
+			log.Printf("  session admission: %s cap=%d waiting=%d ttl=%s idleReclaim=%t keySource=%s",
+				b.Name, cap, waiting, admissionCfg.IdleTTL, admissionCfg.IdleReclaim, admissionCfg.KeySource)
 		}
 	}
 

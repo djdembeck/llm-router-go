@@ -498,6 +498,7 @@ function tick(): Frame {
             maxAdmitted: b.maxAdmitted,
             maxWaiting: b.maxWaiting,
             idleTTLms: 30000,
+            idleReclaim: true,
             active: b.admActive,
             idle: b.admIdle,
             waiting: b.admWaiting,

@@ -149,6 +149,9 @@ export interface AdmissionMetrics {
   maxAdmitted: number;
   maxWaiting: number;
   idleTTLms: number;
+  // true = idle reservations yield to waiting work immediately;
+  // false = they hold their full idleTTLms before queued work may take the slot.
+  idleReclaim: boolean;
   active: number;
   idle: number;
   waiting: number;

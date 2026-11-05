@@ -101,6 +101,14 @@ func (c *saManualClock) Advance(d time.Duration) {
 // the disabled state on cleanup.
 func withAdmissionEnv(t *testing.T, ttl time.Duration, clock admissionClock, maxAdmitted, maxWaiting int) {
 	t.Helper()
+	withAdmissionEnvPolicy(t, ttl, clock, maxAdmitted, maxWaiting, true)
+}
+
+// withAdmissionEnvPolicy is withAdmissionEnv with an explicit idle-lease
+// policy: idleReclaim=true is work-conserving (the default), false holds
+// idle leases for their full TTL.
+func withAdmissionEnvPolicy(t *testing.T, ttl time.Duration, clock admissionClock, maxAdmitted, maxWaiting int, idleReclaim bool) {
+	t.Helper()
 	savedSettings := sessionAdmissionSettings
 	savedManagers := sessionAdmissions
 	sessionAdmissionSettings = sessionAdmissionConfig{
@@ -108,11 +116,12 @@ func withAdmissionEnv(t *testing.T, ttl time.Duration, clock admissionClock, max
 		MaxAdmitted: maxAdmitted,
 		MaxWaiting:  maxWaiting,
 		IdleTTL:     ttl,
+		IdleReclaim: idleReclaim,
 		KeySource:   "prompt_cache_key",
 	}
 	sessionAdmissions = make(map[string]*sessionAdmission)
 	for _, b := range backends {
-		sessionAdmissions[b.Name] = newSessionAdmission(maxAdmitted, maxWaiting, ttl, clock)
+		sessionAdmissions[b.Name] = newSessionAdmissionWithPolicy(maxAdmitted, maxWaiting, ttl, idleReclaim, clock)
 	}
 	t.Cleanup(func() {
 		sessionAdmissionSettings = savedSettings
@@ -557,6 +566,12 @@ func saAdmRow(f sessionsFeed, id string) *sessFrame {
 // close the engine server → close the router server.
 func saHTTPSetup(t *testing.T, ttl time.Duration, cap, waiting int) (*saServing, *saGateEngine, *saManualClock) {
 	t.Helper()
+	return saHTTPSetupPolicy(t, ttl, cap, waiting, true)
+}
+
+// saHTTPSetupPolicy is saHTTPSetup with an explicit idle-lease policy.
+func saHTTPSetupPolicy(t *testing.T, ttl time.Duration, cap, waiting int, idleReclaim bool) (*saServing, *saGateEngine, *saManualClock) {
+	t.Helper()
 	engine := newSAGateEngine()
 	withRouterEnv(t,
 		[]Backend{{Name: "smoke", URL: engine.TS.URL, MaxConcurrent: 2, MaxQueueDepth: 4}},
@@ -564,7 +579,7 @@ func saHTTPSetup(t *testing.T, ttl time.Duration, cap, waiting int) (*saServing,
 	proxies["smoke"] = newTestProxy(engine.TS.URL)
 	saIsolate(t)
 	c := newSAManualClock()
-	withAdmissionEnv(t, ttl, c, cap, waiting)
+	withAdmissionEnvPolicy(t, ttl, c, cap, waiting, idleReclaim)
 	s := newSAServing()
 	t.Cleanup(func() { s.ts.Close() })
 	t.Cleanup(func() { engine.TS.Close() }) // LIFO: after handler drain + gate release
@@ -663,6 +678,28 @@ func TestSessionAdmission_ConfigLoader(t *testing.T) {
 			saEnv("SESSION_ADMISSION", "on", "SESSION_IDLE_TTL", "250ms"), limited)
 		if err != nil || cfg.IdleTTL != 250*time.Millisecond {
 			t.Fatalf("ttl = %+v %v", cfg, err)
+		}
+	})
+	t.Run("idle-reclaim", func(t *testing.T) {
+		cfg, err := loadSessionAdmissionConfig(saEnv("SESSION_ADMISSION", "on"), limited)
+		if err != nil || !cfg.IdleReclaim {
+			t.Fatalf("default idleReclaim = %+v %v, want true", cfg, err)
+		}
+		cfg, err = loadSessionAdmissionConfig(
+			saEnv("SESSION_ADMISSION", "on", "SESSION_IDLE_RECLAIM", "on"), limited)
+		if err != nil || !cfg.IdleReclaim {
+			t.Fatalf("on idleReclaim = %+v %v, want true", cfg, err)
+		}
+		cfg, err = loadSessionAdmissionConfig(
+			saEnv("SESSION_ADMISSION", "on", "SESSION_IDLE_RECLAIM", "off"), limited)
+		if err != nil || cfg.IdleReclaim {
+			t.Fatalf("off idleReclaim = %+v %v, want false", cfg, err)
+		}
+		for _, v := range []string{"banana", "true", "1"} {
+			if _, err := loadSessionAdmissionConfig(
+				saEnv("SESSION_ADMISSION", "on", "SESSION_IDLE_RECLAIM", v), limited); err == nil {
+				t.Errorf("SESSION_IDLE_RECLAIM=%s: want error", v)
+			}
 		}
 	})
 	t.Run("key-source", func(t *testing.T) {
@@ -958,6 +995,306 @@ func TestSessionAdmission_ImmediateReclaim(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("newcomer not granted by the final release")
+	}
+}
+
+// saWaitWaiting polls the manager's aggregate frame until it reports the
+// expected number of live waiters. Queue pushes happen on the caller's
+// goroutine (or a spawned acquire), so real-time polling is the only sync.
+func saWaitWaiting(t *testing.T, a *sessionAdmission, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := a.aggregateSnapshot().Waiting; got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admission waiting = %d, want %d", a.aggregateSnapshot().Waiting, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestSessionAdmission_IdleHoldHonorsTTL is the hold arm of idle
+// retention: with SESSION_IDLE_RECLAIM=off a released lease keeps its slot
+// for the full TTL, so a queued newcomer waits for genuine expiry instead
+// of displacing it.
+func TestSessionAdmission_IdleHoldHonorsTTL(t *testing.T) {
+	const ttl = 30 * time.Second
+	c := newSAManualClock()
+	a := newSessionAdmissionWithPolicy(1, 4, ttl, false, c)
+	ctx := context.Background()
+
+	tkA, err := a.acquire(ctx, "kA", time.Second)
+	if err != nil {
+		t.Fatalf("A acquire: %v", err)
+	}
+	tkA.release() // idle: holds the slot until idleSince+ttl
+
+	type result struct {
+		tk  *sessionAdmissionTicket
+		err error
+	}
+	bCh := make(chan result, 1)
+	go func() {
+		tk, err := a.acquire(ctx, "kB", 5*time.Minute)
+		bCh <- result{tk: tk, err: err}
+	}()
+	saWaitWaiting(t, a, 1)
+
+	c.Advance(ttl - time.Second)
+	select {
+	case r := <-bCh:
+		t.Fatalf("B admitted before TTL: ticket=%v err=%v", r.tk != nil, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := a.aggregateSnapshot().ReclaimedTotal; got != 0 {
+		t.Fatalf("reclaimedTotal = %d before TTL, want 0", got)
+	}
+
+	c.Advance(time.Second)
+	select {
+	case r := <-bCh:
+		if r.err != nil {
+			t.Fatalf("B terminal = %v, want grant", r.err)
+		}
+		if got := a.aggregateSnapshot().ReclaimedTotal; got != 0 {
+			t.Fatalf("TTL expiry counted as a pressure reclaim: %d", got)
+		}
+		r.tk.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("B not admitted at TTL expiry")
+	}
+}
+
+// TestSessionAdmission_IdleHoldFIFOAtExpiry proves one expiry releases one
+// slot to the queue HEAD: B is granted, C stays queued behind B's lease.
+func TestSessionAdmission_IdleHoldFIFOAtExpiry(t *testing.T) {
+	const ttl = 10 * time.Second
+	c := newSAManualClock()
+	a := newSessionAdmissionWithPolicy(1, 4, ttl, false, c)
+	ctx := context.Background()
+
+	tkA, err := a.acquire(ctx, "kA", time.Second)
+	if err != nil {
+		t.Fatalf("A acquire: %v", err)
+	}
+	tkA.release()
+
+	type result struct {
+		tk  *sessionAdmissionTicket
+		err error
+	}
+	bCh := make(chan result, 1)
+	go func() {
+		tk, err := a.acquire(ctx, "kB", 5*time.Minute)
+		bCh <- result{tk: tk, err: err}
+	}()
+	saWaitWaiting(t, a, 1)
+	cCh := make(chan result, 1)
+	go func() {
+		tk, err := a.acquire(ctx, "kC", 5*time.Minute)
+		cCh <- result{tk: tk, err: err}
+	}()
+	saWaitWaiting(t, a, 2)
+
+	c.Advance(ttl)
+	var tkB *sessionAdmissionTicket
+	select {
+	case r := <-bCh:
+		if r.err != nil {
+			t.Fatalf("B terminal = %v, want grant", r.err)
+		}
+		tkB = r.tk
+	case <-time.After(2 * time.Second):
+		t.Fatal("B not admitted at TTL expiry")
+	}
+	saWaitWaiting(t, a, 1) // C must remain queued behind B's active lease
+	select {
+	case r := <-cCh:
+		t.Fatalf("C admitted before B released: ticket=%v err=%v", r.tk != nil, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	tkB.release() // B idles at t+ttl
+	c.Advance(ttl)
+	select {
+	case r := <-cCh:
+		if r.err != nil {
+			t.Fatalf("C terminal = %v, want grant", r.err)
+		}
+		r.tk.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("C not admitted at B's TTL expiry")
+	}
+}
+
+// TestSessionAdmission_IdleHoldExpiredWaiterNotGranted pins the tie between
+// a waiter deadline and an idle expiry at the same instant: the expiry
+// callback runs first and must fail the already-expired waiter, never
+// grant it.
+func TestSessionAdmission_IdleHoldExpiredWaiterNotGranted(t *testing.T) {
+	const ttl = 10 * time.Second
+	c := newSAManualClock()
+	a := newSessionAdmissionWithPolicy(1, 2, ttl, false, c)
+	ctx := context.Background()
+
+	tkA, err := a.acquire(ctx, "kA", time.Second)
+	if err != nil {
+		t.Fatalf("A acquire: %v", err)
+	}
+	tkA.release() // idle timer armed at t+ttl (inserted first)
+
+	type result struct {
+		tk  *sessionAdmissionTicket
+		err error
+	}
+	bCh := make(chan result, 1)
+	go func() {
+		// Same absolute deadline as A's idle expiry: the queue grace and
+		// the TTL end on the same clock instant.
+		tk, err := a.acquire(ctx, "kB", ttl)
+		bCh <- result{tk: tk, err: err}
+	}()
+	saWaitWaiting(t, a, 1)
+
+	c.Advance(ttl)
+	select {
+	case r := <-bCh:
+		if r.tk != nil {
+			t.Fatal("expired waiter was granted a ticket")
+		}
+		if !errors.Is(r.err, errSessionAdmissionTimeout) {
+			t.Fatalf("B terminal = %v, want %v", r.err, errSessionAdmissionTimeout)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("B result not published")
+	}
+	if held, _ := a.snapshot("kA"); held {
+		t.Fatal("expired lease A survived its TTL")
+	}
+	if got := a.aggregateSnapshot().ReclaimedTotal; got != 0 {
+		t.Fatalf("reclaimedTotal = %d, want 0", got)
+	}
+}
+
+// TestSessionAdmission_IdleHoldReactivationSurvivesStaleExpiry proves a
+// returning conversation re-arms its lease and no stale expiry callback
+// (captured before the reactivation) can expire it or admit a waiter early.
+func TestSessionAdmission_IdleHoldReactivationSurvivesStaleExpiry(t *testing.T) {
+	const ttl = 10 * time.Second
+	c := newSAManualClock()
+	a := newSessionAdmissionWithPolicy(1, 2, ttl, false, c)
+	ctx := context.Background()
+
+	tkA, err := a.acquire(ctx, "kA", time.Second)
+	if err != nil {
+		t.Fatalf("A acquire: %v", err)
+	}
+	tkA.release() // idle timer at t+ttl
+
+	type result struct {
+		tk  *sessionAdmissionTicket
+		err error
+	}
+	bCh := make(chan result, 1)
+	go func() {
+		tk, err := a.acquire(ctx, "kB", 5*time.Minute)
+		bCh <- result{tk: tk, err: err}
+	}()
+	saWaitWaiting(t, a, 1)
+
+	// A returns halfway through its TTL: the idle lease is reused and its
+	// expiry timer stopped (it stays queued as a stopped callback).
+	c.Advance(ttl / 2)
+	tkA2, err := a.acquire(ctx, "kA", time.Second)
+	if err != nil {
+		t.Fatalf("A reactivation: %v", err)
+	}
+	saWaitWaiting(t, a, 1) // B still behind the renewed active lease
+
+	// The original expiry instant passes: the stale callback must no-op.
+	c.Advance(ttl / 2)
+	select {
+	case r := <-bCh:
+		t.Fatalf("B admitted by a stale expiry: ticket=%v err=%v", r.tk != nil, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if held, _ := a.snapshot("kA"); !held {
+		t.Fatal("renewed lease A lost to its stale expiry callback")
+	}
+
+	tkA2.release() // new idle stamp at t+ttl
+	c.Advance(ttl)
+	select {
+	case r := <-bCh:
+		if r.err != nil {
+			t.Fatalf("B terminal = %v, want grant", r.err)
+		}
+		r.tk.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("B not admitted after A's second TTL expiry")
+	}
+}
+
+// TestSessionAdmission_IdleHoldCancelledHeadThenLiveWaiter proves a
+// cancelled queue head neither mints a lease nor starves the live waiter
+// behind it: C is admitted only when A's TTL genuinely expires.
+func TestSessionAdmission_IdleHoldCancelledHeadThenLiveWaiter(t *testing.T) {
+	const ttl = 10 * time.Second
+	c := newSAManualClock()
+	a := newSessionAdmissionWithPolicy(1, 2, ttl, false, c)
+	ctx := context.Background()
+
+	tkA, err := a.acquire(ctx, "kA", time.Second)
+	if err != nil {
+		t.Fatalf("A acquire: %v", err)
+	}
+	tkA.release()
+
+	type result struct {
+		tk  *sessionAdmissionTicket
+		err error
+	}
+	ctxB, cancelB := context.WithCancel(ctx)
+	bCh := make(chan result, 1)
+	go func() {
+		tk, err := a.acquire(ctxB, "kB", 5*time.Minute)
+		bCh <- result{tk: tk, err: err}
+	}()
+	saWaitWaiting(t, a, 1)
+	cCh := make(chan result, 1)
+	go func() {
+		tk, err := a.acquire(ctx, "kC", 5*time.Minute)
+		cCh <- result{tk: tk, err: err}
+	}()
+	saWaitWaiting(t, a, 2)
+
+	cancelB()
+	select {
+	case r := <-bCh:
+		if r.tk != nil || !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("cancelled head = (%v, %v), want (nil, context.Canceled)", r.tk, r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled waiter did not return")
+	}
+	// Cancellation frees the queue slot, not A's reserved admission slot.
+	select {
+	case r := <-cCh:
+		t.Fatalf("C admitted early: ticket=%v err=%v", r.tk != nil, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	c.Advance(ttl)
+	select {
+	case r := <-cCh:
+		if r.err != nil {
+			t.Fatalf("C terminal = %v, want grant", r.err)
+		}
+		r.tk.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("C not admitted at A's TTL expiry")
 	}
 }
 
@@ -1595,6 +1932,90 @@ func TestSessionAdmission_HTTPIdleRetentionAndHolderBypass(t *testing.T) {
 	// grant instant), not an active lease.
 	if row := saAdmRow(feed, saAdmKey(t, "C", "smoke")); row == nil || !row.AdmissionLease || row.AdmissionIdleSinceMs <= 0 {
 		t.Fatalf("held C row = %+v, want true/idle-stamped", row)
+	}
+}
+
+// TestSessionAdmission_HTTPIdleHoldDefersAdmission proves the policy end to
+// end: with SESSION_IDLE_RECLAIM=off a queued keyed conversation is NOT
+// admitted when the running one completes; it is admitted when the idle TTL
+// genuinely expires, through the real proxy handler and queue path.
+func TestSessionAdmission_HTTPIdleHoldDefersAdmission(t *testing.T) {
+	const ttl = 30 * time.Second
+	prevQueueTimeout := queueTimeout
+	queueTimeout = 5 * time.Minute // >> ttl: the waiter must outlive A's idle TTL
+	t.Cleanup(func() { queueTimeout = prevQueueTimeout })
+
+	s, engine, c := saHTTPSetupPolicy(t, ttl, 1, 4, false)
+	url := s.ts.URL + "/v1/chat/completions"
+
+	waitSeen := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if seen := engine.Seen(); len(seen) >= want {
+				return
+			} else if time.Now().After(deadline) {
+				t.Fatalf("engine seen = %v, want %d requests", seen, want)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	outA := saPostAsync(t, url, saChatBody("smoke", "A", "hello"))
+	waitSeen(1) // A admitted and forwarded upstream
+
+	outB := saPostAsync(t, url, saChatBody("smoke", "B", "hello"))
+	saWaitWaiting(t, sessionAdmissions["smoke"], 1) // cap 1 held by A; B queues
+
+	engine.releaseKey("A")
+	if code := <-outA; code != 200 {
+		t.Fatalf("A status = %d", code)
+	}
+	saWaitIdleLease(t, "smoke", saAdmKey(t, "A", "smoke"))
+
+	// No clock advance: A's idle lease holds its full TTL, so B must not
+	// reach the engine through a pressure reclaim.
+	time.Sleep(150 * time.Millisecond)
+	if got := engine.Seen(); len(got) != 1 || got[0] != "A" {
+		t.Fatalf("engine seen = %v before TTL, want only A", got)
+	}
+	if got := sessionAdmissions["smoke"].aggregateSnapshot(); got.Waiting != 1 || got.ReclaimedTotal != 0 {
+		t.Fatalf("admission before TTL = waiting %d, reclaims %d; want 1/0", got.Waiting, got.ReclaimedTotal)
+	}
+
+	c.Advance(ttl)
+	waitSeen(2) // expiry drained B into the backend
+	engine.releaseKey("B")
+	if code := <-outB; code != 200 {
+		t.Fatalf("B status = %d", code)
+	}
+
+	resp, err := http.Get(s.ts.URL + "/stats")
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+	defer resp.Body.Close()
+	var stats struct {
+		Backends []struct {
+			Admission *struct {
+				MaxWaiting     int   `json:"maxWaiting"`
+				IdleTTLms      int64 `json:"idleTTLms"`
+				IdleReclaim    bool  `json:"idleReclaim"`
+				ReclaimedTotal int64 `json:"reclaimedTotal"`
+			} `json:"admission"`
+		} `json:"backends"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode /stats: %v", err)
+	}
+	if len(stats.Backends) != 1 || stats.Backends[0].Admission == nil {
+		t.Fatalf("stats admission shape missing: %+v", stats)
+	}
+	adm := stats.Backends[0].Admission
+	if adm.MaxWaiting != 4 || adm.IdleTTLms != int64(ttl/time.Millisecond) ||
+		adm.IdleReclaim || adm.ReclaimedTotal != 0 {
+		t.Fatalf("stats admission = %+v, want maxWaiting=4 idleTTLms=%d idleReclaim=false reclaims=0",
+			adm, ttl/time.Millisecond)
 	}
 }
 
