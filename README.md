@@ -159,6 +159,9 @@ BACKENDS='[
     "maxConcurrentLargePrefill": 1,
     "largePrefillThresholdTokens": 8192,
     "largePrefillKVThresholdPct": 80,
+    "largePrefillMode": "balanced",
+    "largePrefillMaxRunning": 0,
+    "largePrefillMaxITLMs": 0,
     "largePrefillMaxQueue": 16
   }
 ]'
@@ -175,8 +178,36 @@ BACKENDS='[
 | `maxQueueDepth` | Maximum pending requests beyond `maxConcurrent`; defaults to `2`. |
 | `maxConcurrentLargePrefill` | Maximum concurrent large-prefill requests. `0` disables large-prefill limiting. |
 | `largePrefillThresholdTokens` | Estimated prompt-token count (whole conversation) that triggers large-prefill logic; defaults to `8192`. |
-| `largePrefillKVThresholdPct` | Parks a **cold** large prefill while the backend's live engine KV usage is at or above this percentage (from the backend's `/metrics` scrape). `0` disables the pressure gate. Requires `maxConcurrentLargePrefill > 0`; metrics unavailable or not `ok` fails open. |
-| `largePrefillMaxQueue` | Bounds the park queue for cold pressure-gated prefills and the large-prefill permit queue; defaults to `4`. Overflow receives `429` with `X-Router-Reason: prefill-queue-full`. |
+| `largePrefillKVThresholdPct` | Parks a **cold** large prefill while the backend's live engine KV usage is at or above this percentage (from the backend's `/metrics` scrape). `0` disables the KV rule. Requires `maxConcurrentLargePrefill > 0`; metrics unavailable or not `ok` fails open. |
+| `largePrefillMode` | Absent, empty string, or `balanced` retains cold-only KV parking and the existing permit behavior. `decode-first` adds headroom checks for **all** large prompts, including returning leases. Unknown nonempty modes fail startup. |
+| `largePrefillMaxRunning` | Decode-first only: require existing occupancy below this integer before starting a large prefill; `0` disables it. Occupancy is the maximum of local execution reservations and fresh, present engine running + waiting gauges. `4` allows three existing requests plus the new prefill. |
+| `largePrefillMaxITLMs` | Decode-first only: park while occupancy is positive and fresh, sampled interval ITL exceeds this millisecond threshold; `0` disables it. Idle backends are not blocked by a previous high ITL. |
+| `largePrefillMaxQueue` | Bounds the pressure park queue and the large-prefill permit queue; defaults to `4`. Overflow receives `429` with `X-Router-Reason: prefill-queue-full`. |
+
+Decode-first requires `maxConcurrentLargePrefill > 0` and at least one positive
+headroom threshold. Both new thresholds must be finite/nonnegative, including in
+balanced mode; balanced ignores valid retained thresholds for a one-setting rollback.
+For example, `"largePrefillMode":"decode-first","largePrefillMaxRunning":4,
+"largePrefillMaxITLMs":250` conservatively admits a large prefill below four existing
+requests and at most 250 ms sampled ITL. These are initial controls, not universal SLOs.
+Changing mode requires reloading configuration by recreating the router, not the engine.
+
+Headroom uses the successful scrape timestamp and metric presence under the registry
+lock; samples older than five seconds or failed/missing telemetry fall back to local
+execution occupancy (including unlimited backends). Missing gauge components contribute
+only when present. ITL needs a fresh positive sample count and finite nonnegative mean.
+Fresh HTTP 200 responses containing frozen metrics cannot be detected by scrape age.
+The existing KV gate's fail-open policy and warm-lease exemption are unchanged, but a
+returning lease is not evidence of cache residency and cannot bypass decode-first.
+
+Pressure parking takes neither an execution slot nor a prefill permit, including when
+KV gating is disabled. Conditions are rechecked after the permit and after execution
+reservation, discounting only this request's own local reservation, never engine counts.
+Lost headroom returns both reservations before re-parking under the original deadline.
+Small requests bypass large-prefill checks. Parking/permit wake order is not FIFO;
+conversation admission remains strictly FIFO, and permit waiters retain no-barging behavior.
+`prefillWaiting` remains parked requests plus permit waiters; parking logs include mode,
+reason, occupancy, ITL and configured thresholds. Already-forwarded requests are not paused.
 
 ### Scalar environment variables
 
