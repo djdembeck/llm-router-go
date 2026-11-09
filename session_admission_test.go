@@ -491,9 +491,8 @@ func saPollEngineSeen(t *testing.T, e *saGateEngine, order ...string) {
 }
 
 // saPollAdmittedLeases polls until the per-backend manager holds EXACTLY
-// `want` admitted leases (len(leaseMap)): the deterministic replacement for a
-// fixed sleep after an admission grant — a lease appears only once the
-// granted handler's admission lands, so the count is stable once reached.
+// `want` admitted leases (len(leaseMap)). A matching count does not identify
+// which leases are held; use saPollAdmittedLeaseKey when identity matters.
 func saPollAdmittedLeases(t *testing.T, backend string, want int) {
 	t.Helper()
 	m := sessionAdmissions[backend]
@@ -507,6 +506,22 @@ func saPollAdmittedLeases(t *testing.T, backend string, want int) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("admission leases = %d, want %d", got, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// saPollAdmittedLeaseKey polls until a specific key has an admitted lease.
+func saPollAdmittedLeaseKey(t *testing.T, backend, key string) {
+	t.Helper()
+	m := sessionAdmissions[backend]
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if held, _ := m.snapshot(key); held {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admission lease %q was not granted", key)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -2339,10 +2354,8 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 	// F's reclaim + B's grant land on the handler's DEFERRED release
 	// (after the client reads the response): poll for the stable
 	// admitted-set {M, B} (F's lease is gone, B's is granted).
+	saPollAdmittedLeaseKey(t, "smoke", kB)
 	saPollAdmittedLeases(t, "smoke", 2)
-	if held, _ := sessionAdmissions["smoke"].snapshot(kB); !held {
-		t.Fatal("B not granted by the release-driven reclaim")
-	}
 	saPollGPU(t, gb, 1, 1)             // M (unit) + B (queued).
 	time.Sleep(150 * time.Millisecond) // settle: no forward (B budget-queued).
 	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
@@ -2358,10 +2371,8 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 	// M's reclaim + C's grant land on the handler's DEFERRED release:
 	// poll for the stable admitted-set {B, C} (M's lease is gone, C's
 	// is granted).
+	saPollAdmittedLeaseKey(t, "smoke", kC)
 	saPollAdmittedLeases(t, "smoke", 2)
-	if held, _ := sessionAdmissions["smoke"].snapshot(kC); !held {
-		t.Fatal("C not granted by M's release-driven reclaim")
-	}
 	saPollGPU(t, gb, 1, 1)             // B (unit) + C (queued).
 	time.Sleep(150 * time.Millisecond) // settle: B takes the unit + slot, C stays budget-queued.
 	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
