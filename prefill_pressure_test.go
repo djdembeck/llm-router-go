@@ -1,7 +1,11 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -300,14 +304,227 @@ func TestPrefillPressure_QueueFullBoundsColdParking(t *testing.T) {
 	}
 }
 
-// TestBackendPrefillJSONFields keeps the new BACKENDS fields wired to their
-// documented JSON names.
-func TestBackendPrefillJSONFields(t *testing.T) {
-	var b Backend
-	if err := json.Unmarshal([]byte(`{"name":"x","url":"http://x","maxConcurrentLargePrefill":1,"largePrefillKVThresholdPct":80,"largePrefillMaxQueue":16}`), &b); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+// TestPrefillPermit_GeneratedOutput exercises real proxy body copies. Reading
+// every prefix chunk is a barrier: it has crossed the tracker, but must not
+// release A's permit. No sleep is used to infer that B stayed blocked.
+func TestPrefillPermit_GeneratedOutput(t *testing.T) {
+	for _, output := range []struct {
+		name string
+		data string
+	}{
+		{"content", `{"choices":[{"delta":{"content":"hello"}}]}`},
+		{"reasoning", `{"choices":[{"delta":{"reasoning_content":"thinking"}}]}`},
+		{"reasoning-alias", `{"choices":[{"delta":{"reasoning":"thinking"}}]}`},
+		{"tool", `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}`},
+		{"completion", `{"choices":[{"text":"hello"}]}`},
+	} {
+		t.Run(output.name, func(t *testing.T) {
+			h := newPrefillHarness(t, 0, false, 4)
+			chunks := make(chan string)
+			stop := make(chan struct{})
+			forwardedB := make(chan struct{})
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.Contains(string(body), `"B"`) {
+					close(forwardedB)
+					fmt.Fprint(w, "B done")
+					return
+				}
+				if strings.Contains(string(body), `"small"`) {
+					fmt.Fprint(w, "small done")
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				for {
+					select {
+					case p := <-chunks:
+						fmt.Fprint(w, p)
+						w.(http.Flusher).Flush()
+					case <-stop:
+						return
+					case <-r.Context().Done():
+						return
+					}
+				}
+			}))
+			t.Cleanup(up.Close)
+			t.Cleanup(func() { close(stop) })
+			proxies["smoke"] = newTestProxy(up.URL)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			body := fmt.Sprintf(`{"model":"smoke","stream":true,"prompt_cache_key":"A","messages":[{"role":"user","content":%q}]}`, strings.Repeat("x", 200))
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.url(), strings.NewReader(body))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if got := prefillInFlight("smoke"); got != 1 {
+				t.Fatalf("headers released prefill: %d", got)
+			}
+			b := saPostAsync(t, h.url(), saChatBody("smoke", "B", strings.Repeat("x", 200)))
+			saPollPrefillSlot(t, 1, 1)
+			if code, _, _ := saPost(t, h.url(), saChatBody("smoke", "small", "hi")); code != 200 {
+				t.Fatalf("small request = %d", code)
+			}
+			forward := func(p string) {
+				t.Helper()
+				select {
+				case chunks <- p:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				got := make([]byte, len(p))
+				if _, err := io.ReadFull(resp.Body, got); err != nil || string(got) != p {
+					t.Fatalf("forwarded bytes = %q, err %v, want %q", got, err, p)
+				}
+			}
+			for _, p := range []string{
+				": heartbeat\r\n\r\n",
+				"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\r\n\r\n",
+				"data: {\"choices\":[{\"delta\":{}}]}\n\n",
+				"data: not-json\n\n",
+				"data: {\"usage\":{\"prompt_tokens\":50}}\n\n",
+				"data: " + strings.Repeat("x", maxPrefillEventBytes) + "\n\n",
+				"data: " + output.data[:len(output.data)/2],
+			} {
+				forward(p)
+				if got := prefillInFlight("smoke"); got != 1 {
+					t.Fatalf("prefix released prefill: %d", got)
+				}
+				select {
+				case <-forwardedB:
+					t.Fatal("B forwarded before generated output")
+				default:
+				}
+			}
+			forward(output.data[len(output.data)/2:] + "\r\n\r\n")
+			select {
+			case <-forwardedB:
+			case <-ctx.Done():
+				t.Fatal("B did not forward during A decode")
+			}
+			if code := <-b; code != 200 {
+				t.Fatalf("B status = %d", code)
+			}
+			// A remains open and can continue decoding after handing off.
+			forward("data: " + output.data + "\n\n")
+			cancel()
+			resp.Body.Close()
+			h.s.awaitIdle(t, 5*time.Second)
+			saPollPrefillSlot(t, 0, 0)
+		})
 	}
-	if b.LargePrefillKVThresholdPct != 80 || b.LargePrefillMaxQueue != 16 {
-		t.Fatalf("fields = %v/%v, want 80/16", b.LargePrefillKVThresholdPct, b.LargePrefillMaxQueue)
+}
+
+func TestPrefillPermit_ResponseWriterBoundaries(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit=%v", explicit), func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			releases := 0
+			tracker := &respTracker{
+				ResponseWriter: rec,
+				status:         http.StatusOK,
+				prefillRelease: func() { releases++ },
+			}
+			if explicit {
+				tracker.WriteHeader(http.StatusOK)
+			}
+			tracker.Flush()
+			if _, err := tracker.Write(nil); err != nil {
+				t.Fatal(err)
+			}
+			if releases != 0 {
+				t.Fatal("headers, flush or empty write released prefill")
+			}
+			tracker.Write([]byte("body"))
+			tracker.Write([]byte("tail"))
+			if releases != 1 || rec.Body.String() != "bodytail" {
+				t.Fatalf("releases=%d body=%q", releases, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestPrefillPermit_SSEFraming(t *testing.T) {
+	for _, framing := range []string{"\n", "\r\n", "\r"} {
+		t.Run(fmt.Sprintf("newline=%q", framing), func(t *testing.T) {
+			observer := &prefillOutputObserver{}
+			prefix := ": heartbeat" + framing + framing +
+				"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}" + framing + framing +
+				"data: [DONE]" + framing + framing
+			for i := range prefix {
+				if observer.observe([]byte{prefix[i]}) {
+					t.Fatal("preamble was mistaken for generated output")
+				}
+			}
+			output := "event: message" + framing + "data: {\"choices\":[" + framing +
+				"data: {\"delta\":{\"content\":\"token\"}}]}" + framing + framing
+			for i := range output {
+				got := observer.observe([]byte{output[i]})
+				// CR dispatches immediately, before the optional LF.
+				want := i == len(output)-1
+				if framing == "\r\n" {
+					want = i == len(output)-2
+				}
+				if got != want {
+					t.Fatalf("byte %d: output=%v, want %v", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestPrefillPermit_HeaderOnlyCleanup(t *testing.T) {
+	for _, ending := range []string{"eof", "abort", "cancel"} {
+		t.Run(ending, func(t *testing.T) {
+			h := newPrefillHarness(t, 0, false, 4)
+			end := make(chan struct{}, 1)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				if ending == "abort" {
+					w.Header().Set("Content-Length", "1000")
+				}
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				select {
+				case <-end:
+				case <-r.Context().Done():
+				}
+			}))
+			t.Cleanup(up.Close)
+			t.Cleanup(func() { close(end) })
+			proxies["smoke"] = newTestProxy(up.URL)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			body := fmt.Sprintf(`{"model":"smoke","stream":true,"messages":[{"role":"user","content":%q}]}`, strings.Repeat("x", 200))
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.url(), strings.NewReader(body))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if got := prefillInFlight("smoke"); got != 1 {
+				t.Fatalf("headers released permit: %d", got)
+			}
+			if ending == "cancel" {
+				cancel()
+			} else {
+				end <- struct{}{}
+			}
+			_, err = io.ReadAll(resp.Body)
+			if ending == "eof" && err != nil {
+				t.Fatal(err)
+			}
+			if ending == "abort" && err == nil {
+				t.Fatal("truncated upstream body did not abort")
+			}
+			resp.Body.Close()
+			h.s.awaitIdle(t, 5*time.Second)
+			saPollPrefillSlot(t, 0, 0)
+		})
 	}
 }

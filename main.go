@@ -3637,7 +3637,7 @@ var (
 	backends            []Backend
 	client              = &http.Client{Timeout: 30 * time.Second}
 	slots               map[string]*slotManager         // per-backend concurrency slots
-	prefillSlots        map[string]*slotManager         // per-backend large-prefill slots (released on first response byte)
+	prefillSlots        map[string]*slotManager         // per-backend large-prefill slots (SSE: first generated-output event; other types: first body byte)
 	prefillPressure     map[string]*prefillPressureGate // per-backend cold large-prefill parking
 	gpu                 *gpuBudget
 	queueTimeout                                    = 30 * time.Second
@@ -6680,12 +6680,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// above.
 	reqID := sessions.start(target.Name, r.URL.Path, parsed.Stream, sessKey, ctxTok, prefillTok)
 	proxy := proxies[target.Name]
-	// Wrap ResponseWriter to capture status + detect completion for duration
-	// tracking. Also releases the prefill slot on first response byte.
+	// Wrap ResponseWriter to capture status and duration without coupling
+	// transport first-byte metrics to completion of a large prompt prefill.
 	tracker := &respTracker{
 		ResponseWriter: w,
 		status:         200,
-		onFirstByte:    prefillRelease,
 		backend:        target.Name,
 		ttftStart:      start,
 		reqStart:       start,
@@ -6697,6 +6696,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		ctxTok:         ctxTok,
 		queueWait:      reqContext.QueueWait,
 		gateWaitMs:     reqContext.GateWaitMs,
+	}
+	if prefillHeld {
+		tracker.prefillRelease = prefillRelease
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
@@ -6743,11 +6745,122 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	proxyReturned = true
 }
 
+// prefillOutputObserver inspects only the pre-generation prefix of an SSE
+// response. It never delays forwarding. Oversized or invalid events fail closed:
+// a later recognizable event (or the handler's defer) must release the permit.
+type prefillOutputObserver struct {
+	event     []byte
+	lineBytes int
+	skipLF    bool
+	oversized bool
+}
+
+const maxPrefillEventBytes = 64 * 1024
+
+func (o *prefillOutputObserver) observe(p []byte) bool {
+	for _, c := range p {
+		if o.skipLF {
+			o.skipLF = false
+			if c == '\n' {
+				continue
+			}
+		}
+		if c == '\r' || c == '\n' {
+			o.skipLF = c == '\r'
+			if o.lineBytes == 0 {
+				if !o.oversized && o.generatedOutput() {
+					return true
+				}
+				o.event = o.event[:0]
+				o.oversized = false
+			} else if !o.oversized {
+				if len(o.event) < maxPrefillEventBytes {
+					o.event = append(o.event, '\n')
+				} else {
+					o.oversized = true
+				}
+			}
+			o.lineBytes = 0
+			continue
+		}
+		o.lineBytes = 1 // only emptiness matters, including for oversized lines
+		if !o.oversized {
+			if len(o.event) < maxPrefillEventBytes {
+				o.event = append(o.event, c)
+			} else {
+				o.oversized = true
+			}
+		}
+	}
+	return false
+}
+
+func (o *prefillOutputObserver) generatedOutput() bool {
+	// Compact SSE data lines in place; comments and event/id/retry fields do
+	// not describe generated tokens. SSE joins multiple data lines with LF.
+	data := o.event[:0]
+	rest := o.event
+	seen := false
+	for len(rest) > 0 {
+		line, tail, _ := bytes.Cut(rest, []byte{'\n'})
+		rest = tail
+		field, value, _ := bytes.Cut(line, []byte{':'})
+		if !bytes.Equal(field, []byte("data")) {
+			continue
+		}
+		if len(value) > 0 && value[0] == ' ' {
+			value = value[1:]
+		}
+		if seen {
+			data = append(data, '\n')
+		}
+		data = append(data, value...)
+		seen = true
+	}
+	type functionDelta struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
+	var event struct {
+		Choices []struct {
+			Text  string `json:"text"`
+			Delta struct {
+				Content          string        `json:"content"`
+				ReasoningContent string        `json:"reasoning_content"`
+				Reasoning        string        `json:"reasoning"`
+				Refusal          string        `json:"refusal"`
+				FunctionCall     functionDelta `json:"function_call"`
+				ToolCalls        []struct {
+					ID       string        `json:"id"`
+					Function functionDelta `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if len(data) == 0 || json.Unmarshal(data, &event) != nil {
+		return false
+	}
+	for i := range event.Choices {
+		choice := &event.Choices[i]
+		d := &choice.Delta
+		if choice.Text != "" || d.Content != "" || d.ReasoningContent != "" || d.Reasoning != "" || d.Refusal != "" || d.FunctionCall.Name != "" || d.FunctionCall.Arguments != "" {
+			return true
+		}
+		for _, call := range d.ToolCalls {
+			if call.ID != "" || call.Function.Name != "" || call.Function.Arguments != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type respTracker struct {
 	http.ResponseWriter
-	status      int
-	wrote       bool
-	onFirstByte func() // called on first WriteHeader/Write; used to release prefill slot
+	status         int
+	wrote          bool
+	prefillRelease func()
+	prefillSSE     *prefillOutputObserver
 	// firstByteAt: time of the first response byte; if only WriteHeader
 	// ever happens (no body byte), the WriteHeader time is the fallback.
 	firstByteAt time.Time
@@ -6777,9 +6890,6 @@ func (t *respTracker) WriteHeader(code int) {
 		if !t.bodyByte {
 			t.firstByteAt = time.Now() // fallback; first body byte overrides
 		}
-		if t.onFirstByte != nil {
-			t.onFirstByte()
-		}
 	}
 	t.ResponseWriter.WriteHeader(code)
 }
@@ -6787,12 +6897,25 @@ func (t *respTracker) WriteHeader(code int) {
 func (t *respTracker) Write(b []byte) (int, error) {
 	if !t.wrote {
 		t.wrote = true
-		if t.onFirstByte != nil {
-			t.onFirstByte()
-		}
 	}
 	n, err := t.ResponseWriter.Write(b)
 	if n > 0 {
+		if t.prefillRelease != nil {
+			mediaType, _, _ := strings.Cut(t.Header().Get("Content-Type"), ";")
+			sse := t.stream && strings.EqualFold(strings.TrimSpace(mediaType), "text/event-stream")
+			release := !sse
+			if sse && t.status >= 200 && t.status < 300 {
+				if t.prefillSSE == nil {
+					t.prefillSSE = &prefillOutputObserver{}
+				}
+				release = t.prefillSSE.observe(b[:n])
+			}
+			if release {
+				t.prefillRelease()
+				t.prefillRelease = nil
+				t.prefillSSE = nil
+			}
+		}
 		if !t.bodyByte {
 			t.firstByteAt = time.Now()
 			t.bodyByte = true

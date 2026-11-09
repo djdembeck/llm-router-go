@@ -136,9 +136,10 @@ func saChatBody(model, key, msg string) string {
 	return fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, model, msg)
 }
 
-// saChatStreamBody is saChatBody with stream:true: production releases
-// the large-prefill slot on the first response byte, so a fake upstream
-// that writes no bytes keeps the slot deterministically gated.
+// saChatStreamBody is saChatBody with stream:true. The fake upstream
+// answers application/json, so this exercises the non-SSE first-body-byte
+// release: an upstream that writes no bytes keeps the large-prefill slot
+// deterministically gated (generated-SSE release is not exercised here).
 func saChatStreamBody(model, key, msg string) string {
 	if key != "" {
 		return fmt.Sprintf(`{"model":%q,"prompt_cache_key":%q,"stream":true,"messages":[{"role":"user","content":%q}]}`, model, key, msg)
@@ -2454,10 +2455,10 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 
 	url := s.ts.URL + "/v1/chat/completions"
 
-	// Streaming: the large-prefill slot is released on the first
-	// response byte only (no estimate timer), and the engine writes no
-	// bytes until its gate opens — the slot hold is deterministic and
-	// controlled by releaseKey below.
+	// Non-SSE streaming: the fake engine answers application/json, so the
+	// large-prefill slot is released on the first response body byte only
+	// (no estimate timer). The engine writes no bytes until its gate opens
+	// — the slot hold is deterministic and controlled by releaseKey below.
 	a1 := strings.Repeat("a", 48) // 12 est. tokens: large
 	done1 := make(chan int, 1)
 	go func() { out, _ := saPostOutDo(url, saChatStreamBody("smoke", "A", a1)); done1 <- out.code }()
@@ -2486,7 +2487,7 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	}
 
 	// Far past the TTL with A1 accepted (engine gate), A2 accepted and
-	// stuck in the prefill slot queue behind A1's first-byte-gated
+	// stuck in the prefill slot queue behind A1's first-body-byte-gated
 	// hold, and C QUEUED in the admission queue (cap 1: A's lease is
 	// the only occupant): the ACTIVE lease must RETAIN, C must stay
 	// queued, and nothing past the first forward is new — A2 is NOT
