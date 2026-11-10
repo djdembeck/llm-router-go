@@ -511,17 +511,17 @@ func saPollAdmittedLeases(t *testing.T, backend string, want int) {
 	}
 }
 
-// saPollAdmittedLeaseKey polls until a specific key has an admitted lease.
+// saPollAdmittedLeaseKey polls until a specific key has an active admission lease.
 func saPollAdmittedLeaseKey(t *testing.T, backend, key string) {
 	t.Helper()
 	m := sessionAdmissions[backend]
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if held, _ := m.snapshot(key); held {
+		if held, idleSince := m.snapshot(key); held && idleSince.IsZero() {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("admission lease %q was not granted", key)
+			t.Fatalf("active admission lease %q was not granted", key)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

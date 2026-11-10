@@ -6661,8 +6661,8 @@ forwardAdmission:
 							recordRejection(499, "")
 							return
 						}
-						log.Printf("%s %s -> %s (model=%s) 429: prefill at capacity (kv pressure, prefillTokens=%d)",
-							r.Method, r.URL.Path, target.Name, modelName, prefillTok)
+						log.Printf("%s %s -> %s (model=%s) 429: prefill headroom wait timed out (reason=%s, prefillTokens=%d)",
+							r.Method, r.URL.Path, target.Name, modelName, pressure.reason, prefillTok)
 						write429(w, "prefill-full", target.Name, estimateRetryAfter(target.Name))
 						recordRejection(http.StatusTooManyRequests, "prefill-full")
 						return
