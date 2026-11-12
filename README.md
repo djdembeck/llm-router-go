@@ -159,6 +159,9 @@ BACKENDS='[
     "maxConcurrentLargePrefill": 1,
     "largePrefillThresholdTokens": 8192,
     "largePrefillKVThresholdPct": 80,
+    "largePrefillMode": "balanced",
+    "largePrefillMaxRunning": 0,
+    "largePrefillMaxITLMs": 0,
     "largePrefillMaxQueue": 16
   }
 ]'
@@ -175,8 +178,36 @@ BACKENDS='[
 | `maxQueueDepth` | Maximum pending requests beyond `maxConcurrent`; defaults to `2`. |
 | `maxConcurrentLargePrefill` | Maximum concurrent large-prefill requests. `0` disables large-prefill limiting. |
 | `largePrefillThresholdTokens` | Estimated prompt-token count (whole conversation) that triggers large-prefill logic; defaults to `8192`. |
-| `largePrefillKVThresholdPct` | Parks a **cold** large prefill while the backend's live engine KV usage is at or above this percentage (from the backend's `/metrics` scrape). `0` disables the pressure gate. Requires `maxConcurrentLargePrefill > 0`; metrics unavailable or not `ok` fails open. |
-| `largePrefillMaxQueue` | Bounds the park queue for cold pressure-gated prefills and the large-prefill permit queue; defaults to `4`. Overflow receives `429` with `X-Router-Reason: prefill-queue-full`. |
+| `largePrefillKVThresholdPct` | Parks a **cold** large prefill while the backend's live engine KV usage is at or above this percentage (from the backend's `/metrics` scrape). `0` disables the KV rule. Requires `maxConcurrentLargePrefill > 0`; metrics unavailable or not `ok` fails open. |
+| `largePrefillMode` | Absent, empty string, or `balanced` retains cold-only KV parking and the existing permit behavior. `decode-first` adds headroom checks for **all** large prompts, including returning leases. Unknown nonempty modes fail startup. |
+| `largePrefillMaxRunning` | Decode-first only: require existing occupancy below this integer before starting a large prefill; `0` disables it. Occupancy is the maximum of local execution reservations and fresh, present engine running + waiting gauges. `4` allows three existing requests plus the new prefill. |
+| `largePrefillMaxITLMs` | Decode-first only: park while occupancy is positive and fresh, sampled interval ITL exceeds this millisecond threshold; `0` disables it. Idle backends are not blocked by a previous high ITL. |
+| `largePrefillMaxQueue` | Bounds the pressure park queue and the large-prefill permit queue; defaults to `4`. Overflow receives `429` with `X-Router-Reason: prefill-queue-full`. |
+
+Decode-first requires `maxConcurrentLargePrefill > 0` and at least one positive
+headroom threshold. Both new thresholds must be finite/nonnegative, including in
+balanced mode; balanced ignores valid retained thresholds for a one-setting rollback.
+For example, `"largePrefillMode":"decode-first","largePrefillMaxRunning":4,
+"largePrefillMaxITLMs":250` conservatively admits a large prefill below four existing
+requests and at most 250 ms sampled ITL. These are initial controls, not universal SLOs.
+Changing mode requires reloading configuration by recreating the router, not the engine.
+
+Headroom uses the successful scrape timestamp and metric presence under the registry
+lock; samples older than five seconds or failed/missing telemetry fall back to local
+execution occupancy (including unlimited backends). Missing gauge components contribute
+only when present. ITL needs a fresh positive sample count and finite nonnegative mean.
+Fresh HTTP 200 responses containing frozen metrics cannot be detected by scrape age.
+The existing KV gate's fail-open policy and warm-lease exemption are unchanged, but a
+returning lease is not evidence of cache residency and cannot bypass decode-first.
+
+Pressure parking takes neither an execution slot nor a prefill permit, including when
+KV gating is disabled. Conditions are rechecked after the permit and after execution
+reservation, discounting only this request's own local reservation, never engine counts.
+Lost headroom returns both reservations before re-parking under the original deadline.
+Small requests bypass large-prefill checks. Parking/permit wake order is not FIFO;
+conversation admission remains strictly FIFO, and permit waiters retain no-barging behavior.
+`prefillWaiting` remains parked requests plus permit waiters; parking logs include mode,
+reason, occupancy, ITL and configured thresholds. Already-forwarded requests are not paused.
 
 ### Scalar environment variables
 
@@ -192,7 +223,7 @@ BACKENDS='[
 | `MAX_QUEUE_TIMEOUT` | `30s` | For keyed session-admission traffic this is one **absolute pre-forward budget**, established when admission begins and shared by every blocking gate (admission, GPU budget, large-prefill pressure/permits, execution). An expired request receives `429 session-admission-timeout` before forwarding; a request that starts forwarding is never cut off by it. Legacy (admission-off/keyless) traffic keeps the per-gate timeout. |
 | `MAX_GPU_BUDGET` | `4` | Maximum weighted GPU usage while any Tier 0 (King) backend is active. |
 | `MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum request body size in bytes. Larger requests receive HTTP `413` with `X-Router-Reason: body-too-large`. |
-| `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput used to bound how long a non-streaming request holds a large-prefill slot. The slot is released after the estimated prefill duration or the first response byte, whichever comes first. This bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
+| `PREFILL_TOKENS_PER_SEC` | `10000` | Estimated prefill throughput used to bound how long a non-streaming request holds a large-prefill slot. The slot is released after the estimated prefill duration or the first response body byte, whichever comes first. This bounds slot hold time but weakens head-of-line protection for very large non-streaming prefills. |
 | `SESSION_ADMISSION` | *(off)* | `on` enables conversation-scoped session admission: each keyed conversation holds one admitted slot per backend. An idle lease is retained up to `SESSION_IDLE_TTL`; whether waiting work may take it earlier is controlled by `SESSION_IDLE_RECLAIM`. Off and unkeyed traffic keep the legacy per-request behavior exactly. |
 | `SESSION_MAX_ADMITTED` | backend's `maxConcurrent` | Cap on concurrently admitted conversations per backend. Empty inherits each backend's `maxConcurrent` (must be set explicitly for unlimited backends); a nonzero value applies to every backend. |
 | `SESSION_MAX_WAITING` | backend's `maxQueueDepth` (default 2) | Bounded, strictly FIFO admission queue per backend. Empty inherits each backend's `maxQueueDepth`; an explicit value (including `0`, which rejects newcomers immediately) applies to every backend. Waiting admissions are also bounded by `MAX_QUEUE_TIMEOUT`. |
@@ -436,7 +467,9 @@ A weighted GPU semaphore models shared GPU capacity. Each backend also has a slo
 
 ### Prefill protection and load balancing
 
-The router estimates new prefill tokens from request bodies. Backends can cap concurrent large prefills to prevent a massive prompt from blocking smaller requests. Large-prefill slots are bounded using `PREFILL_TOKENS_PER_SEC` for non-streaming requests and release on the first response byte for streaming requests. The large-prefill gate runs **before** the per-backend execution slot, so a queued large prefill never occupies a decode slot.
+The router estimates new prefill tokens from request bodies. Backends can cap concurrent large prefills to prevent a massive prompt from blocking smaller requests. A streaming SSE response releases its large-prefill permit on the first complete event containing generated content, reasoning, tool-call output, or completion text—not on HTTP headers, flushes, role-only/empty deltas, or heartbeats. Other response types release on the first body byte. Non-streaming requests retain the existing `PREFILL_TOKENS_PER_SEC` estimate timer as an earlier release bound. Every remaining permit is released at handler completion, including header-only responses, errors, aborted body copies, and client cancellation. The large-prefill gate runs **before** the per-backend execution slot, so a queued large prefill never occupies a decode slot.
+
+Observation never delays or rewrites the forwarded bytes or flushes. It is active only while a large streaming prefill holds a permit and retains at most 64 KiB per SSE event, handling events split across writes and LF/CRLF/CR framing. Unknown, malformed, or oversized events conservatively keep the permit until a later recognized output event or handler completion; they are still forwarded unchanged. Transport first-byte metrics retain their existing meaning independently of this generated-output boundary.
 
 With `largePrefillKVThresholdPct` set, a large prefill also needs engine KV headroom: while the backend's live engine KV usage is at or above that percentage, a **cold** large prefill parks in the pressure queue (bounded by `largePrefillMaxQueue`) instead of starting. Parking does not hold the large-prefill permit, so a warm request can still run. Small requests always bypass this gate. A parked request re-checks pressure after acquiring the permit and hands it back if pressure rose in the meantime; for keyed traffic the prefill phase spends the request's shared pre-forward budget, while legacy traffic keeps one `MAX_QUEUE_TIMEOUT` for the phase.
 

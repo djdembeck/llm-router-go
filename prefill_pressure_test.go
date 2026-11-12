@@ -1,7 +1,12 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -60,7 +65,7 @@ func newPrefillHarness(t *testing.T, kv float64, admission bool, maxQueue int) *
 func setEngineView(t *testing.T, name string, v engineView) {
 	t.Helper()
 	engineMetrics.mu.Lock()
-	engineMetrics.backends[name] = &engineScrape{status: v.Status, view: v}
+	engineMetrics.backends[name] = &engineScrape{status: v.Status, view: v, lastT: time.Now()}
 	engineMetrics.mu.Unlock()
 }
 
@@ -88,6 +93,260 @@ func waitUntil(t *testing.T, what string, f func() bool) {
 func prefillInFlight(name string) int32 {
 	in, _, _, _ := prefillSlots[name].snapshot()
 	return in
+}
+
+func TestPrefillModes_ParkingBoundAndCleanup(t *testing.T) {
+	for _, end := range []string{"cancel", "deadline"} {
+		t.Run(end, func(t *testing.T) {
+			h := newPrefillHarness(t, 0, true, 1)
+			configureDecodeFirst()
+			oldTimeout := queueTimeout
+			queueTimeout = 500 * time.Millisecond
+			t.Cleanup(func() { queueTimeout = oldTimeout })
+			setEngineView(t, "smoke", engineView{Status: "ok", RunningPresent: true, Running: 7})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.url(), strings.NewReader(saChatBody("smoke", "P", strings.Repeat("x", 200))))
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := http.DefaultClient.Do(req)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}()
+			waitUntil(t, "headroom-only bounded park", func() bool { return prefillPressure["smoke"].snapshot() == 1 })
+			overflow := saPostAsync(t, h.url(), saChatBody("smoke", "Q", strings.Repeat("x", 200)))
+			if code := <-overflow; code != 429 {
+				t.Fatalf("overflow status %d", code)
+			}
+			if end == "cancel" {
+				cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("parking did not terminate")
+			}
+			h.s.awaitIdle(t, 5*time.Second)
+			if prefillPressure["smoke"].snapshot() != 0 || prefillInFlight("smoke") != 0 {
+				t.Fatal("parking reservation leaked")
+			}
+			in, _, waiting, _ := slots["smoke"].snapshot()
+			if in != 0 || waiting != 0 || seenCount(h.engine, "P") != 0 {
+				t.Fatal("parked request took execution capacity")
+			}
+			saWaitIdleLease(t, "smoke", saAdmKey(t, "P", "smoke"))
+		})
+	}
+}
+
+func TestPrefillModes_Validation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		b       Backend
+		invalid bool
+	}{
+		{"absent", Backend{}, false},
+		{"balanced-retains-thresholds", Backend{LargePrefillMode: "balanced", LargePrefillMaxRunning: 4, LargePrefillMaxITLMs: 250}, false},
+		{"empty-retains-thresholds", Backend{LargePrefillMaxRunning: 4, LargePrefillMaxITLMs: 250}, false},
+		{"unknown", Backend{LargePrefillMode: "fast"}, true},
+		{"negative-running", Backend{LargePrefillMaxRunning: -1}, true},
+		{"negative-itl", Backend{LargePrefillMaxITLMs: -1}, true},
+		{"nan-itl", Backend{LargePrefillMaxITLMs: math.NaN()}, true},
+		{"infinite-itl", Backend{LargePrefillMaxITLMs: math.Inf(1)}, true},
+		{"no-permit", Backend{LargePrefillMode: "decode-first", LargePrefillMaxRunning: 4}, true},
+		{"no-threshold", Backend{LargePrefillMode: "decode-first", MaxConcurrentLargePrefill: 1}, true},
+		{"running-only", Backend{LargePrefillMode: "decode-first", MaxConcurrentLargePrefill: 1, LargePrefillMaxRunning: 4}, false},
+		{"itl-only", Backend{LargePrefillMode: "decode-first", MaxConcurrentLargePrefill: 1, LargePrefillMaxITLMs: 250}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validatePrefillModes([]Backend{tc.b}); (err != nil) != tc.invalid {
+				t.Fatalf("startup policy validation = %v, invalid=%t", err, tc.invalid)
+			}
+		})
+	}
+}
+
+func configureDecodeFirst() {
+	backends[0].LargePrefillMode = "decode-first"
+	backends[0].LargePrefillKVThresholdPct = 0
+	backends[0].LargePrefillMaxRunning = 4
+	backends[0].LargePrefillMaxITLMs = 250
+}
+
+func TestPrefillModes_HeadroomConsumers(t *testing.T) {
+	cases := []struct {
+		name  string
+		view  engineView
+		stale bool
+		park  bool
+	}{
+		{"seven-running", engineView{Status: "ok", RunningPresent: true, Running: 7}, false, true},
+		{"three-running", engineView{Status: "ok", RunningPresent: true, Running: 3}, false, false},
+		{"waiting-only", engineView{Status: "ok", WaitingPresent: true, Waiting: 7}, false, true},
+		{"sum-components", engineView{Status: "ok", RunningPresent: true, WaitingPresent: true, Running: 2, Waiting: 2}, false, true},
+		{"missing-gauges", engineView{Status: "ok", Running: 7, Waiting: 7}, false, false},
+		{"absent-component", engineView{Status: "ok", RunningPresent: true, Running: 3, Waiting: 7}, false, false},
+		{"busy-high-itl", engineView{Status: "ok", RunningPresent: true, Running: 1, ITLSamples: 1, ITLms: 300}, false, true},
+		{"idle-high-itl", engineView{Status: "ok", RunningPresent: true, ITLSamples: 1, ITLms: 300}, false, false},
+		{"unsampled-itl", engineView{Status: "ok", RunningPresent: true, Running: 1, ITLms: 300}, false, false},
+		{"negative-itl", engineView{Status: "ok", RunningPresent: true, Running: 1, ITLSamples: 1, ITLms: -300}, false, false},
+		{"nan-itl", engineView{Status: "ok", RunningPresent: true, Running: 1, ITLSamples: 1, ITLms: math.NaN()}, false, false},
+		{"infinite-itl", engineView{Status: "ok", RunningPresent: true, Running: 1, ITLSamples: 1, ITLms: math.Inf(1)}, false, false},
+		{"stale", engineView{Status: "ok", RunningPresent: true, Running: 7, ITLSamples: 1, ITLms: 300}, true, false},
+		{"failed", engineView{Status: "err", RunningPresent: true, Running: 7}, false, false},
+		{"missing", engineView{}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newPrefillHarness(t, 0, false, 4)
+			configureDecodeFirst()
+			setEngineView(t, "smoke", tc.view)
+			if tc.stale {
+				engineMetrics.mu.Lock()
+				engineMetrics.backends["smoke"].lastT = time.Now().Add(-6 * time.Second)
+				engineMetrics.mu.Unlock()
+			}
+			req := saPostAsync(t, h.url(), saChatBody("smoke", "L", strings.Repeat("x", 200)))
+			if tc.park {
+				waitUntil(t, "headroom parking", func() bool { return prefillPressure["smoke"].snapshot() == 1 })
+				if prefillInFlight("smoke") != 0 || seenCount(h.engine, "L") != 0 {
+					t.Fatal("parked request consumed capacity")
+				}
+				small := saPostAsync(t, h.url(), saChatBody("smoke", "S", "hi"))
+				waitUntil(t, "small bypass", func() bool { return seenCount(h.engine, "S") == 1 })
+				h.engine.releaseKey("S")
+				if code := <-small; code != 200 {
+					t.Fatalf("small status %d", code)
+				}
+				setEngineView(t, "smoke", engineView{Status: "ok", RunningPresent: true, Running: 3, ITLSamples: 1, ITLms: 100})
+			}
+			waitUntil(t, "large forwarded with headroom", func() bool { return seenCount(h.engine, "L") == 1 })
+			h.engine.releaseKey("L")
+			if code := <-req; code != 200 {
+				t.Fatalf("large status %d", code)
+			}
+		})
+	}
+}
+
+func TestPrefillModes_WarmLeasePolicy(t *testing.T) {
+	for _, mode := range []string{"", "balanced", "decode-first"} {
+		t.Run("mode-"+mode, func(t *testing.T) {
+			h := newPrefillHarness(t, 90, true, 4)
+			backends[0].LargePrefillMode = mode
+			backends[0].LargePrefillMaxRunning = 4
+			backends[0].LargePrefillMaxITLMs = 250
+			prime := saPostAsync(t, h.url(), saChatBody("smoke", "W", "hi"))
+			waitUntil(t, "prime lease", func() bool { return seenCount(h.engine, "W") == 1 })
+			h.engine.releaseKey("W")
+			if code := <-prime; code != 200 {
+				t.Fatal(code)
+			}
+			saWaitIdleLease(t, "smoke", saAdmKey(t, "W", "smoke"))
+			setEngineView(t, "smoke", engineView{Status: "ok", KVPct: 90, RunningPresent: true, Running: 7})
+			req := saPostAsync(t, h.url(), saChatBody("smoke", "W", strings.Repeat("x", 200)))
+			if mode == "decode-first" {
+				waitUntil(t, "warm headroom parking", func() bool { return prefillPressure["smoke"].snapshot() == 1 })
+				if seenCount(h.engine, "W") != 1 {
+					t.Fatal("warm lease bypassed headroom")
+				}
+				// KV remains high: only the existing warm KV exemption survives.
+				setEngineView(t, "smoke", engineView{Status: "ok", KVPct: 90, RunningPresent: true, Running: 3})
+			}
+			waitUntil(t, "warm large forwarded", func() bool { return seenCount(h.engine, "W") == 2 })
+			h.engine.releaseKey("W")
+			if code := <-req; code != 200 {
+				t.Fatal(code)
+			}
+		})
+	}
+}
+
+func TestPrefillModes_LocalFallback(t *testing.T) {
+	for _, unlimited := range []bool{false, true} {
+		for _, status := range []string{"err", "missing", "stale"} {
+			t.Run(fmt.Sprintf("unlimited=%t/%s", unlimited, status), func(t *testing.T) {
+				h := newPrefillHarness(t, 0, false, 4)
+				configureDecodeFirst()
+				backends[0].LargePrefillMaxRunning = 1
+				if unlimited {
+					delete(slots, "smoke")
+				}
+				setEngineView(t, "smoke", engineView{Status: status})
+				if status == "stale" {
+					setEngineView(t, "smoke", engineView{Status: "ok", RunningPresent: true})
+					engineMetrics.mu.Lock()
+					engineMetrics.backends["smoke"].lastT = time.Now().Add(-6 * time.Second)
+					engineMetrics.mu.Unlock()
+				}
+				small := saPostAsync(t, h.url(), saChatBody("smoke", "S", "hi"))
+				waitUntil(t, "local execution", func() bool { return seenCount(h.engine, "S") == 1 })
+				large := saPostAsync(t, h.url(), saChatBody("smoke", "L", strings.Repeat("x", 200)))
+				waitUntil(t, "local fallback parking", func() bool { return prefillPressure["smoke"].snapshot() == 1 })
+				if seenCount(h.engine, "L") != 0 {
+					t.Fatal("local occupancy ignored")
+				}
+				h.engine.releaseKey("S")
+				if code := <-small; code != 200 {
+					t.Fatal(code)
+				}
+				waitUntil(t, "local fallback recovery", func() bool { return seenCount(h.engine, "L") == 1 })
+				h.engine.releaseKey("L")
+				if code := <-large; code != 200 {
+					t.Fatal(code)
+				}
+			})
+		}
+	}
+}
+
+func TestPrefillModes_RechecksReleaseReservations(t *testing.T) {
+	for _, stage := range []string{"permit", "execution"} {
+		t.Run(stage, func(t *testing.T) {
+			h := newPrefillHarness(t, 0, false, 4)
+			configureDecodeFirst()
+			setEngineView(t, "smoke", engineView{Status: "ok", RunningPresent: true, Running: 3})
+			sem, n := prefillSlots["smoke"], 1
+			if stage == "execution" {
+				sem, n = slots["smoke"], 2
+			}
+			for range n {
+				if !sem.acquire(time.Second, nil) {
+					t.Fatal("reserve")
+				}
+			}
+			held := n
+			defer func() {
+				for held > 0 {
+					sem.release()
+					held--
+				}
+			}()
+			req := saPostAsync(t, h.url(), saChatBody("smoke", "R", strings.Repeat("x", 200)))
+			waitUntil(t, "queued at "+stage, func() bool { _, _, w, _ := sem.snapshot(); return w == 1 })
+			setEngineView(t, "smoke", engineView{Status: "ok", RunningPresent: true, Running: 7})
+			sem.release()
+			held--
+			waitUntil(t, "repark after "+stage, func() bool { return prefillPressure["smoke"].snapshot() == 1 })
+			if prefillInFlight("smoke") != 0 || seenCount(h.engine, "R") != 0 {
+				t.Fatal("repark retained permit or forwarded")
+			}
+			in, _, _, _ := slots["smoke"].snapshot()
+			if stage == "execution" && in != int32(held) {
+				t.Fatalf("execution leak: %d", in)
+			}
+			setEngineView(t, "smoke", engineView{Status: "ok", RunningPresent: true, Running: 3})
+			waitUntil(t, "forward after recovery", func() bool { return seenCount(h.engine, "R") == 1 })
+			h.engine.releaseKey("R")
+			if code := <-req; code != 200 {
+				t.Fatal(code)
+			}
+		})
+	}
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -300,14 +559,227 @@ func TestPrefillPressure_QueueFullBoundsColdParking(t *testing.T) {
 	}
 }
 
-// TestBackendPrefillJSONFields keeps the new BACKENDS fields wired to their
-// documented JSON names.
-func TestBackendPrefillJSONFields(t *testing.T) {
-	var b Backend
-	if err := json.Unmarshal([]byte(`{"name":"x","url":"http://x","maxConcurrentLargePrefill":1,"largePrefillKVThresholdPct":80,"largePrefillMaxQueue":16}`), &b); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+// TestPrefillPermit_GeneratedOutput exercises real proxy body copies. Reading
+// every prefix chunk is a barrier: it has crossed the tracker, but must not
+// release A's permit. No sleep is used to infer that B stayed blocked.
+func TestPrefillPermit_GeneratedOutput(t *testing.T) {
+	for _, output := range []struct {
+		name string
+		data string
+	}{
+		{"content", `{"choices":[{"delta":{"content":"hello"}}]}`},
+		{"reasoning", `{"choices":[{"delta":{"reasoning_content":"thinking"}}]}`},
+		{"reasoning-alias", `{"choices":[{"delta":{"reasoning":"thinking"}}]}`},
+		{"tool", `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}`},
+		{"completion", `{"choices":[{"text":"hello"}]}`},
+	} {
+		t.Run(output.name, func(t *testing.T) {
+			h := newPrefillHarness(t, 0, false, 4)
+			chunks := make(chan string)
+			stop := make(chan struct{})
+			forwardedB := make(chan struct{})
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.Contains(string(body), `"B"`) {
+					close(forwardedB)
+					fmt.Fprint(w, "B done")
+					return
+				}
+				if strings.Contains(string(body), `"small"`) {
+					fmt.Fprint(w, "small done")
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				for {
+					select {
+					case p := <-chunks:
+						fmt.Fprint(w, p)
+						w.(http.Flusher).Flush()
+					case <-stop:
+						return
+					case <-r.Context().Done():
+						return
+					}
+				}
+			}))
+			t.Cleanup(up.Close)
+			t.Cleanup(func() { close(stop) })
+			proxies["smoke"] = newTestProxy(up.URL)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			body := fmt.Sprintf(`{"model":"smoke","stream":true,"prompt_cache_key":"A","messages":[{"role":"user","content":%q}]}`, strings.Repeat("x", 200))
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.url(), strings.NewReader(body))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if got := prefillInFlight("smoke"); got != 1 {
+				t.Fatalf("headers released prefill: %d", got)
+			}
+			b := saPostAsync(t, h.url(), saChatBody("smoke", "B", strings.Repeat("x", 200)))
+			saPollPrefillSlot(t, 1, 1)
+			if code, _, _ := saPost(t, h.url(), saChatBody("smoke", "small", "hi")); code != 200 {
+				t.Fatalf("small request = %d", code)
+			}
+			forward := func(p string) {
+				t.Helper()
+				select {
+				case chunks <- p:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				got := make([]byte, len(p))
+				if _, err := io.ReadFull(resp.Body, got); err != nil || string(got) != p {
+					t.Fatalf("forwarded bytes = %q, err %v, want %q", got, err, p)
+				}
+			}
+			for _, p := range []string{
+				": heartbeat\r\n\r\n",
+				"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\r\n\r\n",
+				"data: {\"choices\":[{\"delta\":{}}]}\n\n",
+				"data: not-json\n\n",
+				"data: {\"usage\":{\"prompt_tokens\":50}}\n\n",
+				"data: " + strings.Repeat("x", maxPrefillEventBytes) + "\n\n",
+				"data: " + output.data[:len(output.data)/2],
+			} {
+				forward(p)
+				if got := prefillInFlight("smoke"); got != 1 {
+					t.Fatalf("prefix released prefill: %d", got)
+				}
+				select {
+				case <-forwardedB:
+					t.Fatal("B forwarded before generated output")
+				default:
+				}
+			}
+			forward(output.data[len(output.data)/2:] + "\r\n\r\n")
+			select {
+			case <-forwardedB:
+			case <-ctx.Done():
+				t.Fatal("B did not forward during A decode")
+			}
+			if code := <-b; code != 200 {
+				t.Fatalf("B status = %d", code)
+			}
+			// A remains open and can continue decoding after handing off.
+			forward("data: " + output.data + "\n\n")
+			cancel()
+			resp.Body.Close()
+			h.s.awaitIdle(t, 5*time.Second)
+			saPollPrefillSlot(t, 0, 0)
+		})
 	}
-	if b.LargePrefillKVThresholdPct != 80 || b.LargePrefillMaxQueue != 16 {
-		t.Fatalf("fields = %v/%v, want 80/16", b.LargePrefillKVThresholdPct, b.LargePrefillMaxQueue)
+}
+
+func TestPrefillPermit_ResponseWriterBoundaries(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit=%v", explicit), func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			releases := 0
+			tracker := &respTracker{
+				ResponseWriter: rec,
+				status:         http.StatusOK,
+				prefillRelease: func() { releases++ },
+			}
+			if explicit {
+				tracker.WriteHeader(http.StatusOK)
+			}
+			tracker.Flush()
+			if _, err := tracker.Write(nil); err != nil {
+				t.Fatal(err)
+			}
+			if releases != 0 {
+				t.Fatal("headers, flush or empty write released prefill")
+			}
+			tracker.Write([]byte("body"))
+			tracker.Write([]byte("tail"))
+			if releases != 1 || rec.Body.String() != "bodytail" {
+				t.Fatalf("releases=%d body=%q", releases, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestPrefillPermit_SSEFraming(t *testing.T) {
+	for _, framing := range []string{"\n", "\r\n", "\r"} {
+		t.Run(fmt.Sprintf("newline=%q", framing), func(t *testing.T) {
+			observer := &prefillOutputObserver{}
+			prefix := ": heartbeat" + framing + framing +
+				"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}" + framing + framing +
+				"data: [DONE]" + framing + framing
+			for i := range prefix {
+				if observer.observe([]byte{prefix[i]}) {
+					t.Fatal("preamble was mistaken for generated output")
+				}
+			}
+			output := "event: message" + framing + "data: {\"choices\":[" + framing +
+				"data: {\"delta\":{\"content\":\"token\"}}]}" + framing + framing
+			for i := range output {
+				got := observer.observe([]byte{output[i]})
+				// CR dispatches immediately, before the optional LF.
+				want := i == len(output)-1
+				if framing == "\r\n" {
+					want = i == len(output)-2
+				}
+				if got != want {
+					t.Fatalf("byte %d: output=%v, want %v", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestPrefillPermit_HeaderOnlyCleanup(t *testing.T) {
+	for _, ending := range []string{"eof", "abort", "cancel"} {
+		t.Run(ending, func(t *testing.T) {
+			h := newPrefillHarness(t, 0, false, 4)
+			end := make(chan struct{}, 1)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				if ending == "abort" {
+					w.Header().Set("Content-Length", "1000")
+				}
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				select {
+				case <-end:
+				case <-r.Context().Done():
+				}
+			}))
+			t.Cleanup(up.Close)
+			t.Cleanup(func() { close(end) })
+			proxies["smoke"] = newTestProxy(up.URL)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			body := fmt.Sprintf(`{"model":"smoke","stream":true,"messages":[{"role":"user","content":%q}]}`, strings.Repeat("x", 200))
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.url(), strings.NewReader(body))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if got := prefillInFlight("smoke"); got != 1 {
+				t.Fatalf("headers released permit: %d", got)
+			}
+			if ending == "cancel" {
+				cancel()
+			} else {
+				end <- struct{}{}
+			}
+			_, err = io.ReadAll(resp.Body)
+			if ending == "eof" && err != nil {
+				t.Fatal(err)
+			}
+			if ending == "abort" && err == nil {
+				t.Fatal("truncated upstream body did not abort")
+			}
+			resp.Body.Close()
+			h.s.awaitIdle(t, 5*time.Second)
+			saPollPrefillSlot(t, 0, 0)
+		})
 	}
 }

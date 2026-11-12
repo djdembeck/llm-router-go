@@ -136,9 +136,10 @@ func saChatBody(model, key, msg string) string {
 	return fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, model, msg)
 }
 
-// saChatStreamBody is saChatBody with stream:true: production releases
-// the large-prefill slot on the first response byte, so a fake upstream
-// that writes no bytes keeps the slot deterministically gated.
+// saChatStreamBody is saChatBody with stream:true. The fake upstream
+// answers application/json, so this exercises the non-SSE first-body-byte
+// release: an upstream that writes no bytes keeps the large-prefill slot
+// deterministically gated (generated-SSE release is not exercised here).
 func saChatStreamBody(model, key, msg string) string {
 	if key != "" {
 		return fmt.Sprintf(`{"model":%q,"prompt_cache_key":%q,"stream":true,"messages":[{"role":"user","content":%q}]}`, model, key, msg)
@@ -490,9 +491,8 @@ func saPollEngineSeen(t *testing.T, e *saGateEngine, order ...string) {
 }
 
 // saPollAdmittedLeases polls until the per-backend manager holds EXACTLY
-// `want` admitted leases (len(leaseMap)): the deterministic replacement for a
-// fixed sleep after an admission grant — a lease appears only once the
-// granted handler's admission lands, so the count is stable once reached.
+// `want` admitted leases (len(leaseMap)). A matching count does not identify
+// which leases are held; use saPollAdmittedLeaseKey when identity matters.
 func saPollAdmittedLeases(t *testing.T, backend string, want int) {
 	t.Helper()
 	m := sessionAdmissions[backend]
@@ -506,6 +506,22 @@ func saPollAdmittedLeases(t *testing.T, backend string, want int) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("admission leases = %d, want %d", got, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// saPollAdmittedLeaseKey polls until a specific key has an active admission lease.
+func saPollAdmittedLeaseKey(t *testing.T, backend, key string) {
+	t.Helper()
+	m := sessionAdmissions[backend]
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if held, idleSince := m.snapshot(key); held && idleSince.IsZero() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("active admission lease %q was not granted", key)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -2338,10 +2354,8 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 	// F's reclaim + B's grant land on the handler's DEFERRED release
 	// (after the client reads the response): poll for the stable
 	// admitted-set {M, B} (F's lease is gone, B's is granted).
+	saPollAdmittedLeaseKey(t, "smoke", kB)
 	saPollAdmittedLeases(t, "smoke", 2)
-	if held, _ := sessionAdmissions["smoke"].snapshot(kB); !held {
-		t.Fatal("B not granted by the release-driven reclaim")
-	}
 	saPollGPU(t, gb, 1, 1)             // M (unit) + B (queued).
 	time.Sleep(150 * time.Millisecond) // settle: no forward (B budget-queued).
 	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
@@ -2357,10 +2371,8 @@ func TestSessionAdmission_AcceptedLifetimeGPUQueue(t *testing.T) {
 	// M's reclaim + C's grant land on the handler's DEFERRED release:
 	// poll for the stable admitted-set {B, C} (M's lease is gone, C's
 	// is granted).
+	saPollAdmittedLeaseKey(t, "smoke", kC)
 	saPollAdmittedLeases(t, "smoke", 2)
-	if held, _ := sessionAdmissions["smoke"].snapshot(kC); !held {
-		t.Fatal("C not granted by M's release-driven reclaim")
-	}
 	saPollGPU(t, gb, 1, 1)             // B (unit) + C (queued).
 	time.Sleep(150 * time.Millisecond) // settle: B takes the unit + slot, C stays budget-queued.
 	if in, _, _, _ := slots["smoke"].snapshot(); in != 1 {
@@ -2454,10 +2466,10 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 
 	url := s.ts.URL + "/v1/chat/completions"
 
-	// Streaming: the large-prefill slot is released on the first
-	// response byte only (no estimate timer), and the engine writes no
-	// bytes until its gate opens — the slot hold is deterministic and
-	// controlled by releaseKey below.
+	// Non-SSE streaming: the fake engine answers application/json, so the
+	// large-prefill slot is released on the first response body byte only
+	// (no estimate timer). The engine writes no bytes until its gate opens
+	// — the slot hold is deterministic and controlled by releaseKey below.
 	a1 := strings.Repeat("a", 48) // 12 est. tokens: large
 	done1 := make(chan int, 1)
 	go func() { out, _ := saPostOutDo(url, saChatStreamBody("smoke", "A", a1)); done1 <- out.code }()
@@ -2486,7 +2498,7 @@ func TestSessionAdmission_AcceptedLifetimePrefillQueue(t *testing.T) {
 	}
 
 	// Far past the TTL with A1 accepted (engine gate), A2 accepted and
-	// stuck in the prefill slot queue behind A1's first-byte-gated
+	// stuck in the prefill slot queue behind A1's first-body-byte-gated
 	// hold, and C QUEUED in the admission queue (cap 1: A's lease is
 	// the only occupant): the ACTIVE lease must RETAIN, C must stay
 	// queued, and nothing past the first forward is new — A2 is NOT
